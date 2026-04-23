@@ -10,6 +10,8 @@ If you only run one short Claude session now and then, the full stack is probabl
 
 ![demo](docs/demo.gif)
 
+![grafana dashboard](docs/grafana-overview.png)
+
 ## Why people install this
 
 - **Multi-session mess.** You have several `claude` terminals open and no clear sense of which one is active, blocked, or drifting.
@@ -84,16 +86,6 @@ Optional trend view:
 - Grafana dashboard: [http://127.0.0.1:3000/d/clauditor-main](http://127.0.0.1:3000/d/clauditor-main)
 - Anonymous viewer mode is enabled
 - Admin login is also provisioned as `admin` / `admin`
-
-## What it looks like
-
-**Live tmux view**
-
-The live tmux view is shown in the demo above.
-
-**Grafana trend view**
-
-![Clauditor Grafana overview](docs/grafana-overview.png)
 
 ## Core workflows
 

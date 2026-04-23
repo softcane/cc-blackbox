@@ -8,7 +8,7 @@ I made this because once I had a few `claude` terminals open at the same time, I
 
 If you only run one short Claude session now and then, the full stack is probably more setup than you need. If you run longer sessions, care about cost or context trends, or regularly have multiple sessions open and keep wondering which one is stuck or why a turn got weird, this is where it starts to pay off.
 
-![Clauditor before and after](docs/before-after.png)
+![demo](docs/demo.gif)
 
 ## Why people install this
 
@@ -89,7 +89,7 @@ Optional trend view:
 
 **Live tmux view**
 
-![Illustrative Clauditor tmux dashboard](docs/tmux-dashboard.png)
+The live tmux view is shown in the demo above.
 
 **Grafana trend view**
 

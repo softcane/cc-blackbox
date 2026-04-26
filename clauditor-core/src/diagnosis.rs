@@ -369,32 +369,34 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
         }
 
         // CAUSE: TTFT regression (> 2x baseline)
-        if ttft_baseline > 0.0 && turn.ttft_ms as f64 > ttft_baseline * 2.0 && i >= 3 {
-            if !causes.iter().any(|c| c.cause_type == "ttft_regression") {
-                set_degradation(turn.turn_number);
-            }
+        if ttft_baseline > 0.0
+            && turn.ttft_ms as f64 > ttft_baseline * 2.0
+            && i >= 3
+            && !causes.iter().any(|c| c.cause_type == "ttft_regression")
+        {
+            set_degradation(turn.turn_number);
         }
 
         // CAUSE: frustration signals
-        if turn.frustration_signals > 0 {
-            if !causes.iter().any(|c| c.cause_type == "harness_pressure") {
-                let total_signals: u32 = turns.iter().map(|t| t.frustration_signals).sum();
-                if total_signals >= 2 {
-                    causes.push(DegradationCause {
-                        turn_first_noticed: turn.turn_number,
-                        cause_type: "harness_pressure".to_string(),
-                        detail: format!(
-                            "{} early-stop or token-pressure signals detected in Claude's output. \
-                             This suggests the harness was constraining response quality.",
-                            total_signals
-                        ),
-                        estimated_cost: 0.0,
-                        is_heuristic: true,
-                        requested_model: None,
-                        actual_model: None,
-                    });
-                    set_degradation(turn.turn_number);
-                }
+        if turn.frustration_signals > 0
+            && !causes.iter().any(|c| c.cause_type == "harness_pressure")
+        {
+            let total_signals: u32 = turns.iter().map(|t| t.frustration_signals).sum();
+            if total_signals >= 2 {
+                causes.push(DegradationCause {
+                    turn_first_noticed: turn.turn_number,
+                    cause_type: "harness_pressure".to_string(),
+                    detail: format!(
+                        "{} early-stop or token-pressure signals detected in Claude's output. \
+                         This suggests the harness was constraining response quality.",
+                        total_signals
+                    ),
+                    estimated_cost: 0.0,
+                    is_heuristic: true,
+                    requested_model: None,
+                    actual_model: None,
+                });
+                set_degradation(turn.turn_number);
             }
         }
     }
@@ -484,23 +486,23 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                 streak_start = turn.turn_number;
             }
             consecutive_failures += 1;
-            if consecutive_failures >= 5 {
-                if !causes.iter().any(|c| c.cause_type == "tool_failure_streak") {
-                    causes.push(DegradationCause {
-                        turn_first_noticed: streak_start,
-                        cause_type: "tool_failure_streak".to_string(),
-                        detail: format!(
-                            "Tool calls failed in {} consecutive turns ({}\u{2013}{}). \
-                             Claude may have been retrying a broken approach.",
-                            consecutive_failures, streak_start, turn.turn_number
-                        ),
-                        estimated_cost: 0.0,
-                        is_heuristic: false,
-                        requested_model: None,
-                        actual_model: None,
-                    });
-                    set_degradation(streak_start);
-                }
+            if consecutive_failures >= 5
+                && !causes.iter().any(|c| c.cause_type == "tool_failure_streak")
+            {
+                causes.push(DegradationCause {
+                    turn_first_noticed: streak_start,
+                    cause_type: "tool_failure_streak".to_string(),
+                    detail: format!(
+                        "Tool calls failed in {} consecutive turns ({}\u{2013}{}). \
+                         Claude may have been retrying a broken approach.",
+                        consecutive_failures, streak_start, turn.turn_number
+                    ),
+                    estimated_cost: 0.0,
+                    is_heuristic: false,
+                    requested_model: None,
+                    actual_model: None,
+                });
+                set_degradation(streak_start);
             }
         } else {
             consecutive_failures = 0;

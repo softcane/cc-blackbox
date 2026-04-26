@@ -22,6 +22,26 @@ pub enum WatchEvent {
         outcome: String,
         duration_ms: u64,
     },
+    SkillEvent {
+        session_id: String,
+        timestamp: String,
+        skill_name: String,
+        event_type: String,
+        source: String,
+        confidence: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    McpEvent {
+        session_id: String,
+        timestamp: String,
+        server: String,
+        tool: String,
+        event_type: String,
+        source: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     CacheEvent {
         session_id: String,
         event_type: String, // "hit" | "partial" | "cold_start" | "miss_ttl" | "miss_thrash"
@@ -165,7 +185,7 @@ impl EventBroadcaster {
         let cutoff = Instant::now().checked_sub(Self::REPLAY_WINDOW);
         let snap = h
             .iter()
-            .filter(|(t, _)| cutoff.map_or(true, |c| *t >= c))
+            .filter(|(t, _)| cutoff.is_none_or(|c| *t >= c))
             .map(|(_, e)| e.clone())
             .collect();
         (snap, rx)
@@ -203,6 +223,14 @@ pub fn extract_summary(tool_name: &str, tool_input_json: &str) -> String {
                 format!("{pattern} in {path}")
             }
         }
+        "Skill" | "skill" => v
+            .get("skill_name")
+            .or_else(|| v.get("name"))
+            .or_else(|| v.get("skill"))
+            .or_else(|| v.get("command_name"))
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .to_string(),
         _ => truncate(tool_input_json, 60),
     }
 }

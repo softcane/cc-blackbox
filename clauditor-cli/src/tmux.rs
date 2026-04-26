@@ -123,7 +123,7 @@ fn run_tmux(args: &[&str]) -> Result<(), String> {
 fn resolve_cli_path() -> String {
     std::env::current_exe()
         .ok()
-        .and_then(|p| Some(p.to_string_lossy().into_owned()))
+        .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "clauditor".into())
 }
 
@@ -644,7 +644,7 @@ impl TmuxOrchestrator {
                 if let (Some(fill), _) = (pane.fill_percent, pane.turns_to_compact) {
                     if fill >= 60.0 && !pane.ended {
                         let tail = match pane.turns_to_compact {
-                            Some(n) if n == 0 => "AT THRESHOLD".to_string(),
+                            Some(0) => "AT THRESHOLD".to_string(),
                             Some(n) => format!("~{} turns to auto-compact", n),
                             None => "trajectory unknown".to_string(),
                         };
@@ -778,6 +778,16 @@ impl TmuxOrchestrator {
                 self.render_status();
             }
 
+            WatchEvent::McpEvent { session_id, .. } => {
+                self.ensure_pane_exists(session_id, cleanup_pane_ids);
+                self.render_status();
+            }
+
+            WatchEvent::SkillEvent { session_id, .. } => {
+                self.ensure_pane_exists(session_id, cleanup_pane_ids);
+                self.render_status();
+            }
+
             WatchEvent::CacheEvent {
                 session_id,
                 cache_expires_at_epoch,
@@ -900,8 +910,8 @@ impl TmuxOrchestrator {
                             .to_string();
                         line_buffer = line_buffer[newline_pos + 1..].to_string();
 
-                        if line.starts_with("data: ") {
-                            data_buffer.push_str(&line[6..]);
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            data_buffer.push_str(data);
                         } else if line.starts_with(": ") || line.starts_with(':') {
                             continue;
                         } else if line.is_empty() && !data_buffer.is_empty() {

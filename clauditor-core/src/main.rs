@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -411,6 +412,28 @@ CREATE TABLE IF NOT EXISTS tool_outcomes (
     duration_ms INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS skill_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    timestamp   TEXT NOT NULL,
+    skill_name  TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    confidence  REAL DEFAULT 1.0,
+    source      TEXT NOT NULL,
+    detail      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS mcp_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    timestamp   TEXT NOT NULL,
+    server      TEXT NOT NULL,
+    tool        TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    detail      TEXT
+);
+
 CREATE TABLE IF NOT EXISTS session_recall (
     session_id              TEXT PRIMARY KEY,
     initial_prompt          TEXT,
@@ -430,6 +453,8 @@ CREATE TABLE IF NOT EXISTS billing_reconciliations (
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turn_snapshots(session_id, turn_number);
 CREATE INDEX IF NOT EXISTS idx_diagnoses_completed ON session_diagnoses(completed_at);
 CREATE INDEX IF NOT EXISTS idx_tool_outcomes_session ON tool_outcomes(session_id);
+CREATE INDEX IF NOT EXISTS idx_skill_events_session ON skill_events(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_mcp_events_session ON mcp_events(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_session_recall_session ON session_recall(session_id);
 CREATE INDEX IF NOT EXISTS idx_billing_reconciliations_session_imported
     ON billing_reconciliations(session_id, imported_at DESC);
@@ -498,6 +523,24 @@ enum DbCommand {
         input_summary: String,
         outcome: String,
         duration_ms: u64,
+    },
+    WriteSkillEvent {
+        session_id: String,
+        timestamp: String,
+        skill_name: String,
+        event_type: String,
+        confidence: f64,
+        source: String,
+        detail: Option<String>,
+    },
+    WriteMcpEvent {
+        session_id: String,
+        timestamp: String,
+        server: String,
+        tool: String,
+        event_type: String,
+        source: String,
+        detail: Option<String>,
     },
     WriteRecall {
         session_id: String,
@@ -664,6 +707,7 @@ fn repair_session_diagnosis_degradation_turns(conn: &Connection) -> rusqlite::Re
 
 fn seed_live_metric_labels_from_db(conn: &Connection) -> rusqlite::Result<()> {
     metrics::ensure_tool_metric_labels("unknown");
+    metrics::ensure_skill_metric_labels("unknown", "fired", "hook");
 
     let mut stmt = conn.prepare(
         "SELECT DISTINCT tool_name FROM tool_calls \
@@ -677,6 +721,41 @@ fn seed_live_metric_labels_from_db(conn: &Connection) -> rusqlite::Result<()> {
 
     for tool_name in tool_names {
         metrics::ensure_tool_metric_labels(&tool_name);
+    }
+
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT skill_name, event_type, source FROM skill_events")?;
+    let skill_events = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .filter_map(|row| row.ok())
+        .collect::<Vec<_>>();
+
+    for (skill_name, event_type, source) in skill_events {
+        metrics::ensure_skill_metric_labels(&skill_name, &event_type, &source);
+    }
+
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT server, tool, event_type, source FROM mcp_events")?;
+    let mcp_events = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .filter_map(|row| row.ok())
+        .collect::<Vec<_>>();
+
+    for (server, tool, event_type, source) in mcp_events {
+        metrics::ensure_mcp_event_metric_labels(&server, &tool, &event_type, &source);
     }
 
     Ok(())
@@ -909,6 +988,46 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                     ],
                 );
             }
+            DbCommand::WriteSkillEvent {
+                session_id,
+                timestamp,
+                skill_name,
+                event_type,
+                confidence,
+                source,
+                detail,
+            } => {
+                let _ = conn.execute(
+                    "INSERT INTO skill_events (session_id, timestamp, skill_name, event_type, \
+                     confidence, source, detail) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    rusqlite::params![
+                        session_id,
+                        timestamp,
+                        skill_name,
+                        event_type,
+                        confidence,
+                        source,
+                        detail,
+                    ],
+                );
+            }
+            DbCommand::WriteMcpEvent {
+                session_id,
+                timestamp,
+                server,
+                tool,
+                event_type,
+                source,
+                detail,
+            } => {
+                let _ = conn.execute(
+                    "INSERT INTO mcp_events (session_id, timestamp, server, tool, event_type, \
+                     source, detail) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    rusqlite::params![
+                        session_id, timestamp, server, tool, event_type, source, detail,
+                    ],
+                );
+            }
             DbCommand::WriteRecall {
                 session_id,
                 initial_prompt,
@@ -1078,10 +1197,7 @@ fn load_latest_billing_reconciliations(
         return Ok(HashMap::new());
     }
 
-    let placeholders = std::iter::repeat("?")
-        .take(session_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let placeholders = vec!["?"; session_ids.len()].join(",");
     let sql = format!(
         "SELECT session_id, imported_at, source, billed_cost_dollars \
          FROM billing_reconciliations \
@@ -1121,10 +1237,7 @@ fn compute_estimated_costs_for_sessions(
         return Ok(HashMap::new());
     }
 
-    let placeholders = std::iter::repeat("?")
-        .take(session_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
+    let placeholders = vec!["?"; session_ids.len()].join(",");
     let sql = format!(
         "SELECT session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, \
          cost_dollars, cost_source, trusted_for_budget_enforcement \
@@ -1898,6 +2011,25 @@ impl ResponseAccumulator {
                                 tool_name: tool_name.clone(),
                                 summary,
                             });
+                            if tool_name.eq_ignore_ascii_case("Skill") {
+                                if let Some(skill_name) =
+                                    skill_name_from_tool_input_json(&self.tool_input_buffer)
+                                {
+                                    self.deferred_watch_events.push(
+                                        watch::WatchEvent::SkillEvent {
+                                            session_id: String::new(), // Filled in finalize_response.
+                                            timestamp: now_iso8601(),
+                                            skill_name,
+                                            event_type: "fired".to_string(),
+                                            source: "proxy".to_string(),
+                                            confidence: 0.65,
+                                            detail: Some(
+                                                "inferred from Skill tool_use".to_string(),
+                                            ),
+                                        },
+                                    );
+                                }
+                            }
                         }
                         self.tool_input_buffer.clear();
                     }
@@ -2073,9 +2205,7 @@ fn finalize_response(
         None
     };
     {
-        let mut entry = SESSION_BUDGETS
-            .entry(session_id.clone())
-            .or_insert_with(SessionBudgetState::default);
+        let mut entry = SESSION_BUDGETS.entry(session_id.clone()).or_default();
         entry.total_spend += total_cost;
         entry.total_tokens += acc.input_tokens
             + acc.output_tokens
@@ -2129,6 +2259,40 @@ fn finalize_response(
         for tool_result in tool_results {
             if tool_result.is_error {
                 metrics::record_tool_failures(&tool_result.tool_name, 1);
+                if let Some((server, tool)) = metrics::mcp_tool_labels(&tool_result.tool_name) {
+                    watch::BROADCASTER.broadcast(watch::WatchEvent::McpEvent {
+                        session_id: session_id.clone(),
+                        timestamp: now_iso8601(),
+                        server,
+                        tool,
+                        event_type: "failed".to_string(),
+                        source: "proxy".to_string(),
+                        detail: Some(tool_result.outcome.clone()),
+                    });
+                }
+                if tool_result.tool_name.eq_ignore_ascii_case("Skill") {
+                    let skill_name = canonical_telemetry_name(&tool_result.input_summary)
+                        .unwrap_or_else(|| "unknown".to_string());
+                    emit_skill_event(SkillTelemetryEvent {
+                        session_id: session_id.clone(),
+                        timestamp: now_iso8601(),
+                        skill_name,
+                        event_type: "failed".to_string(),
+                        source: "proxy".to_string(),
+                        confidence: 0.65,
+                        detail: Some(tool_result.outcome.clone()),
+                    });
+                }
+            } else if let Some((server, tool)) = metrics::mcp_tool_labels(&tool_result.tool_name) {
+                emit_mcp_event(McpTelemetryEvent {
+                    session_id: session_id.clone(),
+                    timestamp: now_iso8601(),
+                    server,
+                    tool,
+                    event_type: "succeeded".to_string(),
+                    source: "proxy".to_string(),
+                    detail: Some(tool_result.outcome.clone()),
+                });
             }
             watch::BROADCASTER.broadcast(watch::WatchEvent::ToolResult {
                 session_id: session_id.clone(),
@@ -2163,15 +2327,62 @@ fn finalize_response(
                 }
                 | watch::WatchEvent::FrustrationSignal {
                     session_id: sid, ..
+                }
+                | watch::WatchEvent::SkillEvent {
+                    session_id: sid, ..
+                }
+                | watch::WatchEvent::McpEvent {
+                    session_id: sid, ..
                 } => {
                     *sid = session_id.clone();
                 }
                 _ => {}
             }
-            if let watch::WatchEvent::ToolUse { tool_name, .. } = &event {
-                metrics::record_tool_call(tool_name);
+            match event {
+                watch::WatchEvent::ToolUse { ref tool_name, .. } => {
+                    metrics::record_tool_call(tool_name);
+                    watch::BROADCASTER.broadcast(event);
+                }
+                watch::WatchEvent::SkillEvent {
+                    session_id,
+                    timestamp,
+                    skill_name,
+                    event_type,
+                    source,
+                    confidence,
+                    detail,
+                } => {
+                    emit_skill_event(SkillTelemetryEvent {
+                        session_id,
+                        timestamp,
+                        skill_name,
+                        event_type,
+                        source,
+                        confidence,
+                        detail,
+                    });
+                }
+                watch::WatchEvent::McpEvent {
+                    session_id,
+                    timestamp,
+                    server,
+                    tool,
+                    event_type,
+                    source,
+                    detail,
+                } => {
+                    emit_mcp_event(McpTelemetryEvent {
+                        session_id,
+                        timestamp,
+                        server,
+                        tool,
+                        event_type,
+                        source,
+                        detail,
+                    });
+                }
+                other => watch::BROADCASTER.broadcast(other),
             }
-            watch::BROADCASTER.broadcast(event);
         }
 
         // Silent-fallback detector: Anthropic sometimes routes a request to a
@@ -2214,7 +2425,7 @@ fn finalize_response(
         let (turn_number, compaction_loop_signal) = {
             let mut entry = diagnosis::SESSION_TURNS
                 .entry(session_id.clone())
-                .or_insert_with(Vec::new);
+                .or_default();
             let n = entry.len() as u32 + 1;
             let gap = if let Some(prev) = entry.last() {
                 started_at.duration_since(prev.timestamp).as_secs_f64()
@@ -2807,7 +3018,7 @@ fn request_uses_1m_context(headers: &HttpHeaders) -> bool {
 
 fn resolve_context_window_tokens(header_hint: Option<u64>, model: &str) -> u64 {
     configured_context_window_tokens()
-        .or_else(|| header_hint)
+        .or(header_hint)
         .or_else(|| model_requests_1m_context(model).then_some(EXTENDED_CONTEXT_WINDOW_TOKENS))
         .unwrap_or(STANDARD_CONTEXT_WINDOW_TOKENS)
 }
@@ -3273,6 +3484,482 @@ struct ParsedToolResult {
     is_error: bool,
 }
 
+#[derive(Clone, Debug)]
+struct SkillTelemetryEvent {
+    session_id: String,
+    timestamp: String,
+    skill_name: String,
+    event_type: String,
+    source: String,
+    confidence: f64,
+    detail: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct McpTelemetryEvent {
+    session_id: String,
+    timestamp: String,
+    server: String,
+    tool: String,
+    event_type: String,
+    source: String,
+    detail: Option<String>,
+}
+
+#[derive(Default)]
+struct SkillTurnState {
+    expected: HashSet<String>,
+    fired: HashSet<String>,
+}
+
+static HOOK_SKILL_TURNS: LazyLock<Mutex<HashMap<String, SkillTurnState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn canonical_telemetry_name(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '/' | '$'));
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.ends_with("SKILL.md")
+        || trimmed.ends_with("Skill.md")
+        || trimmed.ends_with("skill.md")
+    {
+        let path = Path::new(trimmed);
+        if let Some(parent_name) = path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+        {
+            return canonical_telemetry_name(parent_name);
+        }
+    }
+
+    let mut out = String::with_capacity(trimmed.len());
+    let mut last_was_sep = false;
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_sep = false;
+        } else if matches!(ch, '-' | '_' | '.' | ':') {
+            out.push(ch);
+            last_was_sep = false;
+        } else if ch.is_ascii_whitespace() && !last_was_sep && !out.is_empty() {
+            out.push('-');
+            last_was_sep = true;
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn skill_name_from_tool_input_value(value: &Value) -> Option<String> {
+    if let Some(raw) = value.as_str() {
+        return canonical_telemetry_name(raw);
+    }
+
+    let fields = [
+        "skill_name",
+        "skill",
+        "command_name",
+        "command",
+        "name",
+        "id",
+        "path",
+        "file_path",
+    ];
+    for field in fields {
+        if let Some(raw) = value.get(field).and_then(|value| value.as_str()) {
+            if let Some(name) = canonical_telemetry_name(raw) {
+                if name != "skill" {
+                    return Some(name);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn skill_name_from_tool_input_json(raw: &str) -> Option<String> {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| skill_name_from_tool_input_value(&value))
+}
+
+fn truncate_detail(raw: &str, max: usize) -> String {
+    if raw.len() <= max {
+        raw.to_string()
+    } else {
+        format!("{}...", &raw[..max.min(raw.len())])
+    }
+}
+
+fn summarize_hook_tool_input(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(command) = value.get("command").and_then(|value| value.as_str()) {
+        return Some(truncate_detail(command, 100));
+    }
+    if let Some(path) = value
+        .get("file_path")
+        .or_else(|| value.get("path"))
+        .and_then(|value| value.as_str())
+    {
+        return Some(truncate_detail(path, 100));
+    }
+    if let Some(query) = value.get("query").and_then(|value| value.as_str()) {
+        return Some(truncate_detail(query, 100));
+    }
+    serde_json::to_string(value)
+        .ok()
+        .map(|json| truncate_detail(&json, 100))
+}
+
+fn remember_skill_turn_event(event: &SkillTelemetryEvent) {
+    if event.session_id.trim().is_empty() || event.session_id == "unknown" {
+        return;
+    }
+    let mut states = HOOK_SKILL_TURNS.lock().unwrap();
+    let state = states.entry(event.session_id.clone()).or_default();
+    match event.event_type.as_str() {
+        "expected" => {
+            state.expected.insert(event.skill_name.clone());
+        }
+        "fired" | "failed" => {
+            state.fired.insert(event.skill_name.clone());
+        }
+        _ => {}
+    }
+}
+
+fn emit_skill_event(event: SkillTelemetryEvent) {
+    remember_skill_turn_event(&event);
+    metrics::record_skill_event(&event.skill_name, &event.event_type, &event.source);
+    let _ = DB_TX.send(DbCommand::WriteSkillEvent {
+        session_id: event.session_id.clone(),
+        timestamp: event.timestamp.clone(),
+        skill_name: event.skill_name.clone(),
+        event_type: event.event_type.clone(),
+        confidence: event.confidence,
+        source: event.source.clone(),
+        detail: event.detail.clone(),
+    });
+    watch::BROADCASTER.broadcast(watch::WatchEvent::SkillEvent {
+        session_id: event.session_id,
+        timestamp: event.timestamp,
+        skill_name: event.skill_name,
+        event_type: event.event_type,
+        source: event.source,
+        confidence: event.confidence,
+        detail: event.detail,
+    });
+}
+
+fn emit_mcp_event(event: McpTelemetryEvent) {
+    metrics::record_mcp_event(&event.server, &event.tool, &event.event_type, &event.source);
+    let _ = DB_TX.send(DbCommand::WriteMcpEvent {
+        session_id: event.session_id.clone(),
+        timestamp: event.timestamp.clone(),
+        server: event.server.clone(),
+        tool: event.tool.clone(),
+        event_type: event.event_type.clone(),
+        source: event.source.clone(),
+        detail: event.detail.clone(),
+    });
+    watch::BROADCASTER.broadcast(watch::WatchEvent::McpEvent {
+        session_id: event.session_id,
+        timestamp: event.timestamp,
+        server: event.server,
+        tool: event.tool,
+        event_type: event.event_type,
+        source: event.source,
+        detail: event.detail,
+    });
+}
+
+fn extract_explicit_skill_refs(prompt: &str) -> HashSet<String> {
+    let mut refs = HashSet::new();
+    let mut chars = prompt.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if !matches!(ch, '/' | '$') {
+            continue;
+        }
+        let marker_at_token_boundary = prompt[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|prev| prev.is_whitespace() || matches!(prev, '(' | '[' | '{' | ','));
+        if !marker_at_token_boundary {
+            continue;
+        }
+        let mut raw = String::new();
+        while let Some((_, next)) = chars.peek().copied() {
+            if next.is_ascii_alphanumeric() || matches!(next, '-' | '_' | '.' | ':') {
+                raw.push(next);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if ch == '/'
+            && !raw
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_lowercase())
+        {
+            continue;
+        }
+        if let Some(name) = canonical_telemetry_name(&raw) {
+            refs.insert(name);
+        }
+    }
+    refs
+}
+
+fn normalize_phrase_for_match(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_space = true;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_space = false;
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn skill_name_from_skill_file(path: &Path, content: &str) -> Option<String> {
+    let mut lines = content.lines();
+    if lines.next()?.trim() == "---" {
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed == "---" {
+                break;
+            }
+            if let Some(raw) = trimmed.strip_prefix("name:") {
+                return canonical_telemetry_name(raw);
+            }
+        }
+    }
+    path.parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .and_then(canonical_telemetry_name)
+}
+
+fn discover_skill_names(cwd: Option<&str>) -> HashSet<String> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(cwd) = cwd {
+        dirs.push(Path::new(cwd).join(".claude/skills"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(Path::new(&home).join(".claude/skills"));
+    }
+
+    let mut names = HashSet::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let skill_path = entry.path().join("SKILL.md");
+            let Ok(content) = std::fs::read_to_string(&skill_path) else {
+                continue;
+            };
+            if let Some(name) = skill_name_from_skill_file(&skill_path, &content) {
+                names.insert(name);
+            }
+        }
+    }
+    names
+}
+
+fn expected_skill_names_from_prompt(prompt: &str, cwd: Option<&str>) -> HashSet<String> {
+    let mut expected = extract_explicit_skill_refs(prompt);
+    let known_skills = discover_skill_names(cwd);
+    if known_skills.is_empty() {
+        return expected;
+    }
+
+    let prompt_norm = normalize_phrase_for_match(prompt);
+    for skill in known_skills {
+        let skill_phrase = normalize_phrase_for_match(&skill.replace(['-', '_', ':'], " "));
+        if skill_phrase.is_empty() {
+            continue;
+        }
+        if prompt_norm.contains(&format!("use {skill_phrase}"))
+            || prompt_norm.contains(&format!("use the {skill_phrase} skill"))
+            || prompt_norm.contains(&format!("{skill_phrase} skill"))
+        {
+            expected.insert(skill);
+        }
+    }
+    expected
+}
+
+fn finalize_hook_skill_turn(session_id: &str, timestamp: &str) {
+    let state = {
+        let mut states = HOOK_SKILL_TURNS.lock().unwrap();
+        states.remove(session_id).unwrap_or_default()
+    };
+
+    for skill_name in state.expected.difference(&state.fired) {
+        emit_skill_event(SkillTelemetryEvent {
+            session_id: session_id.to_string(),
+            timestamp: timestamp.to_string(),
+            skill_name: skill_name.clone(),
+            event_type: "missed".to_string(),
+            source: "heuristic".to_string(),
+            confidence: 0.9,
+            detail: Some("expected skill did not fire before Stop".to_string()),
+        });
+    }
+
+    for skill_name in state.fired.difference(&state.expected) {
+        emit_skill_event(SkillTelemetryEvent {
+            session_id: session_id.to_string(),
+            timestamp: timestamp.to_string(),
+            skill_name: skill_name.clone(),
+            event_type: "misfired".to_string(),
+            source: "heuristic".to_string(),
+            confidence: 0.4,
+            detail: Some("skill fired without an explicit expected signal".to_string()),
+        });
+    }
+}
+
+fn hook_session_id(payload: &Value) -> String {
+    payload
+        .get("session_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn process_claude_code_hook_payload(payload: &Value, timestamp: String) {
+    let session_id = hook_session_id(payload);
+    let hook_event_name = payload
+        .get("hook_event_name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+
+    match hook_event_name {
+        "UserPromptSubmit" => {
+            let prompt = payload
+                .get("prompt")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let cwd = payload.get("cwd").and_then(|value| value.as_str());
+            for skill_name in expected_skill_names_from_prompt(prompt, cwd) {
+                emit_skill_event(SkillTelemetryEvent {
+                    session_id: session_id.clone(),
+                    timestamp: timestamp.clone(),
+                    skill_name,
+                    event_type: "expected".to_string(),
+                    source: "heuristic".to_string(),
+                    confidence: 0.8,
+                    detail: Some("prompt matched explicit skill trigger".to_string()),
+                });
+            }
+        }
+        "UserPromptExpansion" => {
+            if payload
+                .get("expansion_type")
+                .and_then(|value| value.as_str())
+                == Some("slash_command")
+            {
+                let Some(skill_name) = payload
+                    .get("command_name")
+                    .and_then(|value| value.as_str())
+                    .and_then(canonical_telemetry_name)
+                else {
+                    return;
+                };
+                let detail = payload
+                    .get("command_args")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                    .map(|value| truncate_detail(value, 100));
+                emit_skill_event(SkillTelemetryEvent {
+                    session_id: session_id.clone(),
+                    timestamp: timestamp.clone(),
+                    skill_name: skill_name.clone(),
+                    event_type: "expected".to_string(),
+                    source: "hook".to_string(),
+                    confidence: 1.0,
+                    detail: Some("direct slash command expansion".to_string()),
+                });
+                emit_skill_event(SkillTelemetryEvent {
+                    session_id,
+                    timestamp,
+                    skill_name,
+                    event_type: "fired".to_string(),
+                    source: "hook".to_string(),
+                    confidence: 1.0,
+                    detail,
+                });
+            }
+        }
+        "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "PermissionDenied" => {
+            let tool_name = payload
+                .get("tool_name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let tool_input = payload.get("tool_input");
+            if tool_name.eq_ignore_ascii_case("Skill") {
+                let skill_name = tool_input
+                    .and_then(skill_name_from_tool_input_value)
+                    .unwrap_or_else(|| "unknown".to_string());
+                let (event_type, confidence) = match hook_event_name {
+                    "PostToolUseFailure" => ("failed", 1.0),
+                    "PermissionDenied" => ("failed", 0.9),
+                    _ => ("fired", 1.0),
+                };
+                if hook_event_name != "PostToolUse" {
+                    emit_skill_event(SkillTelemetryEvent {
+                        session_id,
+                        timestamp,
+                        skill_name,
+                        event_type: event_type.to_string(),
+                        source: "hook".to_string(),
+                        confidence,
+                        detail: summarize_hook_tool_input(tool_input),
+                    });
+                }
+            } else if let Some((server, tool)) = metrics::mcp_tool_labels(tool_name) {
+                let event_type = match hook_event_name {
+                    "PostToolUse" => "succeeded",
+                    "PostToolUseFailure" => "failed",
+                    "PermissionDenied" => "denied",
+                    _ => "called",
+                };
+                emit_mcp_event(McpTelemetryEvent {
+                    session_id,
+                    timestamp,
+                    server,
+                    tool,
+                    event_type: event_type.to_string(),
+                    source: "hook".to_string(),
+                    detail: summarize_hook_tool_input(tool_input),
+                });
+            }
+        }
+        "Stop" | "StopFailure" => {
+            finalize_hook_skill_turn(&session_id, &timestamp);
+        }
+        _ => {}
+    }
+}
+
 /// Reconstruct the latest turn's tool results by pairing user `tool_result`
 /// blocks with prior assistant `tool_use` blocks via `tool_use_id`.
 fn parse_latest_tool_results(body: &[u8]) -> Vec<ParsedToolResult> {
@@ -3734,6 +4421,11 @@ async fn handle_metrics() -> impl IntoResponse {
     }
 }
 
+async fn handle_claude_code_hook(Json(payload): Json<Value>) -> impl IntoResponse {
+    process_claude_code_hook_payload(&payload, now_iso8601());
+    StatusCode::NO_CONTENT
+}
+
 async fn handle_summary() -> impl IntoResponse {
     let summary = tokio::task::spawn_blocking(|| {
         let conn = Connection::open(db_path()).ok()?;
@@ -3838,6 +4530,8 @@ fn event_matches_session(ev: &watch::WatchEvent, filter: Option<&str>) -> bool {
     match ev {
         watch::WatchEvent::ToolUse { session_id, .. }
         | watch::WatchEvent::ToolResult { session_id, .. }
+        | watch::WatchEvent::SkillEvent { session_id, .. }
+        | watch::WatchEvent::McpEvent { session_id, .. }
         | watch::WatchEvent::CacheEvent { session_id, .. }
         | watch::WatchEvent::SessionStart { session_id, .. }
         | watch::WatchEvent::SessionEnd { session_id, .. }
@@ -4658,6 +5352,7 @@ async fn http_server() {
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
+        .route("/api/hooks/claude-code", post(handle_claude_code_hook))
         .route("/api/summary", get(handle_summary))
         .route("/api/recall", get(handle_recall))
         .route(
@@ -4673,7 +5368,7 @@ async fn http_server() {
     let listener = tokio::net::TcpListener::bind("0.0.0.0:9090")
         .await
         .expect("failed to bind :9090");
-    info!("HTTP server listening on 0.0.0.0:9090 (/health, /metrics, /api/summary, /api/recall, /api/billing-reconciliations, /api/sessions, /api/cache-rebuilds, /api/degradation, /watch)");
+    info!("HTTP server listening on 0.0.0.0:9090 (/health, /metrics, /api/hooks/claude-code, /api/summary, /api/recall, /api/billing-reconciliations, /api/sessions, /api/cache-rebuilds, /api/degradation, /watch)");
     axum::serve(listener, app).await.expect("HTTP server error");
 }
 
@@ -5006,16 +5701,17 @@ mod tests {
 
     use super::{
         build_diagnosis_response_json, build_session_summary_json, build_sessions_response_json,
-        build_summary_response_json, compact_response_summary, db_writer_loop,
-        ensure_session_columns, epoch_to_iso8601, load_degradation_view_from_db, metrics,
-        now_epoch_secs, parse_latest_tool_results, persist_billing_reconciliation, pricing,
-        query_historical_metrics, query_summary, repair_persisted_session_artifacts,
-        repair_turn_snapshot_context_windows, request_uses_1m_context,
-        resolve_context_window_tokens, seed_live_metric_labels_from_db, session_timeout_secs,
-        should_broadcast_quota_snapshot, BillingReconciliationInput,
-        BillingReconciliationWriteError, DbCommand, HttpHeaders, ParsedToolResult,
-        ProtoHeaderValue, SummaryWindowData, ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS,
-        QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA, STANDARD_CONTEXT_WINDOW_TOKENS,
+        build_summary_response_json, canonical_telemetry_name, compact_response_summary,
+        db_writer_loop, ensure_session_columns, epoch_to_iso8601, extract_explicit_skill_refs,
+        load_degradation_view_from_db, metrics, now_epoch_secs, parse_latest_tool_results,
+        persist_billing_reconciliation, pricing, query_historical_metrics, query_summary,
+        repair_persisted_session_artifacts, repair_turn_snapshot_context_windows,
+        request_uses_1m_context, resolve_context_window_tokens, seed_live_metric_labels_from_db,
+        session_timeout_secs, should_broadcast_quota_snapshot, skill_name_from_tool_input_json,
+        BillingReconciliationInput, BillingReconciliationWriteError, DbCommand, HttpHeaders,
+        ParsedToolResult, ProtoHeaderValue, SummaryWindowData, ESTIMATED_COST_SOURCE,
+        EXTENDED_CONTEXT_WINDOW_TOKENS, QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA,
+        STANDARD_CONTEXT_WINDOW_TOKENS,
     };
 
     static METRICS_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -5104,6 +5800,14 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open sqlite");
         conn.execute_batch(SCHEMA).expect("create full test schema");
         conn
+    }
+
+    fn metric_line_has(body: &str, metric: &str, labels: &[&str], value: &str) -> bool {
+        body.lines().any(|line| {
+            line.starts_with(metric)
+                && labels.iter().all(|label| line.contains(label))
+                && line.ends_with(value)
+        })
     }
 
     #[test]
@@ -5285,10 +5989,9 @@ mod tests {
                     .map(|(key, value)| ProtoHeaderValue {
                         key: (*key).to_string(),
                         value: (*value).to_string(),
-                        ..Default::default()
+                        raw_value: Vec::new(),
                     })
                     .collect(),
-                ..Default::default()
             }),
             ..Default::default()
         }
@@ -5669,6 +6372,31 @@ mod tests {
             body.contains("clauditor_model_fallback_total{actual=\"sonnet\",requested=\"opus\"} 0")
         );
         assert!(body.contains("clauditor_tool_failures_total{tool=\"unknown\"} 0"));
+        assert!(
+            body.contains("clauditor_mcp_tool_calls_total{server=\"unknown\",tool=\"unknown\"} 0")
+        );
+        assert!(body.contains("clauditor_mcp_server_calls_total{server=\"unknown\"} 0"));
+        assert!(metric_line_has(
+            &body,
+            "clauditor_mcp_events_total",
+            &[
+                "server=\"unknown\"",
+                "tool=\"unknown\"",
+                "event_type=\"called\"",
+                "source=\"hook\""
+            ],
+            " 0"
+        ));
+        assert!(metric_line_has(
+            &body,
+            "clauditor_skill_events_total",
+            &[
+                "skill=\"unknown\"",
+                "event_type=\"fired\"",
+                "source=\"hook\""
+            ],
+            " 0"
+        ));
     }
 
     #[test]
@@ -5710,6 +6438,37 @@ mod tests {
             ],
         )
         .expect("insert tool outcome");
+        conn.execute(
+            "INSERT INTO tool_calls (request_id, timestamp, tool_name) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["req_1", "2026-01-01T00:00:01Z", "mcp__github__get_issue"],
+        )
+        .expect("insert mcp tool call");
+        conn.execute(
+            "INSERT INTO skill_events (session_id, timestamp, skill_name, event_type, confidence, source) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "session_1",
+                "2026-01-01T00:00:02Z",
+                "openai-docs",
+                "fired",
+                1.0,
+                "hook"
+            ],
+        )
+        .expect("insert skill event");
+        conn.execute(
+            "INSERT INTO mcp_events (session_id, timestamp, server, tool, event_type, source) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "session_1",
+                "2026-01-01T00:00:03Z",
+                "github",
+                "get_issue",
+                "called",
+                "hook"
+            ],
+        )
+        .expect("insert mcp event");
 
         seed_live_metric_labels_from_db(&conn).expect("seed tool labels");
 
@@ -5718,6 +6477,84 @@ mod tests {
         assert!(body.contains("clauditor_tool_failures_total{tool=\"bash\"} 0"));
         assert!(body.contains("clauditor_tool_calls_total{tool=\"read_file\"} 0"));
         assert!(body.contains("clauditor_tool_failures_total{tool=\"read_file\"} 0"));
+        assert!(
+            body.contains("clauditor_mcp_tool_calls_total{server=\"github\",tool=\"get_issue\"} 0")
+        );
+        assert!(body
+            .contains("clauditor_mcp_tool_failures_total{server=\"github\",tool=\"get_issue\"} 0"));
+        assert!(body.contains("clauditor_mcp_server_calls_total{server=\"github\"} 0"));
+        assert!(body.contains("clauditor_mcp_server_failures_total{server=\"github\"} 0"));
+        assert!(metric_line_has(
+            &body,
+            "clauditor_skill_events_total",
+            &[
+                "skill=\"openai-docs\"",
+                "event_type=\"fired\"",
+                "source=\"hook\""
+            ],
+            " 0"
+        ));
+        assert!(metric_line_has(
+            &body,
+            "clauditor_mcp_events_total",
+            &[
+                "server=\"github\"",
+                "tool=\"get_issue\"",
+                "event_type=\"called\"",
+                "source=\"hook\""
+            ],
+            " 0"
+        ));
+    }
+
+    #[test]
+    fn tool_metric_path_records_mcp_breakdowns() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        metrics::init();
+
+        let tool_name = "mcp__metricstest_server__lookup_widget";
+        metrics::record_tool_call(tool_name);
+        metrics::record_tool_failures(tool_name, 2);
+
+        let (_, body) = metrics::render().expect("render metrics");
+        assert!(body.contains(
+            "clauditor_tool_calls_total{tool=\"mcp__metricstest_server__lookup_widget\"} 1"
+        ));
+        assert!(body.contains(
+            "clauditor_tool_failures_total{tool=\"mcp__metricstest_server__lookup_widget\"} 2"
+        ));
+        assert!(body.contains(
+            "clauditor_mcp_tool_calls_total{server=\"metricstest_server\",tool=\"lookup_widget\"} 1"
+        ));
+        assert!(body.contains(
+            "clauditor_mcp_tool_failures_total{server=\"metricstest_server\",tool=\"lookup_widget\"} 2"
+        ));
+        assert!(body.contains("clauditor_mcp_server_calls_total{server=\"metricstest_server\"} 1"));
+        assert!(
+            body.contains("clauditor_mcp_server_failures_total{server=\"metricstest_server\"} 2")
+        );
+        assert!(metric_line_has(
+            &body,
+            "clauditor_mcp_events_total",
+            &[
+                "server=\"metricstest_server\"",
+                "tool=\"lookup_widget\"",
+                "event_type=\"called\"",
+                "source=\"proxy\""
+            ],
+            " 1"
+        ));
+        assert!(metric_line_has(
+            &body,
+            "clauditor_mcp_events_total",
+            &[
+                "server=\"metricstest_server\"",
+                "tool=\"lookup_widget\"",
+                "event_type=\"failed\"",
+                "source=\"proxy\""
+            ],
+            " 2"
+        ));
     }
 
     #[test]
@@ -6159,6 +6996,51 @@ mod tests {
             "claude-opus-4-7",
             "claude-opus-4-7[1m]"
         ));
+    }
+
+    #[test]
+    fn canonical_skill_names_are_metric_friendly() {
+        assert_eq!(
+            canonical_telemetry_name("/OpenAI Docs"),
+            Some("openai-docs".to_string())
+        );
+        assert_eq!(
+            canonical_telemetry_name("/tmp/project/.claude/skills/review/SKILL.md"),
+            Some("review".to_string())
+        );
+        assert_eq!(canonical_telemetry_name("   "), None);
+    }
+
+    #[test]
+    fn skill_tool_input_extracts_name_variants() {
+        assert_eq!(
+            skill_name_from_tool_input_json(r#"{"skill_name":"openai-docs"}"#),
+            Some("openai-docs".to_string())
+        );
+        assert_eq!(
+            skill_name_from_tool_input_json(
+                r#"{"file_path":"/tmp/.claude/skills/browser-use/SKILL.md"}"#
+            ),
+            Some("browser-use".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_skill_refs_detect_slash_and_dollar_mentions() {
+        let refs = extract_explicit_skill_refs("Use /openai-docs and $browser-use:browser here");
+        assert!(refs.contains("openai-docs"));
+        assert!(refs.contains("browser-use:browser"));
+    }
+
+    #[test]
+    fn explicit_skill_refs_ignore_inline_slashes_and_absolute_paths() {
+        let refs = extract_explicit_skill_refs(
+            "Use read/list/search tools in /Users/pradeep/code, then /base-gke-readonly",
+        );
+        assert!(refs.contains("base-gke-readonly"));
+        assert!(!refs.contains("list"));
+        assert!(!refs.contains("search"));
+        assert!(!refs.contains("users"));
     }
 
     #[test]

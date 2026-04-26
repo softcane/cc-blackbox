@@ -12,6 +12,10 @@ pub const HISTORY_WINDOWS: [(&str, u64); 3] = [("1d", 1), ("7d", 7), ("30d", 30)
 pub const HISTORY_MODELS: [&str; 4] = ["opus", "sonnet", "haiku", "other"];
 const LIVE_MODELS: [&str; 4] = ["opus", "sonnet", "haiku", "other"];
 const LIVE_CACHE_EVENT_TYPES: [&str; 4] = ["cold_start", "partial", "miss_ttl", "miss_thrash"];
+const LIVE_SKILL_EVENT_TYPES: [&str; 5] = ["expected", "fired", "missed", "misfired", "failed"];
+const LIVE_SKILL_EVENT_SOURCES: [&str; 3] = ["hook", "proxy", "heuristic"];
+const LIVE_MCP_EVENT_TYPES: [&str; 4] = ["called", "succeeded", "failed", "denied"];
+const LIVE_MCP_EVENT_SOURCES: [&str; 2] = ["hook", "proxy"];
 pub const HISTORY_CACHE_EVENT_TYPES: [&str; 2] = ["miss_ttl", "miss_thrash"];
 pub const HISTORY_CAUSE_TYPES: [&str; 8] = [
     "cache_miss_ttl",
@@ -54,6 +58,12 @@ pub struct ClauditorMetrics {
     compaction_suspected_total: IntCounter,
     tool_calls_total: IntCounterVec,
     tool_failures_total: IntCounterVec,
+    mcp_tool_calls_total: IntCounterVec,
+    mcp_tool_failures_total: IntCounterVec,
+    mcp_server_calls_total: IntCounterVec,
+    mcp_server_failures_total: IntCounterVec,
+    mcp_events_total: IntCounterVec,
+    skill_events_total: IntCounterVec,
     active_sessions: IntGauge,
     weekly_tokens_used: IntGauge,
     weekly_tokens_remaining: IntGauge,
@@ -172,6 +182,54 @@ impl ClauditorMetrics {
                 &["tool"]
             )
             .expect("register clauditor_tool_failures_total"),
+            mcp_tool_calls_total: register_int_counter_vec!(
+                opts!(
+                    "clauditor_mcp_tool_calls_total",
+                    "MCP tool calls observed in assistant responses, split by MCP server and tool."
+                ),
+                &["server", "tool"]
+            )
+            .expect("register clauditor_mcp_tool_calls_total"),
+            mcp_tool_failures_total: register_int_counter_vec!(
+                opts!(
+                    "clauditor_mcp_tool_failures_total",
+                    "MCP tool failures observed from tool_result blocks, split by MCP server and tool."
+                ),
+                &["server", "tool"]
+            )
+            .expect("register clauditor_mcp_tool_failures_total"),
+            mcp_server_calls_total: register_int_counter_vec!(
+                opts!(
+                    "clauditor_mcp_server_calls_total",
+                    "MCP tool calls observed in assistant responses, split by MCP server."
+                ),
+                &["server"]
+            )
+            .expect("register clauditor_mcp_server_calls_total"),
+            mcp_server_failures_total: register_int_counter_vec!(
+                opts!(
+                    "clauditor_mcp_server_failures_total",
+                    "MCP tool failures observed from tool_result blocks, split by MCP server."
+                ),
+                &["server"]
+            )
+            .expect("register clauditor_mcp_server_failures_total"),
+            mcp_events_total: register_int_counter_vec!(
+                opts!(
+                    "clauditor_mcp_events_total",
+                    "MCP lifecycle events observed by source."
+                ),
+                &["server", "tool", "event_type", "source"]
+            )
+            .expect("register clauditor_mcp_events_total"),
+            skill_events_total: register_int_counter_vec!(
+                opts!(
+                    "clauditor_skill_events_total",
+                    "Skill lifecycle events observed or inferred by clauditor."
+                ),
+                &["skill", "event_type", "source"]
+            )
+            .expect("register clauditor_skill_events_total"),
             active_sessions: register_int_gauge!(
                 "clauditor_active_sessions",
                 "Tracked active sessions currently in memory."
@@ -342,6 +400,17 @@ pub fn init() {
     }
 
     ensure_tool_metric_labels("unknown");
+    ensure_mcp_metric_labels_for_parts("unknown", "unknown");
+    for event_type in LIVE_MCP_EVENT_TYPES {
+        for source in LIVE_MCP_EVENT_SOURCES {
+            ensure_mcp_event_metric_labels("unknown", "unknown", event_type, source);
+        }
+    }
+    for event_type in LIVE_SKILL_EVENT_TYPES {
+        for source in LIVE_SKILL_EVENT_SOURCES {
+            ensure_skill_metric_labels("unknown", event_type, source);
+        }
+    }
 }
 
 pub fn record_request(
@@ -449,6 +518,17 @@ pub fn record_tool_call(tool_name: &str) {
         .tool_calls_total
         .with_label_values(&[tool.as_str()])
         .inc();
+    if let Some((server, mcp_tool)) = mcp_tool_labels(tool_name) {
+        METRICS
+            .mcp_tool_calls_total
+            .with_label_values(&[server.as_str(), mcp_tool.as_str()])
+            .inc();
+        METRICS
+            .mcp_server_calls_total
+            .with_label_values(&[server.as_str()])
+            .inc();
+        record_mcp_event_parts(&server, &mcp_tool, "called", "proxy");
+    }
 }
 
 pub fn record_tool_failures(tool_name: &str, failures: u64) {
@@ -460,6 +540,17 @@ pub fn record_tool_failures(tool_name: &str, failures: u64) {
         .tool_failures_total
         .with_label_values(&[tool.as_str()])
         .inc_by(failures);
+    if let Some((server, mcp_tool)) = mcp_tool_labels(tool_name) {
+        METRICS
+            .mcp_tool_failures_total
+            .with_label_values(&[server.as_str(), mcp_tool.as_str()])
+            .inc_by(failures);
+        METRICS
+            .mcp_server_failures_total
+            .with_label_values(&[server.as_str()])
+            .inc_by(failures);
+        record_mcp_event_parts_by(&server, &mcp_tool, "failed", "proxy", failures);
+    }
 }
 
 pub fn ensure_tool_metric_labels(tool_name: &str) {
@@ -468,6 +559,76 @@ pub fn ensure_tool_metric_labels(tool_name: &str) {
     METRICS
         .tool_failures_total
         .with_label_values(&[tool.as_str()]);
+    if let Some((server, mcp_tool)) = mcp_tool_labels(tool_name) {
+        ensure_mcp_metric_labels_for_parts(&server, &mcp_tool);
+    }
+}
+
+fn ensure_mcp_metric_labels_for_parts(server: &str, tool: &str) {
+    METRICS
+        .mcp_tool_calls_total
+        .with_label_values(&[server, tool]);
+    METRICS
+        .mcp_tool_failures_total
+        .with_label_values(&[server, tool]);
+    METRICS.mcp_server_calls_total.with_label_values(&[server]);
+    METRICS
+        .mcp_server_failures_total
+        .with_label_values(&[server]);
+}
+
+pub fn record_mcp_event(server: &str, tool: &str, event_type: &str, source: &str) {
+    let server = normalize_tool(server);
+    let tool = normalize_tool(tool);
+    record_mcp_event_parts(&server, &tool, event_type, source);
+}
+
+fn record_mcp_event_parts(server: &str, tool: &str, event_type: &str, source: &str) {
+    record_mcp_event_parts_by(server, tool, event_type, source, 1);
+}
+
+fn record_mcp_event_parts_by(server: &str, tool: &str, event_type: &str, source: &str, count: u64) {
+    if count == 0 {
+        return;
+    }
+    let event_type = normalize_mcp_event_type(event_type);
+    let source = normalize_mcp_event_source(source);
+    METRICS
+        .mcp_events_total
+        .with_label_values(&[server, tool, event_type, source])
+        .inc_by(count);
+}
+
+pub fn record_skill_event(skill_name: &str, event_type: &str, source: &str) {
+    let skill = normalize_tool(skill_name);
+    let event_type = normalize_skill_event_type(event_type);
+    let source = normalize_skill_event_source(source);
+    METRICS
+        .skill_events_total
+        .with_label_values(&[skill.as_str(), event_type, source])
+        .inc();
+}
+
+pub fn ensure_skill_metric_labels(skill_name: &str, event_type: &str, source: &str) {
+    let skill = normalize_tool(skill_name);
+    let event_type = normalize_skill_event_type(event_type);
+    let source = normalize_skill_event_source(source);
+    METRICS
+        .skill_events_total
+        .with_label_values(&[skill.as_str(), event_type, source]);
+}
+
+pub fn ensure_mcp_event_metric_labels(server: &str, tool: &str, event_type: &str, source: &str) {
+    let server = normalize_tool(server);
+    let tool = normalize_tool(tool);
+    let event_type = normalize_mcp_event_type(event_type);
+    let source = normalize_mcp_event_source(source);
+    METRICS.mcp_events_total.with_label_values(&[
+        server.as_str(),
+        tool.as_str(),
+        event_type,
+        source,
+    ]);
 }
 
 pub fn set_active_sessions(count: usize) {
@@ -703,6 +864,44 @@ fn normalize_cause(cause_type: &str) -> &str {
     }
 }
 
+fn normalize_skill_event_type(event_type: &str) -> &'static str {
+    match event_type {
+        "expected" => "expected",
+        "fired" => "fired",
+        "missed" => "missed",
+        "misfired" => "misfired",
+        "failed" => "failed",
+        _ => "other",
+    }
+}
+
+fn normalize_skill_event_source(source: &str) -> &'static str {
+    match source {
+        "hook" => "hook",
+        "proxy" => "proxy",
+        "heuristic" => "heuristic",
+        _ => "other",
+    }
+}
+
+fn normalize_mcp_event_type(event_type: &str) -> &'static str {
+    match event_type {
+        "called" => "called",
+        "succeeded" => "succeeded",
+        "failed" => "failed",
+        "denied" => "denied",
+        _ => "other",
+    }
+}
+
+fn normalize_mcp_event_source(source: &str) -> &'static str {
+    match source {
+        "hook" => "hook",
+        "proxy" => "proxy",
+        _ => "other",
+    }
+}
+
 pub fn historical_cause_label(cause_type: &str) -> Option<&'static str> {
     HISTORY_CAUSE_TYPES
         .iter()
@@ -746,5 +945,44 @@ fn normalize_tool(tool_name: &str) -> String {
         "unknown".to_string()
     } else {
         normalized
+    }
+}
+
+pub fn mcp_tool_labels(tool_name: &str) -> Option<(String, String)> {
+    let rest = tool_name.trim().strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
+    if server.trim().is_empty() || tool.trim().is_empty() {
+        return None;
+    }
+
+    Some((normalize_tool(server), normalize_tool(tool)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mcp_tool_labels;
+
+    #[test]
+    fn parses_mcp_tool_labels() {
+        assert_eq!(
+            mcp_tool_labels("mcp__github__get_issue"),
+            Some(("github".to_string(), "get_issue".to_string()))
+        );
+        assert_eq!(
+            mcp_tool_labels(" mcp__Git Hub__Get Issue "),
+            Some(("git_hub".to_string(), "get_issue".to_string()))
+        );
+        assert_eq!(
+            mcp_tool_labels("mcp__server__tool__with_suffix"),
+            Some(("server".to_string(), "tool__with_suffix".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_non_mcp_tool_labels() {
+        assert_eq!(mcp_tool_labels("Bash"), None);
+        assert_eq!(mcp_tool_labels("mcp__github"), None);
+        assert_eq!(mcp_tool_labels("mcp____get_issue"), None);
+        assert_eq!(mcp_tool_labels("mcp__github__"), None);
     }
 }

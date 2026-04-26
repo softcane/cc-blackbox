@@ -117,6 +117,26 @@ pub(crate) enum WatchEvent {
         outcome: String,
         duration_ms: u64,
     },
+    SkillEvent {
+        session_id: String,
+        timestamp: String,
+        skill_name: String,
+        event_type: String,
+        source: String,
+        confidence: f64,
+        #[serde(default)]
+        detail: Option<String>,
+    },
+    McpEvent {
+        session_id: String,
+        timestamp: String,
+        server: String,
+        tool: String,
+        event_type: String,
+        source: String,
+        #[serde(default)]
+        detail: Option<String>,
+    },
     CacheEvent {
         session_id: String,
         event_type: String,
@@ -311,6 +331,8 @@ pub(crate) fn event_session_id(event: &WatchEvent) -> Option<&str> {
     match event {
         WatchEvent::ToolUse { session_id, .. }
         | WatchEvent::ToolResult { session_id, .. }
+        | WatchEvent::SkillEvent { session_id, .. }
+        | WatchEvent::McpEvent { session_id, .. }
         | WatchEvent::CacheEvent { session_id, .. }
         | WatchEvent::SessionStart { session_id, .. }
         | WatchEvent::SessionEnd { session_id, .. }
@@ -372,6 +394,16 @@ fn print_tagged(tag: &str, line: &str) {
         println!("{}", line);
     } else {
         println!("{}{}", tag.dimmed(), line);
+    }
+}
+
+fn parse_mcp_tool_name(tool_name: &str) -> Option<(&str, &str)> {
+    let rest = tool_name.trim().strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
+    if server.is_empty() || tool.is_empty() {
+        None
+    } else {
+        Some((server, tool))
     }
 }
 
@@ -473,11 +505,11 @@ fn render_event(
             {
                 format!("{} \u{2713}", outcome).green().to_string()
             } else if outcome.contains("Partially Completed") {
-                format!("{}", outcome).yellow().to_string()
+                outcome.to_string().yellow().to_string()
             } else if outcome.contains("Abandoned") {
-                format!("{}", outcome).dimmed().to_string()
+                outcome.to_string().dimmed().to_string()
             } else {
-                format!("{}", outcome).yellow().to_string()
+                outcome.to_string().yellow().to_string()
             };
             let tokens_display = format_tokens(*total_tokens);
             print_tagged(
@@ -500,6 +532,20 @@ fn render_event(
             summary,
         } => {
             let time = local_time_from_iso(timestamp);
+            if let Some((server, tool)) = parse_mcp_tool_name(tool_name) {
+                let summary_display = if summary.len() > 80 {
+                    format!("{}...", &summary[..77])
+                } else {
+                    summary.clone()
+                };
+                let line = if summary_display.is_empty() {
+                    format!("{}  MCP     {}.{}", time, server, tool)
+                } else {
+                    format!("{}  MCP     {}.{}  {}", time, server, tool, summary_display)
+                };
+                print_tagged(&tag, &line.cyan().to_string());
+                return;
+            }
             let label = format!("{:<6}", tool_name.to_uppercase());
             let summary_display = if summary.len() > 80 {
                 format!("{}...", &summary[..77])
@@ -517,6 +563,68 @@ fn render_event(
                 _ => line.white().to_string(),
             };
             print_tagged(&tag, &colored_line);
+        }
+
+        WatchEvent::SkillEvent {
+            session_id: _,
+            timestamp,
+            skill_name,
+            event_type,
+            source,
+            confidence,
+            detail,
+        } => {
+            let time = local_time_from_iso(timestamp);
+            let detail_suffix = detail
+                .as_ref()
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("  {}", truncate_for_box(value, 80)))
+                .unwrap_or_default();
+            let line = format!(
+                "{}  SKILL   {} {} [{} {:.0}%]{}",
+                time,
+                skill_name,
+                event_type,
+                source,
+                confidence * 100.0,
+                detail_suffix
+            );
+            let colored = match event_type.as_str() {
+                "fired" => line.green().to_string(),
+                "expected" => line.dimmed().to_string(),
+                "missed" | "misfired" => line.yellow().bold().to_string(),
+                "failed" => line.red().bold().to_string(),
+                _ => line.white().to_string(),
+            };
+            print_tagged(&tag, &colored);
+        }
+
+        WatchEvent::McpEvent {
+            session_id: _,
+            timestamp,
+            server,
+            tool,
+            event_type,
+            source,
+            detail,
+        } => {
+            let time = local_time_from_iso(timestamp);
+            let detail_suffix = detail
+                .as_ref()
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("  {}", truncate_for_box(value, 80)))
+                .unwrap_or_default();
+            let line = format!(
+                "{}  MCP     {}.{} {} [{}]{}",
+                time, server, tool, event_type, source, detail_suffix
+            );
+            let colored = match event_type.as_str() {
+                "succeeded" => line.green().dimmed().to_string(),
+                "failed" | "denied" => line.red().bold().to_string(),
+                "called" => line.cyan().to_string(),
+                _ => line.white().to_string(),
+            };
+            print_tagged(&tag, &colored);
         }
 
         WatchEvent::ToolResult {
@@ -1099,8 +1207,8 @@ async fn fetch_sessions(url: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Header
     println!(
-        "{:<22} {:<18} {:<8} {:<22} {:<16} {:<14} {:<8} {}",
-        "SESSION", "MODEL", "TURNS", "OUTCOME", "ESTIMATED COST", "BILLED COST", "CACHE%", "CAUSE"
+        "{:<22} {:<18} {:<8} {:<22} {:<16} {:<14} {:<8} CAUSE",
+        "SESSION", "MODEL", "TURNS", "OUTCOME", "ESTIMATED COST", "BILLED COST", "CACHE%"
     );
     println!("{}", "-".repeat(122));
 
@@ -1137,14 +1245,12 @@ async fn fetch_sessions(url: &str) -> Result<(), Box<dyn std::error::Error>> {
 
         if degraded {
             println!("{}", line.yellow());
+        } else if outcome.contains("Completed") && !outcome.contains("Partially") {
+            println!("{}", line.green());
+        } else if outcome.contains("Abandoned") {
+            println!("{}", line.dimmed());
         } else {
-            if outcome.contains("Completed") && !outcome.contains("Partially") {
-                println!("{}", line.green());
-            } else if outcome.contains("Abandoned") {
-                println!("{}", line.dimmed());
-            } else {
-                println!("{}", line);
-            }
+            println!("{}", line);
         }
     }
 
@@ -1303,8 +1409,8 @@ async fn connect_and_stream(
                 .to_string();
             line_buffer = line_buffer[newline_pos + 1..].to_string();
 
-            if line.starts_with("data: ") {
-                data_buffer.push_str(&line[6..]);
+            if let Some(data) = line.strip_prefix("data: ") {
+                data_buffer.push_str(data);
             } else if line.starts_with(": ") || line.starts_with(':') {
                 continue;
             } else if line.is_empty() && !data_buffer.is_empty() {

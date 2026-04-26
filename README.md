@@ -126,9 +126,117 @@ This searches the cleaned first prompt and the compact final summary for each st
 curl -s http://127.0.0.1:9091/metrics | grep '^clauditor_'
 ```
 
+**Enable Claude Code hook telemetry**
+
+Add hooks like these to your Claude Code settings, for example
+`.claude/settings.local.json` for one project or `~/.claude/settings.json`
+globally. The Docker Compose stack exposes Clauditor on host port `9091`;
+if you run `clauditor-core` directly, use its default `9090` port instead.
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:9091/api/hooks/claude-code",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "UserPromptExpansion": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:9091/api/hooks/claude-code",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^(Skill|mcp__.*)$",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:9091/api/hooks/claude-code",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^mcp__.*$",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:9091/api/hooks/claude-code",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "^(Skill|mcp__.*)$",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:9091/api/hooks/claude-code",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PermissionDenied": [
+      {
+        "matcher": "^(Skill|mcp__.*)$",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:9091/api/hooks/claude-code",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:9091/api/hooks/claude-code",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:9091/api/hooks/claude-code",
+            "timeout": 2
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
 ## What Clauditor surfaces
 
-- **Tool activity.** Reads, edits, bash commands, grep/glob calls, and tool failures.
+- **Tool activity.** Reads, edits, bash commands, grep/glob calls, MCP server/tool usage, and tool failures.
+- **Skill telemetry.** Expected, fired, missed, misfired, and failed skills from hooks plus conservative proxy inference.
 - **Cache intelligence.** Cache hits, misses, expiry countdown, and estimated rebuild cost.
 - **Context pressure.** Fill percentage and projected turns-to-compact as a heuristic.
   Fill percentage is computed against the detected context window for the current request, including extended-context requests such as `sonnet[1m]` or `opus[1m]`.

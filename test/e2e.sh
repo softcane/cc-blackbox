@@ -62,9 +62,9 @@ pass "Sent 5 API requests"
 
 # --- Verify Prometheus metrics ---
 metrics=$(docker run --rm --network clauditor_default curlimages/curl:latest -sf http://clauditor-core:9090/metrics 2>&1)
-echo "$metrics" | grep -q "clauditor_requests_total" && pass "Prometheus metrics populated" || fail "No clauditor metrics"
-echo "$metrics" | grep -q "clauditor_turn_duration_seconds" && pass "Turn duration metrics present" || fail "No turn duration metrics"
-echo "$metrics" | grep -q "clauditor_active_sessions" && pass "Session gauges registered" || fail "No active session gauge"
+grep -q "clauditor_requests_total" <<<"$metrics" && pass "Prometheus metrics populated" || fail "No clauditor metrics"
+grep -q "clauditor_turn_duration_seconds" <<<"$metrics" && pass "Turn duration metrics present" || fail "No turn duration metrics"
+grep -q "clauditor_active_sessions" <<<"$metrics" && pass "Session gauges registered" || fail "No active session gauge"
 
 # --- Verify SQLite has records ---
 summary=$(docker run --rm --network clauditor_default curlimages/curl:latest -sf http://clauditor-core:9090/api/summary 2>&1)
@@ -123,8 +123,8 @@ sessions2=$(echo "$summary2" | python3 -c "import sys,json; print(json.load(sys.
 
 # --- Verify core metrics still work after restart ---
 metrics2=$(docker run --rm --network clauditor_default curlimages/curl:latest -sf http://clauditor-core:9090/metrics 2>&1)
-echo "$metrics2" | grep -q "clauditor_history_estimated_spend_dollars" && pass "Historical spend metrics present" || fail "Historical spend metrics missing"
-echo "$metrics2" | grep -q "clauditor_history_cache_hit_ratio" && pass "Historical cache metrics present" || fail "Historical cache metrics missing"
+grep -q "clauditor_history_estimated_spend_dollars" <<<"$metrics2" && pass "Historical spend metrics present" || fail "Historical spend metrics missing"
+grep -q "clauditor_history_cache_hit_ratio" <<<"$metrics2" && pass "Historical cache metrics present" || fail "Historical cache metrics missing"
 
 # --- Verify failure_mode_allow ---
 echo "Testing failure_mode_allow..."
@@ -138,7 +138,7 @@ response=$(curl -s --max-time 10 http://localhost:10000/v1/messages \
     -H "content-type: application/json" \
     -d '{"model":"claude-haiku-4-5-20241022","max_tokens":10,"messages":[{"role":"user","content":"failover test"}]}' 2>&1 || echo "connection_failed")
 docker compose start clauditor-core 2>&1 | tail -1
-echo "$response" | grep -q "authentication_error\|invalid\|error" && pass "failure_mode_allow works" || fail "Proxy failed without ext_proc: $response"
+grep -Eq "authentication_error|invalid|error" <<<"$response" && pass "failure_mode_allow works" || fail "Proxy failed without ext_proc: $response"
 
 # --- Check image size ---
 size=$(docker images clauditor-clauditor-core --format '{{.Size}}' | head -1)

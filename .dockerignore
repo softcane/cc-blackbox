@@ -1,0 +1,7 @@
+**
+!Cargo.toml
+!Cargo.lock
+!clauditor-cli/
+!clauditor-cli/**
+!clauditor-core/
+!clauditor-core/**

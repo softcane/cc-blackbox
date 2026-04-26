@@ -16,8 +16,8 @@ services:
 
   clauditor-core:
     build:
-      context: ./clauditor-core
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: clauditor-core/Dockerfile
     expose:
       - "50051"
     ports:

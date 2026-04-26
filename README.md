@@ -12,27 +12,27 @@ Clauditor runs on your machine. It does not phone home and does not send Claudit
 
 ## What Clauditor Catches
 
-- **Stuck or runaway sessions.** See which session is active, idle, blocked, or burning through repeated work.
-- **Tool loops and repeated tool failures.** Spot noisy reads, edits, bash calls, MCP activity, and failure streaks while they are happening.
-- **Cache expiry and cache rebuild waste.** Watch cache hits, misses, TTL countdowns, and estimated rebuild cost.
+- **Stuck or runaway sessions:** See which session is active, idle, blocked, or burning through repeated work.
+- **Tool loops and repeated tool failures:** Spot noisy reads, edits, bash calls, MCP activity, and failure streaks while they are happening.
+- **Cache expiry and cache rebuild waste:** Watch cache hits, misses, TTL countdowns, and estimated rebuild cost.
 - **Context pressure and turns-to-compact.** See when a session is close to auto-compaction before the next confusing slowdown.
-- **Silent model fallback.** Detect when the model used in the response differs from the model Claude Code requested.
-- **Multi-session chaos.** Keep several long-running Claude Code terminals understandable from one watch view.
-- **Quota and cost trends.** Track token use, estimated spend, reset timing, and budget pressure.
-- **Session diagnosis after the run.** Get post-session hints for cache expiry, tool thrash, compaction pressure, and other degradation signals.
-- **Lightweight recall without storing full transcripts.** Search cleaned first prompts and compact final summaries when you need to remember where a session left off.
+- **Silent model fallback:** Detect when the model used in the response differs from the model Claude Code requested.
+- **Multi-session chaos:** Keep several long-running Claude Code terminals understandable from one watch view.
+- **Quota and cost trends:** Track token use, estimated spend, reset timing, and budget pressure.
+- **Session diagnosis after the run:** Get post-session hints for cache expiry, tool thrash, compaction pressure, and other degradation signals.
+- **Lightweight recall without storing full transcripts:** Search cleaned first prompts and compact final summaries when you need to remember where a session left off.
 
 ## Why It Is Safe To Run Locally
 
 Clauditor is designed to be safe to try because it stays local and is easy to stop using.
 
-- **It runs on your machine.** The local proxy, core service, database, metrics, dashboard, and CLI all run locally.
-- **It does not phone home.** Clauditor does not send observability data to a hosted Clauditor service.
-- **Ports stay local by default.** Docker Compose binds the published ports to `127.0.0.1`.
-- **Claude Code still talks to Anthropic.** Normal Claude Code API requests still go to Anthropic, exactly as they would without Clauditor.
-- **No full transcript storage.** By default, Clauditor stores a cleaned first prompt and compact final summary for recall. It does not persist full conversation history, raw file contents, or raw tool payloads.
-- **It fails open.** If the observability service stops, Claude Code traffic can keep going.
-- **Estimates are estimates.** Cost, compaction runway, cache rebuild cost, and diagnosis are best-effort signals, not billing truth.
+- **It runs on your machine:** The local proxy, core service, database, metrics, dashboard, and CLI all run locally.
+- **It does not phone home:** Clauditor does not send observability data to a hosted Clauditor service.
+- **Ports stay local by default:** Docker Compose binds the published ports to `127.0.0.1`.
+- **Claude Code still talks to Anthropic:** Normal Claude Code API requests still go to Anthropic, exactly as they would without Clauditor.
+- **No full transcript storage:** By default, Clauditor stores a cleaned first prompt and compact final summary for recall. It does not persist full conversation history, raw file contents, or raw tool payloads.
+- **It fails open:** If the observability service stops, Claude Code traffic can keep going.
+- **Estimates are estimates:** Cost, compaction runway, cache rebuild cost, and diagnosis are best-effort signals, not billing truth.
 
 ## Quick Start
 
@@ -79,17 +79,17 @@ Replace `session_1776...` and `<session_id>` with real session IDs from `/api/se
 
 ## What Clauditor Surfaces
 
-- **Tool activity.** Reads, edits, bash commands, grep/glob calls, MCP server/tool usage, and tool failures.
+- **Tool activity:** Reads, edits, bash commands, grep/glob calls, MCP server/tool usage, and tool failures.
 - **Skill telemetry.** Expected, fired, missed, misfired, and failed skills from hooks plus conservative proxy inference.
-- **MCP activity.** MCP server and tool lifecycle events from hooks and proxy-derived metrics.
-- **Cache intelligence.** Cache hits, misses, expiry countdown, and estimated rebuild cost.
-- **Context pressure.** Fill percentage and projected turns-to-compact as a heuristic. Fill percentage is computed against the detected context window for the current request, including extended-context requests such as `sonnet[1m]` or `opus[1m]`.
-- **Model fallback.** Detection when the response model differs from the requested one.
-- **Quota burn.** Weekly token use, reset time, and projected exhaustion if you set a budget.
-- **Session diagnosis.** Post-session hints for cache expiry, thrash, tool failure streaks, compaction loops, and context pressure.
-- **Session history.** Recent sessions in SQLite plus lightweight recall.
-- **Prometheus metrics.** Local `/metrics` output for scripting, dashboards, and alerts you control.
-- **Grafana trends.** Local dashboards for sessions, quality, cache reuse, model fallback, and estimated cost over time.
+- **MCP activity:** MCP server and tool lifecycle events from hooks and proxy-derived metrics.
+- **Cache intelligence:** Cache hits, misses, expiry countdown, and estimated rebuild cost.
+- **Context pressure:** Fill percentage and projected turns-to-compact as a heuristic. Fill percentage is computed against the detected context window for the current request, including extended-context requests such as `sonnet[1m]` or `opus[1m]`.
+- **Model fallback:** Detection when the response model differs from the requested one.
+- **Quota burn:** Weekly token use, reset time, and projected exhaustion if you set a budget.
+- **Session diagnosis:** Post-session hints for cache expiry, thrash, tool failure streaks, compaction loops, and context pressure.
+- **Session history:** Recent sessions in SQLite plus lightweight recall.
+- **Prometheus metrics:** Local `/metrics` output for scripting, dashboards, and alerts you control.
+- **Grafana trends:** Local dashboards for sessions, quality, cache reuse, model fallback, and estimated cost over time.
 
 ## Advanced
 
@@ -199,7 +199,7 @@ Add hooks like these to your Claude Code settings, for example `.claude/settings
 
 ## How It Works
 
-Claude Code points to a local proxy. The proxy forwards normal API traffic to Anthropic and streams request/response metadata to `clauditor-core`. `clauditor-core` parses streamed responses, tracks sessions, writes local SQLite history, exposes `/watch`, `/metrics`, and JSON APIs, and feeds Prometheus and Grafana.
+Claude Code points to a local envoy proxy. The proxy forwards normal API traffic to Anthropic and streams request/response metadata to `clauditor-core`. `clauditor-core` parses streamed responses, tracks sessions, writes local SQLite history, exposes `/watch`, `/metrics`, and JSON APIs, and feeds Prometheus and Grafana.
 
 Fail-open behavior means the local proxy keeps routing even if `clauditor-core` dies, so observability is not a hard dependency for Claude Code traffic.
 

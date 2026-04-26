@@ -40,9 +40,6 @@ Clauditor does not add a new cloud service to your workflow. The proxy, core ser
 Install Clauditor:
 
 ```bash
-brew install softcane/tap/clauditor
-
-# or
 curl -fsSL https://raw.githubusercontent.com/softcane/clauditor/main/install.sh | sh
 ```
 

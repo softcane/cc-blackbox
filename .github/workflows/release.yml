@@ -142,7 +142,6 @@ jobs:
       - docker-image
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -154,14 +153,6 @@ jobs:
           pattern: clauditor-*
           merge-multiple: true
 
-      - name: Render Homebrew formula
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          scripts/render-homebrew-formula.sh "$version" dist
-          cp packaging/homebrew/Formula/clauditor.rb dist/clauditor.rb
-
       - name: Create release
         shell: bash
         run: |
@@ -169,26 +160,6 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             dist/clauditor-*.tar.gz \
             dist/clauditor-*.tar.gz.sha256 \
-            dist/clauditor.rb \
             install.sh \
             --title "$GITHUB_REF_NAME" \
             --notes "Install with: curl -fsSL https://raw.githubusercontent.com/softcane/clauditor/main/install.sh | sh"
-
-      - name: Publish Homebrew tap formula
-        if: env.HOMEBREW_TAP_TOKEN != ''
-        shell: bash
-        run: |
-          set -euo pipefail
-          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/softcane/homebrew-tap.git" homebrew-tap
-          mkdir -p homebrew-tap/Formula
-          cp packaging/homebrew/Formula/clauditor.rb homebrew-tap/Formula/clauditor.rb
-          cd homebrew-tap
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- Formula/clauditor.rb; then
-            echo "Homebrew formula already up to date"
-          else
-            git add Formula/clauditor.rb
-            git commit -m "Update clauditor to ${GITHUB_REF_NAME}"
-            git push
-          fi

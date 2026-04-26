@@ -98,8 +98,6 @@ The release workflow:
 - builds CLI tarballs for macOS and Linux on x86_64 and arm64/aarch64
 - pushes `ghcr.io/softcane/clauditor-core:v0.1.0`
 - publishes SHA-256 checksums and `install.sh` to the GitHub Release
-- renders a Homebrew formula as a release artifact
-- optionally updates `softcane/homebrew-tap` when `HOMEBREW_TAP_TOKEN` is set
 
 The installed CLI can run `clauditor up` without a git checkout. If it cannot
 find a repo-level compose file, it writes bundled stack assets under

@@ -137,19 +137,6 @@ Advanced setup: [Claude Code hook telemetry](#claude-code-hook-telemetry).
 - **Prometheus metrics.** Local `/metrics` output for scripting, dashboards, and alerts you control.
 - **Grafana trends.** Local dashboards for sessions, quality, cache reuse, model fallback, and estimated cost over time.
 
-## Terminology Guide
-
-How to read the Grafana dashboard:
-
-- **Degraded session** means the session hit a real problem, not just an early warning.
-- **Degraded sessions %** is the main health number. Lower is better.
-- **Degraded causes** tells you what kind of problem happened, so you can see patterns.
-- **Cache reuse %** shows how much old context was reused instead of rebuilt. Higher is better because it usually means faster and cheaper sessions.
-- **TTL misses** mean the cache expired before the next turn, so Claude had to rebuild context.
-- **Thrash misses** mean the cache had to be rebuilt again very quickly, which usually points to something in the setup or context changing too often.
-- **Model fallbacks** mean the requested model was not the one that actually got used.
-- **Estimated cost** is a best-effort cost estimate. It is useful for trends, but it may not exactly match billing.
-
 If your provider or gateway strips the signal Clauditor uses to detect extended context, pin the denominator explicitly:
 
 ```bash

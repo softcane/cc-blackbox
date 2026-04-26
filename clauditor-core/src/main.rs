@@ -1419,6 +1419,7 @@ fn build_summary_response_json(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_diagnosis_response_json(
     session_id: String,
     completed_at: String,
@@ -1455,6 +1456,7 @@ fn build_diagnosis_response_json(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_session_summary_json(
     session_id: String,
     started_at: Option<String>,
@@ -2098,6 +2100,7 @@ fn project_turns_to_compact(session_id: &str, current_fill_percent: f64) -> Opti
     project_turns_until_compaction(prev_fill, current_fill_percent)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finalize_response(
     acc: &ResponseAccumulator,
     request_id: &str,
@@ -3222,13 +3225,13 @@ fn auto_weekly_budget_suggestion() -> Option<AutoWeeklyBudget> {
     suggestion
 }
 
+type ParsedRequestBody = (String, usize, bool, usize, usize, u64, String, String);
+
 /// Returns (model, message_count, has_tools, system_prompt_length, estimated_input_tokens, sys_prompt_hash, working_dir).
 /// sys_prompt_hash: stable per-terminal session key derived from working directory.
 /// working_dir: extracted working directory path — used for session naming.
 /// user_prompt_excerpt: cleaned text of the first user message (no Claude Code preamble), for display.
-fn parse_request_body(
-    body: &[u8],
-) -> Option<(String, usize, bool, usize, usize, u64, String, String)> {
+fn parse_request_body(body: &[u8]) -> Option<ParsedRequestBody> {
     let v: Value = serde_json::from_slice(body).ok()?;
     let model = v.get("model")?.as_str()?.to_string();
     let mc = v
@@ -4630,7 +4633,7 @@ async fn handle_sessions(
             )
             .ok()?;
 
-        let session_rows: Vec<(
+        type RecentDiagnosisRow = (
             String,
             Option<String>,
             String,
@@ -4639,7 +4642,9 @@ async fn handle_sessions(
             String,
             f64,
             Option<String>,
-        )> = stmt
+        );
+
+        let session_rows: Vec<RecentDiagnosisRow> = stmt
             .query_map(rusqlite::params![since, limit], |row| {
                 Ok((
                     row.get::<_, String>(0)?,

@@ -1,22 +1,52 @@
 mod tmux;
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::fs;
+use std::io::{self, ErrorKind, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
-#[derive(Parser)]
-#[command(name = "clauditor", about = "CLI for clauditor observability proxy")]
+#[derive(Debug, Parser)]
+#[command(
+    name = "clauditor",
+    version,
+    about = "CLI for clauditor observability proxy"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Commands {
+    /// Check local developer prerequisites and stack health
+    Doctor,
+
+    /// Start the local Clauditor stack
+    Up {
+        /// Start without Grafana once compose profiles support it
+        #[arg(long)]
+        no_grafana: bool,
+    },
+
+    /// Run a command through the local Clauditor proxy
+    Run {
+        /// Start clauditor watch alongside the child command
+        #[arg(long)]
+        watch: bool,
+
+        /// Command and arguments to run
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+
     /// Live stream of Claude Code activity
     Watch {
         /// Base URL of clauditor-core
@@ -252,6 +282,821 @@ struct BillingReconciliationInput {
     billed_cost_dollars: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     imported_at: Option<String>,
+}
+
+const ENVOY_PROXY_URL: &str = "http://127.0.0.1:10000";
+const CLAUDITOR_CORE_URL: &str = "http://127.0.0.1:9091";
+const CLAUDITOR_CORE_HEALTH_URL: &str = "http://127.0.0.1:9091/health";
+const GRAFANA_URL: &str = "http://127.0.0.1:3000";
+const GRAFANA_DASHBOARD_URL: &str = "http://127.0.0.1:3000/d/clauditor-main";
+const DEFAULT_CORE_IMAGE: &str = concat!(
+    "ghcr.io/softcane/clauditor-core:v",
+    env!("CARGO_PKG_VERSION")
+);
+const BUNDLED_ENVOY_YAML: &str = include_str!("../../envoy/envoy.yaml");
+const BUNDLED_PROMETHEUS_YAML: &str = include_str!("../../prometheus/prometheus.yml");
+const BUNDLED_GRAFANA_DASHBOARD_PROVIDER_YAML: &str =
+    include_str!("../../grafana/provisioning/dashboards/clauditor.yml");
+const BUNDLED_GRAFANA_PROMETHEUS_DATASOURCE_YAML: &str =
+    include_str!("../../grafana/provisioning/datasources/prometheus.yml");
+const BUNDLED_GRAFANA_DASHBOARD_JSON: &str =
+    include_str!("../../grafana/dashboards/clauditor.json");
+
+#[derive(Debug, Clone)]
+struct ComposeCommand {
+    program: String,
+    args: Vec<String>,
+    display: String,
+}
+
+#[derive(Debug)]
+enum PortState {
+    Available,
+    ClauditorService(String),
+    Busy,
+}
+
+#[derive(Debug)]
+enum WatchHandle {
+    Plain(Child),
+    TmuxSession(String),
+}
+
+impl WatchHandle {
+    fn stop(&mut self) {
+        match self {
+            WatchHandle::Plain(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            WatchHandle::TmuxSession(session) => {
+                let _ = Command::new("tmux")
+                    .args(["kill-session", "-t", session])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+}
+
+fn command_exists(name: &str) -> bool {
+    command_path(name).is_some()
+}
+
+fn command_path(name: &str) -> Option<PathBuf> {
+    let path = Path::new(name);
+    if path.components().count() > 1 {
+        return is_executable_file(path).then(|| path.to_path_buf());
+    }
+
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        let candidate = dir.join(name);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn run_quiet(program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn docker_daemon_running() -> bool {
+    command_exists("docker") && run_quiet("docker", &["info"])
+}
+
+fn docker_compose_command() -> Option<ComposeCommand> {
+    if command_exists("docker") && run_quiet("docker", &["compose", "version"]) {
+        return Some(ComposeCommand {
+            program: "docker".to_string(),
+            args: vec!["compose".to_string()],
+            display: "docker compose".to_string(),
+        });
+    }
+
+    if run_quiet("docker-compose", &["version"]) {
+        return Some(ComposeCommand {
+            program: "docker-compose".to_string(),
+            args: Vec::new(),
+            display: "docker-compose".to_string(),
+        });
+    }
+
+    None
+}
+
+fn is_clauditor_repo_root(path: &Path) -> bool {
+    path.join("clauditor-core").is_dir() && path.join("envoy").is_dir()
+}
+
+fn find_repo_compose_file() -> Option<PathBuf> {
+    let mut starts = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        starts.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            starts.push(parent.to_path_buf());
+        }
+    }
+    starts.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+    for start in starts {
+        for ancestor in start.ancestors() {
+            if !is_clauditor_repo_root(ancestor) {
+                continue;
+            }
+            for name in [
+                "docker-compose.yml",
+                "docker-compose.yaml",
+                "compose.yaml",
+                "compose.yml",
+            ] {
+                let candidate = ancestor.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn clauditor_data_dir() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("CLAUDITOR_HOME") {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(dir).join("clauditor"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(home).join(".local/share/clauditor"));
+    }
+    Err("Could not determine a data directory; set CLAUDITOR_HOME.".to_string())
+}
+
+fn yaml_quote(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn yaml_quote_volume(source: &Path, target: &str, mode: &str) -> String {
+    yaml_quote(&format!("{}:{target}:{mode}", source.to_string_lossy()))
+}
+
+fn write_if_changed(path: &Path, contents: &str) -> Result<(), String> {
+    if path.is_file() {
+        if let Ok(existing) = fs::read_to_string(path) {
+            if existing == contents {
+                return Ok(());
+            }
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {}", parent.display(), err))?;
+    }
+    fs::write(path, contents).map_err(|err| format!("failed to write {}: {}", path.display(), err))
+}
+
+fn bundled_compose_yaml(stack_dir: &Path) -> String {
+    let envoy_config = yaml_quote_volume(
+        &stack_dir.join("envoy/envoy.yaml"),
+        "/etc/envoy/envoy.yaml",
+        "ro",
+    );
+    let prometheus_config = yaml_quote_volume(
+        &stack_dir.join("prometheus/prometheus.yml"),
+        "/etc/prometheus/prometheus.yml",
+        "ro",
+    );
+    let grafana_provisioning = yaml_quote_volume(
+        &stack_dir.join("grafana/provisioning"),
+        "/etc/grafana/provisioning",
+        "ro",
+    );
+    let grafana_dashboards = yaml_quote_volume(
+        &stack_dir.join("grafana/dashboards"),
+        "/var/lib/grafana/dashboards",
+        "ro",
+    );
+
+    format!(
+        r#"services:
+  envoy:
+    image: envoyproxy/envoy:v1.32-latest
+    volumes:
+      - {envoy_config}
+    ports:
+      - "127.0.0.1:10000:10000"
+    depends_on:
+      clauditor-core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/10000'"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  clauditor-core:
+    image: ${{CLAUDITOR_CORE_IMAGE:-{DEFAULT_CORE_IMAGE}}}
+    expose:
+      - "50051"
+    ports:
+      - "127.0.0.1:9091:9090"
+    environment:
+      - RUST_LOG=info
+      - CLAUDITOR_SESSION_BUDGET_DOLLARS=0
+      - CLAUDITOR_SESSION_BUDGET_TOKENS=0
+      - CLAUDITOR_CIRCUIT_BREAKER_THRESHOLD=5
+    volumes:
+      - clauditor_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    ports:
+      - "127.0.0.1:9092:9090"
+    volumes:
+      - {prometheus_config}
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    depends_on:
+      clauditor-core:
+        condition: service_healthy
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - {grafana_provisioning}
+      - {grafana_dashboards}
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+
+volumes:
+  clauditor_data:
+  prometheus_data:
+  grafana_data:
+"#
+    )
+}
+
+fn prepare_bundled_stack() -> Result<PathBuf, String> {
+    let stack_dir = clauditor_data_dir()?
+        .join("stack")
+        .join(env!("CARGO_PKG_VERSION"));
+    write_if_changed(&stack_dir.join("envoy/envoy.yaml"), BUNDLED_ENVOY_YAML)?;
+    write_if_changed(
+        &stack_dir.join("prometheus/prometheus.yml"),
+        BUNDLED_PROMETHEUS_YAML,
+    )?;
+    write_if_changed(
+        &stack_dir.join("grafana/provisioning/dashboards/clauditor.yml"),
+        BUNDLED_GRAFANA_DASHBOARD_PROVIDER_YAML,
+    )?;
+    write_if_changed(
+        &stack_dir.join("grafana/provisioning/datasources/prometheus.yml"),
+        BUNDLED_GRAFANA_PROMETHEUS_DATASOURCE_YAML,
+    )?;
+    write_if_changed(
+        &stack_dir.join("grafana/dashboards/clauditor.json"),
+        BUNDLED_GRAFANA_DASHBOARD_JSON,
+    )?;
+    let compose_path = stack_dir.join("docker-compose.yml");
+    write_if_changed(&compose_path, &bundled_compose_yaml(&stack_dir))?;
+    Ok(compose_path)
+}
+
+fn resolve_compose_file() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("CLAUDITOR_COMPOSE_FILE") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "CLAUDITOR_COMPOSE_FILE points to {}, but that file does not exist.",
+            path.display()
+        ));
+    }
+
+    let force_bundled = std::env::var_os("CLAUDITOR_USE_BUNDLED_STACK").is_some();
+    if !force_bundled {
+        if let Some(path) = find_repo_compose_file() {
+            return Ok(path);
+        }
+    }
+
+    prepare_bundled_stack()
+}
+
+fn is_port_available(port: u16) -> bool {
+    let loopback_addrs = [
+        SocketAddr::from(([127, 0, 0, 1], port)),
+        SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port)),
+    ];
+
+    for addr in loopback_addrs {
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            return false;
+        }
+    }
+
+    let v4_free = TcpListener::bind(("127.0.0.1", port)).is_ok();
+    let v6_free = match TcpListener::bind(("::1", port)) {
+        Ok(_) => true,
+        Err(err) if err.kind() == ErrorKind::AddrNotAvailable => true,
+        Err(_) => false,
+    };
+
+    v4_free && v6_free
+}
+
+fn clauditor_container_for_port(port: u16) -> Option<String> {
+    let output = Command::new("docker")
+        .args(["ps", "--format", "{{.Names}}\t{{.Ports}}"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let marker = format!(":{port}->");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let Some((name, ports)) = line.split_once('\t') else {
+            continue;
+        };
+        if name.to_ascii_lowercase().contains("clauditor") && ports.contains(&marker) {
+            return Some(name.to_string());
+        }
+    }
+
+    None
+}
+
+fn port_state(port: u16) -> PortState {
+    if is_port_available(port) {
+        PortState::Available
+    } else if let Some(container) = clauditor_container_for_port(port) {
+        PortState::ClauditorService(container)
+    } else {
+        PortState::Busy
+    }
+}
+
+async fn health_check(url: &str) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
+
+    client
+        .get(url)
+        .send()
+        .await
+        .map(|resp| resp.status().is_success())
+        .unwrap_or(false)
+}
+
+async fn wait_for_health(url: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if health_check(url).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    false
+}
+
+fn print_check(symbol: &str, message: impl AsRef<str>) {
+    println!("{} {}", symbol, message.as_ref());
+}
+
+fn push_unique(lines: &mut Vec<String>, line: impl Into<String>) {
+    let line = line.into();
+    if !lines.iter().any(|existing| existing == &line) {
+        lines.push(line);
+    }
+}
+
+async fn run_doctor() -> i32 {
+    println!("Clauditor doctor");
+    println!();
+
+    let mut failed = false;
+    let mut fixes = Vec::new();
+
+    print_check("✓", format!("clauditor {}", env!("CARGO_PKG_VERSION")));
+
+    let docker_found = command_exists("docker");
+    if docker_found {
+        print_check("✓", "docker found");
+    } else {
+        failed = true;
+        print_check("✗", "docker not found in PATH");
+        push_unique(
+            &mut fixes,
+            "Install Docker Desktop or Docker Engine, then ensure `docker` is on PATH.",
+        );
+    }
+
+    if docker_found && docker_daemon_running() {
+        print_check("✓", "docker daemon running");
+    } else {
+        failed = true;
+        print_check("✗", "docker daemon not reachable");
+        push_unique(
+            &mut fixes,
+            "Start Docker Desktop or your Docker daemon, then rerun `clauditor up`.",
+        );
+    }
+
+    if let Some(compose) = docker_compose_command() {
+        print_check(
+            "✓",
+            format!("docker compose available ({})", compose.display),
+        );
+    } else {
+        failed = true;
+        print_check("✗", "docker compose not available");
+        push_unique(
+            &mut fixes,
+            "Install Docker Compose v2 or make `docker-compose` available on PATH.",
+        );
+    }
+
+    if command_exists("claude") {
+        print_check("✓", "claude found");
+    } else {
+        failed = true;
+        print_check("✗", "claude not found in PATH");
+        push_unique(
+            &mut fixes,
+            "Install Claude Code and ensure the `claude` command is on PATH.",
+        );
+    }
+
+    if command_exists("tmux") {
+        print_check("✓", "tmux found");
+    } else {
+        print_check("⚠", "tmux not found; --tmux watch mode will not work");
+    }
+
+    for port in [10000, 9091, 3000] {
+        match port_state(port) {
+            PortState::Available => print_check("✓", format!("port {port} available")),
+            PortState::ClauditorService(container) => {
+                print_check("✓", format!("port {port} used by Clauditor ({container})"));
+            }
+            PortState::Busy => {
+                failed = true;
+                print_check("✗", format!("port {port} is already in use"));
+                push_unique(
+                    &mut fixes,
+                    format!(
+                        "Free port {port}, or stop the process using it before running `clauditor up`."
+                    ),
+                );
+            }
+        }
+    }
+
+    let core_healthy = health_check(CLAUDITOR_CORE_HEALTH_URL).await;
+    if core_healthy {
+        print_check("✓", "clauditor-core healthy");
+    } else {
+        failed = true;
+        print_check("✗", "clauditor-core not healthy");
+        push_unique(&mut fixes, "Run: clauditor up");
+    }
+
+    if health_check(GRAFANA_URL).await {
+        print_check("✓", "Grafana reachable");
+    } else {
+        failed = true;
+        print_check("✗", "Grafana not reachable");
+        push_unique(&mut fixes, "Run: clauditor up");
+    }
+
+    match std::env::var("ANTHROPIC_BASE_URL") {
+        Ok(value) if value == ENVOY_PROXY_URL => {
+            print_check("✓", "ANTHROPIC_BASE_URL points at Clauditor");
+        }
+        Ok(value) => {
+            print_check(
+                "⚠",
+                format!("ANTHROPIC_BASE_URL is {value}; expected {ENVOY_PROXY_URL}"),
+            );
+            push_unique(
+                &mut fixes,
+                format!("export ANTHROPIC_BASE_URL={ENVOY_PROXY_URL}"),
+            );
+        }
+        Err(_) => {
+            print_check("⚠", "ANTHROPIC_BASE_URL unset");
+            push_unique(
+                &mut fixes,
+                format!("export ANTHROPIC_BASE_URL={ENVOY_PROXY_URL}"),
+            );
+        }
+    }
+
+    if !fixes.is_empty() {
+        println!();
+        println!("Fix:");
+        for fix in fixes {
+            println!("  {fix}");
+        }
+    }
+
+    if failed {
+        1
+    } else {
+        0
+    }
+}
+
+async fn start_stack(no_grafana: bool) -> Result<(), String> {
+    if no_grafana {
+        // TODO: make Grafana optional through a compose profile without
+        // changing the default all-in-one local stack.
+        println!("⚠ --no-grafana is not implemented yet; starting the default stack");
+    }
+
+    let compose = docker_compose_command()
+        .ok_or_else(|| "docker compose is not available. Run `clauditor doctor`.".to_string())?;
+
+    if command_exists("docker") && !docker_daemon_running() {
+        return Err(
+            "Docker daemon is not reachable. Start Docker Desktop or your Docker daemon first."
+                .to_string(),
+        );
+    }
+
+    let compose_file = resolve_compose_file()?;
+    let compose_root = compose_file
+        .parent()
+        .ok_or_else(|| "compose file has no parent directory".to_string())?;
+
+    println!("Starting Clauditor stack with {}...", compose.display);
+    let _ = io::stdout().flush();
+    let mut command = Command::new(&compose.program);
+    command
+        .args(&compose.args)
+        .args(["-p", "clauditor"])
+        .arg("-f")
+        .arg(&compose_file)
+        .args(["up", "-d"])
+        .current_dir(compose_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    let status = command
+        .status()
+        .map_err(|err| format!("failed to run {}: {}", compose.display, err))?;
+    if !status.success() {
+        return Err(format!("{} up -d failed", compose.display));
+    }
+
+    println!("Waiting for clauditor-core health...");
+    let _ = io::stdout().flush();
+    if !wait_for_health(CLAUDITOR_CORE_HEALTH_URL, Duration::from_secs(90)).await {
+        return Err(format!(
+            "clauditor-core did not become healthy at {CLAUDITOR_CORE_HEALTH_URL}"
+        ));
+    }
+
+    Ok(())
+}
+
+async fn run_up(no_grafana: bool) -> i32 {
+    match start_stack(no_grafana).await {
+        Ok(()) => {
+            println!();
+            println!("Clauditor is up.");
+            println!("  Envoy proxy:    {ENVOY_PROXY_URL}");
+            println!("  Clauditor core: {CLAUDITOR_CORE_URL}");
+            println!("  Grafana:        {GRAFANA_DASHBOARD_URL}");
+            println!();
+            println!("Next:");
+            println!("  clauditor run claude --watch");
+            0
+        }
+        Err(err) => {
+            eprintln!("Error: {err}");
+            1
+        }
+    }
+}
+
+fn extract_run_watch(watch_flag: bool, command: Vec<String>) -> (bool, Vec<String>) {
+    let mut watch = watch_flag;
+    let mut child_command = Vec::with_capacity(command.len());
+    for arg in command {
+        if arg == "--watch" {
+            watch = true;
+        } else {
+            child_command.push(arg);
+        }
+    }
+    (watch, child_command)
+}
+
+async fn ensure_stack_running() -> Result<(), String> {
+    if health_check(CLAUDITOR_CORE_HEALTH_URL).await {
+        return Ok(());
+    }
+
+    println!("clauditor-core is not healthy; starting the local stack...");
+    start_stack(false).await
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '='))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn shell_join(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|part| shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn current_cli_path() -> String {
+    std::env::current_exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "clauditor".to_string())
+}
+
+fn tmux_session_name() -> String {
+    format!("clauditor-watch-{}", std::process::id())
+}
+
+fn start_watcher() -> Result<WatchHandle, String> {
+    let cli_path = current_cli_path();
+    if command_exists("tmux") {
+        let session = tmux_session_name();
+        let command = shell_join(&[
+            cli_path,
+            "watch".to_string(),
+            "--tmux".to_string(),
+            "--url".to_string(),
+            CLAUDITOR_CORE_URL.to_string(),
+        ]);
+        let status = Command::new("tmux")
+            .args(["new-session", "-d", "-s", &session, &command])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .status()
+            .map_err(|err| format!("failed to start tmux watcher: {err}"))?;
+        if !status.success() {
+            return Err("failed to start tmux watcher".to_string());
+        }
+        println!("Watch: tmux attach -t {session}");
+        return Ok(WatchHandle::TmuxSession(session));
+    }
+
+    let child = Command::new(cli_path)
+        .args(["watch", "--url", CLAUDITOR_CORE_URL])
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|err| format!("failed to start plain watcher: {err}"))?;
+    println!("Watch: plain mode");
+    Ok(WatchHandle::Plain(child))
+}
+
+fn exit_code(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
+}
+
+fn run_command_with_env(
+    command: &str,
+    args: &[String],
+    envs: &[(&str, &str)],
+) -> Result<i32, String> {
+    let mut child = Command::new(command);
+    child.args(args);
+    for (key, value) in envs {
+        child.env(key, value);
+    }
+    let status = child
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|err| format!("failed to spawn {command}: {err}"))?
+        .wait()
+        .map_err(|err| format!("failed while waiting for {command}: {err}"))?;
+
+    Ok(exit_code(status))
+}
+
+async fn run_child_command(watch_flag: bool, command: Vec<String>) -> i32 {
+    let (watch, child_command) = extract_run_watch(watch_flag, command);
+    if child_command.is_empty() {
+        eprintln!("Error: missing command after `clauditor run`");
+        return 1;
+    }
+
+    if let Err(err) = ensure_stack_running().await {
+        eprintln!("Error: {err}");
+        return 1;
+    }
+
+    let mut watcher = if watch {
+        match start_watcher() {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                eprintln!("Error: {err}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+
+    let command_name = &child_command[0];
+    let command_args = &child_command[1..];
+    let result = run_command_with_env(
+        command_name,
+        command_args,
+        &[("ANTHROPIC_BASE_URL", ENVOY_PROXY_URL)],
+    );
+
+    if let Some(handle) = watcher.as_mut() {
+        handle.stop();
+    }
+
+    match result {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            1
+        }
+    }
 }
 
 fn parse_local_datetime(iso: &str) -> Option<DateTime<Local>> {
@@ -1032,6 +1877,15 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Doctor => {
+            std::process::exit(run_doctor().await);
+        }
+        Commands::Up { no_grafana } => {
+            std::process::exit(run_up(no_grafana).await);
+        }
+        Commands::Run { watch, command } => {
+            std::process::exit(run_child_command(watch, command).await);
+        }
         Commands::Watch {
             url,
             no_cache,
@@ -1427,8 +2281,10 @@ async fn connect_and_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_datetime_from_iso, local_time_from_iso};
+    use super::{compact_datetime_from_iso, extract_run_watch, local_time_from_iso, Cli, Commands};
     use chrono::{DateTime, Local};
+    use clap::Parser;
+    use std::path::Path;
 
     #[test]
     fn local_time_from_iso_converts_from_rfc3339() {
@@ -1455,5 +2311,65 @@ mod tests {
     #[test]
     fn local_time_from_iso_falls_back_for_invalid_timestamps() {
         assert_eq!(local_time_from_iso("not-a-timestamp"), "??:??:??");
+    }
+
+    #[test]
+    fn run_watch_after_child_command_is_clauditor_flag() {
+        let cli = Cli::try_parse_from(["clauditor", "run", "claude", "--watch"])
+            .expect("run command parses");
+        let Commands::Run { watch, command } = cli.command else {
+            panic!("expected run command");
+        };
+        let (watch, command) = extract_run_watch(watch, command);
+        assert!(watch);
+        assert_eq!(command, vec!["claude"]);
+    }
+
+    #[test]
+    fn run_watch_before_child_command_is_clauditor_flag() {
+        let cli = Cli::try_parse_from(["clauditor", "run", "--watch", "claude"])
+            .expect("run command parses");
+        let Commands::Run { watch, command } = cli.command else {
+            panic!("expected run command");
+        };
+        let (watch, command) = extract_run_watch(watch, command);
+        assert!(watch);
+        assert_eq!(command, vec!["claude"]);
+    }
+
+    #[test]
+    fn run_preserves_child_flags() {
+        let cli = Cli::try_parse_from([
+            "clauditor",
+            "run",
+            "claude",
+            "--dangerously-skip-permissions",
+            "--model",
+            "opus",
+        ])
+        .expect("run command parses");
+        let Commands::Run { watch, command } = cli.command else {
+            panic!("expected run command");
+        };
+        let (watch, command) = extract_run_watch(watch, command);
+        assert!(!watch);
+        assert_eq!(
+            command,
+            vec![
+                "claude",
+                "--dangerously-skip-permissions",
+                "--model",
+                "opus"
+            ]
+        );
+    }
+
+    #[test]
+    fn bundled_compose_uses_release_image_and_quoted_volume_mounts() {
+        let yaml = super::bundled_compose_yaml(Path::new("/tmp/clauditor test"));
+        assert!(yaml.contains(super::DEFAULT_CORE_IMAGE));
+        assert!(yaml.contains("\"/tmp/clauditor test/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro\""));
+        assert!(yaml
+            .contains("\"/tmp/clauditor test/grafana/dashboards:/var/lib/grafana/dashboards:ro\""));
     }
 }

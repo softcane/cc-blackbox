@@ -39,7 +39,7 @@ jobs:
         run: cargo test --workspace
 
       - name: Run clippy
-        run: cargo clippy --workspace -- -W clippy::all
+        run: cargo clippy --workspace -- -D warnings
 
       - name: Start stack for session-isolation regression
         run: docker compose up -d
@@ -82,3 +82,13 @@ jobs:
       - name: Tear down stack
         if: always()
         run: docker compose down -t 5 || true
+
+  installer:
+    name: Installer syntax
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check install.sh syntax
+        run: sh -n install.sh

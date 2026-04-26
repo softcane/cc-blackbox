@@ -1,0 +1,194 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-cli:
+    name: Build CLI (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cross: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+          - os: macos-13
+            target: x86_64-apple-darwin
+            cross: false
+          - os: macos-14
+            target: aarch64-apple-darwin
+            cross: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check crate version matches tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          crate_version="$(awk -F'"' '/^version = / { print $2; exit }' clauditor-cli/Cargo.toml)"
+          test "v${crate_version}" = "$GITHUB_REF_NAME"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cross build --release -p clauditor-cli --target "${{ matrix.target }}"
+          else
+            cargo build --release -p clauditor-cli --target "${{ matrix.target }}"
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          archive="clauditor-${target}.tar.gz"
+          staging="dist/${target}"
+          mkdir -p "$staging"
+          cp "target/${target}/release/clauditor" "$staging/clauditor"
+          cp README.md LICENSE "$staging/"
+          tar -czf "dist/${archive}" -C "$staging" clauditor README.md LICENSE
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/${archive}" > "dist/${archive}.sha256"
+          else
+            shasum -a 256 "dist/${archive}" > "dist/${archive}.sha256"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: clauditor-${{ matrix.target }}
+          path: |
+            dist/clauditor-${{ matrix.target }}.tar.gz
+            dist/clauditor-${{ matrix.target }}.tar.gz.sha256
+
+  docker-image:
+    name: Build and push clauditor-core image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check crate version matches tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          crate_version="$(awk -F'"' '/^version = / { print $2; exit }' clauditor-cli/Cargo.toml)"
+          test "v${crate_version}" = "$GITHUB_REF_NAME"
+
+      - name: Set image tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/clauditor-core"
+          {
+            echo "image=${image}"
+            echo "tag=${tag}"
+            echo "version=${version}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./clauditor-core
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.image }}:${{ steps.tags.outputs.tag }}
+            ${{ steps.tags.outputs.image }}:${{ steps.tags.outputs.version }}
+            ${{ steps.tags.outputs.image }}:latest
+
+  release:
+    name: Publish GitHub release
+    runs-on: ubuntu-latest
+    needs:
+      - build-cli
+      - docker-image
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: clauditor-*
+          merge-multiple: true
+
+      - name: Render Homebrew formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          scripts/render-homebrew-formula.sh "$version" dist
+          cp packaging/homebrew/Formula/clauditor.rb dist/clauditor.rb
+
+      - name: Create release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            dist/clauditor-*.tar.gz \
+            dist/clauditor-*.tar.gz.sha256 \
+            dist/clauditor.rb \
+            install.sh \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Install with: curl -fsSL https://raw.githubusercontent.com/softcane/clauditor/main/install.sh | sh"
+
+      - name: Publish Homebrew tap formula
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/softcane/homebrew-tap.git" homebrew-tap
+          mkdir -p homebrew-tap/Formula
+          cp packaging/homebrew/Formula/clauditor.rb homebrew-tap/Formula/clauditor.rb
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- Formula/clauditor.rb; then
+            echo "Homebrew formula already up to date"
+          else
+            git add Formula/clauditor.rb
+            git commit -m "Update clauditor to ${GITHUB_REF_NAME}"
+            git push
+          fi

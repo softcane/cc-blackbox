@@ -1,98 +1,93 @@
 # Clauditor
 
-**A local way to keep an eye on Claude Code when things get busy.**
+**Clauditor tells you why Claude Code got slow, stuck, expensive, or weird.**
 
-Clauditor is a local, fail-open observability layer for Claude Code. In plain English: it sits between Claude Code and Anthropic, watches the request and response flow, and gives you a better picture of what each session is doing.
+Clauditor is a local flight recorder and live session dashboard for Claude Code. It routes a Claude Code process through local Envoy, watches the request/response stream, and turns the parts that are usually invisible into useful signals: tool activity, cache behavior, context pressure, model fallback, quota burn, session history, and diagnosis after the run.
 
-I made this because once I had a few `claude` terminals open at the same time, I kept losing track of them. One would be chewing through tools, another would be idle, another would suddenly get slower, and I had no quick way to tell why. Clauditor is meant to make that less annoying.
-
-If you only run one short Claude session now and then, the full stack is probably more setup than you need. If you run longer sessions, care about cost or context trends, or regularly have multiple sessions open and keep wondering which one is stuck or why a turn got weird, this is where it starts to pay off.
+Clauditor is local-first and privacy-preserving. The observability stack runs on your machine, does not phone home, and does not send telemetry to any Clauditor-hosted service. Your normal Claude Code API traffic still goes to Anthropic, exactly as it would without Clauditor, but no additional observability data leaves your machine/network.
 
 ![demo](docs/demo.gif)
 
 ![grafana dashboard](docs/grafana-overview.png)
 
-## Why people install this
+## What Clauditor Catches
 
-- **Multi-session mess.** You have several `claude` terminals open and no clear sense of which one is active, blocked, or drifting.
-- **Slow turns with no obvious cause.** Cache expiry, model fallback, tool churn, and context pressure all feel the same from the outside unless you can actually see them.
-- **A Grafana dashboard for trends.** Sometimes you do not want just the live tmux view, you want the Grafana dashboard to look at session and cost trends over time.
-- **Bad memory after the fact.** You want some lightweight recall about what a session was doing without saving the whole transcript.
+- **Stuck or runaway sessions.** See which session is active, idle, blocked, or burning through repeated work.
+- **Tool loops and repeated tool failures.** Spot noisy reads, edits, bash calls, MCP activity, and failure streaks while they are happening.
+- **Cache expiry and cache rebuild waste.** Watch cache hits, misses, TTL countdowns, and estimated rebuild cost.
+- **Context pressure and turns-to-compact.** See when a session is close to auto-compaction before the next confusing slowdown.
+- **Silent model fallback.** Detect when the model used in the response differs from the model Claude Code requested.
+- **Multi-session chaos.** Keep several long-running Claude Code terminals understandable from one watch view.
+- **Quota and cost trends.** Track token use, estimated spend, reset timing, and budget pressure.
+- **Session diagnosis after the run.** Get post-session hints for cache expiry, tool thrash, compaction pressure, and other degradation signals.
+- **Lightweight recall without storing full transcripts.** Search cleaned first prompts and compact final summaries when you need to remember where a session left off.
 
-## What you get in the first minute
+## Why It Is Safe To Run Locally
 
-- **A live session view.** One tmux pane per active session, with activity state and recent events.
-- **A Grafana trend view.** A dashboard for session, quality, and estimated cost trends over time.
-- **Useful debug signals.** Cache TTL, context fill, turns-to-compact, fallback detection, and session diagnosis.
-- **Simple history.** Recent sessions, cleaned first prompt, compact final summary, and JSON APIs if you want to script around it.
+Clauditor does not add a new cloud service to your workflow. The proxy, core service, database, Prometheus, Grafana, and CLI all run on your machine. Clauditor does not phone home or send observability data to a hosted backend. Your normal Claude Code requests still go to Anthropic, exactly as they would without Clauditor.
 
-## Trust and boundaries
+- **Local Envoy proxy.** Claude Code points at `http://127.0.0.1:10000`, and Envoy forwards normal API traffic to Anthropic.
+- **Loopback-only ports by default.** Docker Compose publishes Envoy, clauditor-core, Prometheus, and Grafana on `127.0.0.1`.
+- **Fail-open behavior.** Envoy is configured so Claude Code traffic keeps routing even if `clauditor-core` is unavailable.
+- **No hosted Clauditor backend.** There is no Clauditor cloud service receiving your observability data.
+- **No Clauditor telemetry.** Clauditor does not phone home and does not send telemetry to the Clauditor project or maintainers.
+- **No full transcript persistence.** By default, Clauditor stores a cleaned first prompt and compact final summary for recall. It does not persist full conversation history, raw file contents, or raw tool payloads.
+- **Local storage and metrics.** SQLite, Prometheus metrics, and Grafana dashboards stay in local Docker volumes unless you change the deployment.
+- **Honest estimates.** Cost, compaction runway, cache rebuild cost, and diagnosis are best-effort signals for reasoning about a session, not billing truth.
 
-- **Local proxy.** Claude Code points at local Envoy, and Envoy forwards to Anthropic.
-- **Loopback-only by default.** Docker Compose publishes the host ports on `127.0.0.1`, so the stack stays local to the machine unless you change it yourself.
-- **Fail-open behavior.** If `clauditor-core` dies, Envoy still routes traffic onward.
-- **Streaming, not buffering.** The live watch view is based on streamed SSE parsing, so you see events as they happen.
-- **No full transcript storage.** Clauditor stores a cleaned first prompt and a compact final summary for recall. It does not persist full conversation history, raw file contents, or raw tool payloads.
-- **Some values are estimates.** Cost, compaction runway, and parts of diagnosis are heuristics. They are there to help you reason, not to pretend they are perfect truth.
+## Quick Start
 
-## Quick start
+Install Clauditor:
 
-### 1. Build the CLI
+```bash
+brew install softcane/tap/clauditor
+
+# or
+curl -fsSL https://raw.githubusercontent.com/softcane/clauditor/main/install.sh | sh
+```
+
+Start using it:
+
+```bash
+clauditor doctor
+clauditor up
+clauditor run claude --watch
+```
+
+`clauditor doctor` checks Docker, Docker Compose, Claude Code, tmux, local ports, health endpoints, and environment variables. `clauditor up` starts the local Envoy, `clauditor-core`, Prometheus, and Grafana stack. `clauditor run claude --watch` routes only that Claude Code process through Clauditor and starts a watcher; it does not permanently modify shell config, shell startup files, or other Claude Code sessions.
+
+Open Grafana at [http://127.0.0.1:3000/d/clauditor-main](http://127.0.0.1:3000/d/clauditor-main). Anonymous viewer mode is enabled, and the local admin login is `admin` / `admin`.
+
+### Build From Source
+
+Until the first public release is cut, or when working from a checkout:
 
 ```bash
 cargo build --release -p clauditor-cli
-# Optional: put `clauditor` on your PATH
 install -m 0755 target/release/clauditor ~/.local/bin/clauditor
 ```
 
-### 2. Start the local stack
+## What You See Live
 
-```bash
-docker compose up -d
-curl -s http://127.0.0.1:9091/health
-# -> ok
+```text
+session-api      READ     src/routes.rs
+session-api      CACHE    expires in 2m14s · est. rebuild $0.43
+session-worker   CONTEXT  82% full · ~1 turn to auto-compact
+session-auth     ⚠ MODEL FALLBACK requested opus, got sonnet
 ```
 
-This brings up Envoy, `clauditor-core`, Prometheus, and Grafana. You can ignore Grafana at first and still get most of the value from `clauditor watch`.
+## Core Workflows
 
-By default the published ports are bound to `127.0.0.1` only.
-
-### 3. Point Claude Code at the proxy
-
-```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:10000
-```
-
-If you want this on every shell, drop it into your shell startup file.
-
-### 4. Open the live dashboard
-
-```bash
-clauditor watch --tmux --url http://127.0.0.1:9091
-```
-
-If you are not already inside tmux, Clauditor will bootstrap a tmux session for you. Detach with `Ctrl+b d`, and reattach later with `tmux attach -t clauditor-<pid>`.
-
-If you want the Grafana dashboard, open this directly in your browser:
-
-- Dashboard: [http://127.0.0.1:3000/d/clauditor-main](http://127.0.0.1:3000/d/clauditor-main)
-
-### 5. Run `claude` like you normally do
-
-That is basically it. Work as usual, and Clauditor will show which session is active, which tools ran, whether cache expired, whether context is filling up, and whether a request silently fell back to another model.
-
-Optional trend view:
-
-- Grafana dashboard: [http://127.0.0.1:3000/d/clauditor-main](http://127.0.0.1:3000/d/clauditor-main)
-- Anonymous viewer mode is enabled
-- Admin login is also provisioned as `admin` / `admin`
-
-## Core workflows
-
-**Watch all active sessions in plain text**
+**Watch all active sessions**
 
 ```bash
 clauditor watch --url http://127.0.0.1:9091
+```
+
+**Watch all sessions in tmux**
+
+```bash
+clauditor watch --tmux
 ```
 
 **Watch one session**
@@ -101,7 +96,7 @@ clauditor watch --url http://127.0.0.1:9091
 clauditor watch --session session_1776... --url http://127.0.0.1:9091
 ```
 
-Replace `session_1776...` with a real session id from `/api/sessions`. If you subscribe after a session already started, Clauditor injects a synthetic `SessionStart` so the watcher still gets the session header and cleaned initial prompt.
+Replace `session_1776...` with a real session ID from `/api/sessions`. If you subscribe after a session already started, Clauditor injects a synthetic `SessionStart` so the watcher still gets the session header and cleaned initial prompt.
 
 **Review recent sessions**
 
@@ -118,7 +113,7 @@ curl -s http://127.0.0.1:9091/api/diagnosis/<session_id>
 clauditor recall "auth middleware"
 ```
 
-This searches the cleaned first prompt and the compact final summary for each stored session.
+This searches the cleaned first prompt and compact final summary for each stored session.
 
 **Inspect Prometheus metrics**
 
@@ -126,12 +121,46 @@ This searches the cleaned first prompt and the compact final summary for each st
 curl -s http://127.0.0.1:9091/metrics | grep '^clauditor_'
 ```
 
-**Enable Claude Code hook telemetry**
+Advanced setup: [Claude Code hook telemetry](#claude-code-hook-telemetry).
 
-Add hooks like these to your Claude Code settings, for example
-`.claude/settings.local.json` for one project or `~/.claude/settings.json`
-globally. The Docker Compose stack exposes Clauditor on host port `9091`;
-if you run `clauditor-core` directly, use its default `9090` port instead.
+## What Clauditor Surfaces
+
+- **Tool activity.** Reads, edits, bash commands, grep/glob calls, MCP server/tool usage, and tool failures.
+- **Skill telemetry.** Expected, fired, missed, misfired, and failed skills from hooks plus conservative proxy inference.
+- **MCP activity.** MCP server and tool lifecycle events from hooks and proxy-derived metrics.
+- **Cache intelligence.** Cache hits, misses, expiry countdown, and estimated rebuild cost.
+- **Context pressure.** Fill percentage and projected turns-to-compact as a heuristic. Fill percentage is computed against the detected context window for the current request, including extended-context requests such as `sonnet[1m]` or `opus[1m]`.
+- **Model fallback.** Detection when the response model differs from the requested one.
+- **Quota burn.** Weekly token use, reset time, and projected exhaustion if you set a budget.
+- **Session diagnosis.** Post-session hints for cache expiry, thrash, tool failure streaks, compaction loops, and context pressure.
+- **Session history.** Recent sessions in SQLite plus lightweight recall.
+- **Prometheus metrics.** Local `/metrics` output for scripting, dashboards, and alerts you control.
+- **Grafana trends.** Local dashboards for sessions, quality, cache reuse, model fallback, and estimated cost over time.
+
+## Terminology Guide
+
+How to read the Grafana dashboard:
+
+- **Degraded session** means the session hit a real problem, not just an early warning.
+- **Degraded sessions %** is the main health number. Lower is better.
+- **Degraded causes** tells you what kind of problem happened, so you can see patterns.
+- **Cache reuse %** shows how much old context was reused instead of rebuilt. Higher is better because it usually means faster and cheaper sessions.
+- **TTL misses** mean the cache expired before the next turn, so Claude had to rebuild context.
+- **Thrash misses** mean the cache had to be rebuilt again very quickly, which usually points to something in the setup or context changing too often.
+- **Model fallbacks** mean the requested model was not the one that actually got used.
+- **Estimated cost** is a best-effort cost estimate. It is useful for trends, but it may not exactly match billing.
+
+If your provider or gateway strips the signal Clauditor uses to detect extended context, pin the denominator explicitly:
+
+```bash
+CLAUDITOR_CONTEXT_WINDOW_TOKENS=1000000 docker compose up -d
+```
+
+## Advanced
+
+### Claude Code Hook Telemetry
+
+Add hooks like these to your Claude Code settings, for example `.claude/settings.local.json` for one project or `~/.claude/settings.json` globally. The Docker Compose stack exposes Clauditor on host port `9091`; if you run `clauditor-core` directly, use its default `9090` port instead.
 
 ```json
 {
@@ -233,38 +262,11 @@ if you run `clauditor-core` directly, use its default `9090` port instead.
 }
 ```
 
-## What Clauditor surfaces
+## How It Works
 
-- **Tool activity.** Reads, edits, bash commands, grep/glob calls, MCP server/tool usage, and tool failures.
-- **Skill telemetry.** Expected, fired, missed, misfired, and failed skills from hooks plus conservative proxy inference.
-- **Cache intelligence.** Cache hits, misses, expiry countdown, and estimated rebuild cost.
-- **Context pressure.** Fill percentage and projected turns-to-compact as a heuristic.
-  Fill percentage is computed against the detected context window for the current request, including extended-context requests such as `sonnet[1m]` or `opus[1m]`.
-- **Model fallback.** Detection when the response model differs from the requested one.
-- **Quota burn.** Weekly token use, reset time, and projected exhaustion if you set a budget.
-- **Session diagnosis.** Post-session hints for things like cache expiry, thrash, tool failure streaks, or compaction pressure.
-- **Session history.** Recent sessions in SQLite plus lightweight recall.
+Claude Code points to local Envoy. Envoy forwards normal API traffic to Anthropic and streams request/response metadata to `clauditor-core` through Envoy's `ext_proc` filter. `clauditor-core` parses streamed SSE, tracks sessions, writes local SQLite history, exposes `/watch`, `/metrics`, and JSON APIs, and feeds Prometheus and Grafana.
 
-If your provider or gateway strips the signal Clauditor uses to detect extended context, pin the denominator explicitly:
-
-```bash
-CLAUDITOR_CONTEXT_WINDOW_TOKENS=1000000 docker compose up -d
-```
-
-## Who this is for
-
-- **Claude Code power users** who run multiple sessions at once.
-- **Developers debugging slow or confusing sessions.**
-- **People who want a little observability** without standing up a whole seperate system.
-- **API-key users** who care about estimated cost and budget guardrails on top of the usual session tracking.
-
-If your only goal is token accounting, Clauditor is probably more stack than you need.
-
-## How it works
-
-Clauditor sits between Claude Code and Anthropic through local Envoy. Envoy forwards request and streamed response metadata to `clauditor-core`, which parses SSE, tracks sessions, writes SQLite history, serves `/watch`, and exposes `/metrics`.
-
-The important design choice is that response-side parsing returns `CONTINUE` immediately and the ext_proc filter runs with `failure_mode_allow: true`. That keeps observability off the hot path and avoids turning the proxy into a hard dependency.
+Fail-open behavior means Envoy keeps routing even if `clauditor-core` dies, so observability is not a hard dependency for Claude Code traffic.
 
 ```text
 Claude Code  (ANTHROPIC_BASE_URL=http://127.0.0.1:10000)
@@ -290,7 +292,7 @@ Claude Code  (ANTHROPIC_BASE_URL=http://127.0.0.1:10000)
           clauditor watch / Grafana
 ```
 
-## Developing on it
+## Developing On It
 
 ```bash
 docker compose up -d --build

@@ -242,3 +242,86 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{}...", &s[..max.min(s.len())])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_summary, EventBroadcaster, WatchEvent};
+
+    #[test]
+    fn extract_summary_renders_known_tool_inputs() {
+        assert_eq!(
+            extract_summary("Read", r#"{"file_path":"src/main.rs"}"#),
+            "src/main.rs"
+        );
+        assert_eq!(
+            extract_summary("Grep", r#"{"pattern":"TODO","path":"src"}"#),
+            "TODO in src"
+        );
+        assert_eq!(extract_summary("Skill", r#"{"command_name":"tdd"}"#), "tdd");
+    }
+
+    #[test]
+    fn extract_summary_truncates_large_or_unknown_payloads() {
+        let long_command = format!("cargo test {}", "x".repeat(100));
+        let summary = extract_summary("Bash", &format!(r#"{{"command":"{long_command}"}}"#));
+        assert!(summary.starts_with("cargo test "));
+        assert!(summary.ends_with("..."));
+        assert!(summary.len() <= 83);
+
+        let invalid = extract_summary("Unknown", &"x".repeat(100));
+        assert!(invalid.ends_with("..."));
+        assert!(invalid.len() <= 63);
+    }
+
+    #[test]
+    fn broadcaster_replays_recent_history_and_live_events() {
+        let broadcaster = EventBroadcaster::new();
+        broadcaster.broadcast(WatchEvent::ToolUse {
+            session_id: "session_a".to_string(),
+            timestamp: "2999-01-01T00:00:00Z".to_string(),
+            tool_name: "Read".to_string(),
+            summary: "src/main.rs".to_string(),
+        });
+
+        let (history, mut rx) = broadcaster.subscribe_with_history();
+        assert_eq!(history.len(), 1);
+        assert!(matches!(
+            &history[0],
+            WatchEvent::ToolUse { session_id, tool_name, .. }
+                if session_id == "session_a" && tool_name == "Read"
+        ));
+
+        broadcaster.broadcast(WatchEvent::ToolResult {
+            session_id: "session_a".to_string(),
+            tool_name: "Read".to_string(),
+            outcome: "success".to_string(),
+            duration_ms: 12,
+        });
+        let event = rx.try_recv().expect("live event");
+        assert!(matches!(
+            event,
+            WatchEvent::ToolResult { outcome, duration_ms, .. }
+                if outcome == "success" && duration_ms == 12
+        ));
+    }
+
+    #[test]
+    fn broadcaster_history_is_bounded() {
+        let broadcaster = EventBroadcaster::new();
+        for idx in 0..513 {
+            broadcaster.broadcast(WatchEvent::ToolUse {
+                session_id: format!("session_{idx}"),
+                timestamp: "2999-01-01T00:00:00Z".to_string(),
+                tool_name: "Read".to_string(),
+                summary: "src/main.rs".to_string(),
+            });
+        }
+
+        let (history, _) = broadcaster.subscribe_with_history();
+        assert_eq!(history.len(), 512);
+        assert!(matches!(
+            &history[0],
+            WatchEvent::ToolUse { session_id, .. } if session_id == "session_1"
+        ));
+    }
+}

@@ -340,6 +340,19 @@ impl WatchHandle {
     }
 }
 
+fn envoy_proxy_url() -> String {
+    std::env::var("CLAUDITOR_ENVOY_PROXY_URL").unwrap_or_else(|_| ENVOY_PROXY_URL.to_string())
+}
+
+fn clauditor_core_url() -> String {
+    std::env::var("CLAUDITOR_CORE_URL").unwrap_or_else(|_| CLAUDITOR_CORE_URL.to_string())
+}
+
+fn clauditor_core_health_url() -> String {
+    std::env::var("CLAUDITOR_CORE_HEALTH_URL")
+        .unwrap_or_else(|_| format!("{}/health", clauditor_core_url().trim_end_matches('/')))
+}
+
 fn command_exists(name: &str) -> bool {
     command_path(name).is_some()
 }
@@ -953,7 +966,8 @@ fn extract_run_watch(watch_flag: bool, command: Vec<String>) -> (bool, Vec<Strin
 }
 
 async fn ensure_stack_running() -> Result<(), String> {
-    if health_check(CLAUDITOR_CORE_HEALTH_URL).await {
+    let health_url = clauditor_core_health_url();
+    if health_check(&health_url).await {
         return Ok(());
     }
 
@@ -994,6 +1008,7 @@ fn tmux_session_name() -> String {
 
 fn start_watcher() -> Result<WatchHandle, String> {
     let cli_path = current_cli_path();
+    let core_url = clauditor_core_url();
     if command_exists("tmux") {
         let session = tmux_session_name();
         let command = shell_join(&[
@@ -1001,7 +1016,7 @@ fn start_watcher() -> Result<WatchHandle, String> {
             "watch".to_string(),
             "--tmux".to_string(),
             "--url".to_string(),
-            CLAUDITOR_CORE_URL.to_string(),
+            core_url.clone(),
         ]);
         let status = Command::new("tmux")
             .args(["new-session", "-d", "-s", &session, &command])
@@ -1018,7 +1033,7 @@ fn start_watcher() -> Result<WatchHandle, String> {
     }
 
     let child = Command::new(cli_path)
-        .args(["watch", "--url", CLAUDITOR_CORE_URL])
+        .args(["watch", "--url", core_url.as_str()])
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -1080,10 +1095,11 @@ async fn run_child_command(watch_flag: bool, command: Vec<String>) -> i32 {
 
     let command_name = &child_command[0];
     let command_args = &child_command[1..];
+    let proxy_url = envoy_proxy_url();
     let result = run_command_with_env(
         command_name,
         command_args,
-        &[("ANTHROPIC_BASE_URL", ENVOY_PROXY_URL)],
+        &[("ANTHROPIC_BASE_URL", proxy_url.as_str())],
     );
 
     if let Some(handle) = watcher.as_mut() {
@@ -2281,10 +2297,75 @@ async fn connect_and_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_datetime_from_iso, extract_run_watch, local_time_from_iso, Cli, Commands};
+    use super::{
+        compact_datetime_from_iso, event_session_id, extract_run_watch, format_duration_coarse,
+        format_tokens, local_time_from_iso, parse_mcp_tool_name, push_unique, shell_join,
+        shell_quote, truncate_for_box, yaml_quote, ActiveSessions, Cli, Commands, WatchEvent,
+    };
     use chrono::{DateTime, Local};
     use clap::Parser;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn unique_test_dir(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "clauditor-cli-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create test dir");
+        path
+    }
+
+    fn serve_sse_chunks_once(chunks: Vec<String>) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind sse server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept sse request");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut buffer).expect("read request");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..n]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tx.send(String::from_utf8_lossy(&request).into_owned())
+                .expect("send captured request");
+
+            let content_len: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                content_len
+            )
+            .expect("write sse response headers");
+
+            for chunk in chunks {
+                stream.write_all(chunk.as_bytes()).expect("write sse chunk");
+                stream.flush().expect("flush sse chunk");
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        (url, rx)
+    }
 
     #[test]
     fn local_time_from_iso_converts_from_rfc3339() {
@@ -2311,6 +2392,87 @@ mod tests {
     #[test]
     fn local_time_from_iso_falls_back_for_invalid_timestamps() {
         assert_eq!(local_time_from_iso("not-a-timestamp"), "??:??:??");
+    }
+
+    #[test]
+    fn formatting_helpers_render_compact_user_text() {
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(12_345), "12K");
+        assert_eq!(format_tokens(3_400_000), "3.4M");
+
+        assert_eq!(format_duration_coarse(45), "45s");
+        assert_eq!(format_duration_coarse(12 * 60), "12m");
+        assert_eq!(format_duration_coarse(3 * 60 * 60 + 20 * 60), "3h 20m");
+        assert_eq!(
+            format_duration_coarse(2 * 24 * 60 * 60 + 5 * 60 * 60),
+            "2d 5h"
+        );
+
+        assert_eq!(truncate_for_box("short", 10), "short");
+        assert_eq!(truncate_for_box("abcdef", 4), "abc\u{2026}");
+        assert_eq!(truncate_for_box("åäöabc", 4), "åäö\u{2026}");
+    }
+
+    #[test]
+    fn shell_and_yaml_quoting_preserve_command_arguments() {
+        assert_eq!(shell_quote("abc/def-123"), "abc/def-123");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("hello world"), "'hello world'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+
+        assert_eq!(
+            shell_join(&["clauditor".to_string(), "hello world".to_string()]),
+            "clauditor 'hello world'"
+        );
+        assert_eq!(yaml_quote(r#"a\b"c"#), r#""a\\b\"c""#);
+    }
+
+    #[test]
+    fn command_path_accepts_explicit_executable_paths() {
+        let dir = unique_test_dir("command-path");
+        let executable = dir.join("fake-command");
+        {
+            let mut file = fs::File::create(&executable).expect("create executable");
+            writeln!(file, "#!/bin/sh").expect("write executable");
+        }
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&executable).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&executable, permissions).expect("chmod executable");
+        }
+
+        assert_eq!(
+            super::command_path(executable.to_str().expect("utf8 path")),
+            Some(executable.clone())
+        );
+        assert!(super::command_exists(
+            executable.to_str().expect("utf8 path")
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_if_changed_creates_parent_dirs_and_preserves_identical_files() {
+        let dir = unique_test_dir("write-if-changed");
+        let path = dir.join("nested/config.yml");
+
+        super::write_if_changed(&path, "one").expect("first write");
+        let modified = fs::metadata(&path).expect("metadata").modified().ok();
+        super::write_if_changed(&path, "one").expect("same write");
+        assert_eq!(fs::read_to_string(&path).expect("read"), "one");
+        if let Some(modified) = modified {
+            assert_eq!(
+                fs::metadata(&path).expect("metadata").modified().ok(),
+                Some(modified)
+            );
+        }
+
+        super::write_if_changed(&path, "two").expect("changed write");
+        assert_eq!(fs::read_to_string(&path).expect("read"), "two");
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2362,6 +2524,173 @@ mod tests {
                 "opus"
             ]
         );
+    }
+
+    #[test]
+    fn parser_applies_command_defaults() {
+        let cli = Cli::try_parse_from(["clauditor", "watch"]).expect("watch parses");
+        let Commands::Watch {
+            url,
+            no_cache,
+            no_signals,
+            session,
+            tmux,
+            tmux_max_panes,
+        } = cli.command
+        else {
+            panic!("expected watch command");
+        };
+        assert_eq!(url, "http://localhost:9091");
+        assert!(!no_cache);
+        assert!(!no_signals);
+        assert_eq!(session, None);
+        assert!(!tmux);
+        assert_eq!(tmux_max_panes, 4);
+
+        let cli = Cli::try_parse_from(["clauditor", "sessions"]).expect("sessions parses");
+        let Commands::Sessions { url, limit, days } = cli.command else {
+            panic!("expected sessions command");
+        };
+        assert_eq!(url, "http://localhost:9091");
+        assert_eq!(limit, 20);
+        assert_eq!(days, 7);
+
+        let cli = Cli::try_parse_from(["clauditor", "recall", "auth"]).expect("recall parses");
+        let Commands::Recall {
+            url,
+            limit,
+            days,
+            query,
+        } = cli.command
+        else {
+            panic!("expected recall command");
+        };
+        assert_eq!(url, "http://localhost:9091");
+        assert_eq!(limit, 5);
+        assert_eq!(days, 30);
+        assert_eq!(query, vec!["auth"]);
+    }
+
+    #[test]
+    fn active_sessions_tags_only_when_multiple_sessions_exist() {
+        let mut active = ActiveSessions::new();
+        active.add("session_a", "api");
+        assert!(!active.is_multi());
+        assert_eq!(active.tag_for("session_a"), "");
+
+        active.add("session_b", "worker-long");
+        assert!(active.is_multi());
+        assert_eq!(active.tag_for("session_a"), "[api        ]  ");
+        assert_eq!(active.tag_for("missing"), "[?          ]  ");
+
+        active.remove("session_b");
+        assert!(!active.is_multi());
+    }
+
+    #[tokio::test]
+    async fn watch_stream_consumes_sse_chunks_and_applies_session_filter() {
+        let chunks = vec![
+            ": keepalive\n\n".to_string(),
+            concat!(
+                "data: {\"type\":\"session_start\",\"session_id\":\"session_other\",",
+                "\"display_name\":\"other\",\"model\":\"opus\"}\n\n"
+            )
+            .to_string(),
+            concat!(
+                "data: {\"type\":\"session_start\",\"session_id\":\"session_target\",",
+                "\"display_name\":\"api\",\"model\":\"sonnet\",",
+                "\"initial_prompt\":\"investigate auth\"}\n\n"
+            )
+            .to_string(),
+            concat!(
+                "data: {\"type\":\"tool_use\",\"session_id\":\"session_target\",",
+                "\"timestamp\":\"2026-04-28T00:00:00Z\",",
+                "\"tool_name\":\"Read\",\"summary\":\"src/main.rs\"}\n\n"
+            )
+            .to_string(),
+            concat!(
+                "data: {\"type\":\"session_end\",\"session_id\":\"session_target\",",
+                "\"outcome\":\"Likely Completed\",\"total_tokens\":1234,\"total_turns\":3}\n\n"
+            )
+            .to_string(),
+        ];
+        let (url, request_rx) = serve_sse_chunks_once(chunks);
+        let mut active = ActiveSessions::new();
+        let filter = Some("session_target".to_string());
+
+        super::connect_and_stream(&url, false, false, &filter, &mut active)
+            .await
+            .expect("watch stream closes cleanly");
+
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured watch request");
+        assert!(
+            request.starts_with("GET / "),
+            "unexpected request:\n{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("accept: text/event-stream"),
+            "missing SSE accept header:\n{request}"
+        );
+        assert!(
+            active.sessions.is_empty(),
+            "target session should be removed after session_end"
+        );
+    }
+
+    #[test]
+    fn watch_event_session_ids_skip_global_events() {
+        let event = WatchEvent::ToolUse {
+            session_id: "session_a".to_string(),
+            timestamp: "2026-04-28T00:00:00Z".to_string(),
+            tool_name: "Read".to_string(),
+            summary: "src/main.rs".to_string(),
+        };
+        assert_eq!(event_session_id(&event), Some("session_a"));
+
+        assert_eq!(
+            event_session_id(&WatchEvent::RateLimitStatus {
+                seconds_to_reset: Some(60),
+                requests_remaining: None,
+                requests_limit: None,
+                input_tokens_remaining: None,
+                output_tokens_remaining: None,
+                tokens_used_this_week: Some(10),
+                tokens_limit: Some(100),
+                tokens_remaining: Some(90),
+                budget_source: Some("env".to_string()),
+                projected_exhaustion_secs: None,
+            }),
+            None
+        );
+        assert_eq!(event_session_id(&WatchEvent::Lagged { missed: 3 }), None);
+    }
+
+    #[test]
+    fn mcp_tool_names_split_server_and_tool() {
+        assert_eq!(
+            parse_mcp_tool_name("mcp__github__get_issue"),
+            Some(("github", "get_issue"))
+        );
+        assert_eq!(
+            parse_mcp_tool_name(" mcp__server__tool__suffix "),
+            Some(("server", "tool__suffix"))
+        );
+        assert_eq!(parse_mcp_tool_name("Read"), None);
+        assert_eq!(parse_mcp_tool_name("mcp__github"), None);
+        assert_eq!(parse_mcp_tool_name("mcp____tool"), None);
+    }
+
+    #[test]
+    fn push_unique_preserves_first_occurrence_order() {
+        let mut lines = Vec::new();
+        push_unique(&mut lines, "one");
+        push_unique(&mut lines, "two");
+        push_unique(&mut lines, "one");
+        assert_eq!(lines, vec!["one", "two"]);
     }
 
     #[test]

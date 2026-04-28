@@ -1,0 +1,21 @@
+services:
+  fake-anthropic:
+    image: python:3.12-alpine
+    command: ["python", "/fake-anthropic.py"]
+    volumes:
+      - ./test/fake-anthropic.py:/fake-anthropic.py:ro
+    expose:
+      - "8000"
+
+  envoy:
+    volumes:
+      - ./test/envoy.e2e.yaml:/etc/envoy/envoy.yaml:ro
+    depends_on:
+      clauditor-core:
+        condition: service_healthy
+      fake-anthropic:
+        condition: service_started
+
+  clauditor-core:
+    environment:
+      - CLAUDITOR_SESSION_TIMEOUT_MINUTES=1

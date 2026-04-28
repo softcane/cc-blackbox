@@ -727,4 +727,113 @@ mod tests {
         assert_eq!(report.causes.len(), 1);
         assert_eq!(report.causes[0].cause_type, "context_bloat");
     }
+
+    #[test]
+    fn analyze_session_reports_model_fallback_as_degradation() {
+        let mut turns = vec![
+            snapshot(1, 10_000, 500, 0.0, 0.20),
+            snapshot(2, 11_000, 600, 10.0, 0.22),
+            snapshot(3, 9_000, 400, 10.0, 0.18),
+        ];
+        turns[0].tool_calls = vec!["Edit".to_string()];
+        turns[1].tool_calls = vec!["Bash".to_string()];
+        turns[1].requested_model = Some("claude-opus-4-5".to_string());
+        turns[1].actual_model = Some("claude-sonnet-4-5".to_string());
+        turns[2].tool_calls = vec!["Bash".to_string()];
+
+        let report = analyze_session("session-model-fallback", &turns);
+
+        assert!(report.degraded);
+        assert_eq!(report.degradation_turn, Some(2));
+        let cause = report
+            .causes
+            .iter()
+            .find(|cause| cause.cause_type == "model_fallback")
+            .expect("model fallback cause");
+        assert_eq!(cause.requested_model.as_deref(), Some("claude-opus-4-5"));
+        assert_eq!(cause.actual_model.as_deref(), Some("claude-sonnet-4-5"));
+        assert!(report.advice.iter().any(|advice| advice.contains("Sonnet")));
+    }
+
+    #[test]
+    fn analyze_session_reports_cache_ttl_miss_as_degradation() {
+        let mut turns = vec![
+            snapshot(1, 10_000, 500, 0.0, 0.20),
+            snapshot(2, 11_000, 600, 360.0, 0.22),
+            snapshot(3, 9_000, 400, 10.0, 0.18),
+        ];
+        turns[0].tool_calls = vec!["Edit".to_string()];
+        turns[1].tool_calls = vec!["Bash".to_string()];
+        turns[1].cache_creation_tokens = 25_000;
+        turns[2].tool_calls = vec!["Bash".to_string()];
+
+        let report = analyze_session("session-cache-ttl", &turns);
+
+        assert!(report.degraded);
+        assert_eq!(report.degradation_turn, Some(2));
+        let cause = report
+            .causes
+            .iter()
+            .find(|cause| cause.cause_type == "cache_miss_ttl")
+            .expect("cache TTL cause");
+        assert_eq!(cause.turn_first_noticed, 2);
+        assert!(cause.estimated_cost > 0.0);
+    }
+
+    #[test]
+    fn analyze_session_reports_cache_thrash_after_repeated_rebuilds() {
+        let mut turns = vec![
+            snapshot(1, 10_000, 500, 0.0, 0.20),
+            snapshot(2, 11_000, 600, 20.0, 0.22),
+            snapshot(3, 12_000, 700, 20.0, 0.24),
+            snapshot(4, 13_000, 800, 20.0, 0.26),
+            snapshot(5, 9_000, 400, 10.0, 0.18),
+        ];
+        turns[0].tool_calls = vec!["Edit".to_string()];
+        for turn in turns.iter_mut().skip(1) {
+            turn.tool_calls = vec!["Bash".to_string()];
+        }
+        for turn in turns.iter_mut().take(4).skip(1) {
+            turn.cache_creation_tokens = 10_000;
+            turn.cache_read_tokens = 0;
+        }
+
+        let report = analyze_session("session-cache-thrash", &turns);
+
+        assert!(report.degraded);
+        assert_eq!(report.degradation_turn, Some(2));
+        let cause = report
+            .causes
+            .iter()
+            .find(|cause| cause.cause_type == "cache_miss_thrash")
+            .expect("cache thrash cause");
+        assert_eq!(cause.turn_first_noticed, 2);
+        assert!(cause.detail.contains("3 consecutive cache rebuilds"));
+    }
+
+    #[test]
+    fn analyze_session_reports_tool_failure_streak_after_turn_six() {
+        let mut turns = (1..=10)
+            .map(|turn| snapshot(turn, 10_000 + turn * 100, 500, 10.0, 0.20))
+            .collect::<Vec<_>>();
+        turns[0].tool_calls = vec!["Edit".to_string()];
+        for turn in turns.iter_mut().skip(1) {
+            turn.tool_calls = vec!["Bash".to_string()];
+        }
+        for turn in turns.iter_mut().skip(5) {
+            turn.tool_results_failed = 1;
+        }
+
+        let report = analyze_session("session-tool-failures", &turns);
+
+        assert!(report.degraded);
+        assert_eq!(report.degradation_turn, Some(6));
+        let cause = report
+            .causes
+            .iter()
+            .find(|cause| cause.cause_type == "tool_failure_streak")
+            .expect("tool failure cause");
+        assert_eq!(cause.turn_first_noticed, 6);
+        assert!(cause.detail.contains("5 consecutive turns"));
+    }
 }

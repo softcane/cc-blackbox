@@ -56,15 +56,17 @@ pub mod pricing;
 pub mod watch;
 
 use envoy::config::core::v3::{
-    HeaderValue as ProtoHeaderValue, HeaderValueOption as ProtoHeaderValueOption,
+    header_value_option::HeaderAppendAction, HeaderValue as ProtoHeaderValue,
+    HeaderValueOption as ProtoHeaderValueOption,
 };
 use envoy::service::ext_proc::v3::{
+    body_mutation,
     common_response::ResponseStatus,
     external_processor_server::{ExternalProcessor, ExternalProcessorServer},
     processing_request::Request as ExtProcRequest,
     processing_response::Response as ExtProcResponse,
-    BodyResponse, CommonResponse, HeaderMutation, HeadersResponse, HttpHeaders, ImmediateResponse,
-    ProcessingRequest, ProcessingResponse,
+    BodyMutation, BodyResponse, CommonResponse, HeaderMutation, HeadersResponse, HttpHeaders,
+    ImmediateResponse, ProcessingRequest, ProcessingResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -138,7 +140,7 @@ fn start_of_week_epoch_at(secs: u64) -> u64 {
     let days = (secs / 86400) as i32;
     // day-of-week: 0=Thu for epoch. Monday = (days + 3) % 7 offset.
     let dow = ((days + 3) % 7) as u64; // 0=Mon .. 6=Sun
-    secs - (secs % 86400) - dow * 86400
+    (secs - (secs % 86400)).saturating_sub(dow * 86400)
 }
 
 fn start_of_week_iso_at(secs: u64) -> String {
@@ -2054,11 +2056,21 @@ impl ResponseAccumulator {
 // ---------------------------------------------------------------------------
 // Finalize: metrics + DB persistence
 // ---------------------------------------------------------------------------
+/// Claude Code can expose 1M context as a UI model suffix even though the
+/// Anthropic API expects a normal model id plus an anthropic-beta header.
+fn strip_model_1m_alias(model: &str) -> Option<&str> {
+    let lower = model.to_ascii_lowercase();
+    lower
+        .ends_with("[1m]")
+        .then(|| &model[..model.len().saturating_sub("[1m]".len())])
+        .filter(|model| !model.is_empty())
+}
+
 /// Relaxed model equivalence check: "claude-opus-4-7" and
 /// "claude-opus-4-7-20260410" should be considered the same model. We treat
 /// two strings as matching if either contains the other as a prefix.
 fn normalize_model_for_match(model: &str) -> &str {
-    model.strip_suffix("[1m]").unwrap_or(model)
+    strip_model_1m_alias(model).unwrap_or(model)
 }
 
 pub(crate) fn model_matches(requested: &str, actual: &str) -> bool {
@@ -2995,6 +3007,7 @@ fn extract_headers(h: &HttpHeaders, name: &str) -> Vec<String> {
 
 const STANDARD_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
 const EXTENDED_CONTEXT_WINDOW_TOKENS: u64 = 1_000_000;
+const CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
 const CONTEXT_1M_BETA_PREFIX: &str = "context-1m-";
 
 fn configured_context_window_tokens() -> Option<u64> {
@@ -3011,12 +3024,53 @@ fn model_requests_1m_context(model: &str) -> bool {
     model.to_ascii_lowercase().contains("[1m]")
 }
 
-fn request_uses_1m_context(headers: &HttpHeaders) -> bool {
-    extract_headers(headers, "anthropic-beta")
+fn beta_values_use_1m_context(values: &[String]) -> bool {
+    values
         .iter()
         .flat_map(|value| value.split(','))
         .map(|beta| beta.trim().to_ascii_lowercase())
         .any(|beta| beta.starts_with(CONTEXT_1M_BETA_PREFIX))
+}
+
+fn request_uses_1m_context(headers: &HttpHeaders) -> bool {
+    beta_values_use_1m_context(&extract_headers(headers, "anthropic-beta"))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UpstreamRequestAdjustment {
+    body: Option<Vec<u8>>,
+    anthropic_beta: Option<String>,
+}
+
+fn anthropic_beta_with_1m_context(beta_values: &[String]) -> String {
+    if beta_values.is_empty() {
+        CONTEXT_1M_BETA.to_string()
+    } else {
+        format!("{}, {}", beta_values.join(", "), CONTEXT_1M_BETA)
+    }
+}
+
+fn upstream_request_adjustment_for_body(
+    beta_values: &[String],
+    body: &[u8],
+) -> UpstreamRequestAdjustment {
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return UpstreamRequestAdjustment::default();
+    };
+
+    let Some(model) = value.get("model").and_then(|model| model.as_str()) else {
+        return UpstreamRequestAdjustment::default();
+    };
+    let Some(upstream_model) = strip_model_1m_alias(model) else {
+        return UpstreamRequestAdjustment::default();
+    };
+
+    value["model"] = Value::String(upstream_model.to_string());
+    UpstreamRequestAdjustment {
+        body: serde_json::to_vec(&value).ok(),
+        anthropic_beta: (!beta_values_use_1m_context(beta_values))
+            .then(|| anthropic_beta_with_1m_context(beta_values)),
+    }
 }
 
 fn resolve_context_window_tokens(header_hint: Option<u64>, model: &str) -> u64 {
@@ -3799,6 +3853,7 @@ fn expected_skill_names_from_prompt(prompt: &str, cwd: Option<&str>) -> HashSet<
             continue;
         }
         if prompt_norm.contains(&format!("use {skill_phrase}"))
+            || prompt_norm.contains(&format!("use the {skill_phrase}"))
             || prompt_norm.contains(&format!("use the {skill_phrase} skill"))
             || prompt_norm.contains(&format!("{skill_phrase} skill"))
         {
@@ -4098,6 +4153,45 @@ fn body_continue() -> BodyResponse {
         }),
     }
 }
+fn body_continue_with_upstream_adjustment(adjustment: UpstreamRequestAdjustment) -> BodyResponse {
+    let mut set_headers = Vec::new();
+    if let Some(value) = adjustment.anthropic_beta {
+        set_headers.push(ProtoHeaderValueOption {
+            header: Some(ProtoHeaderValue {
+                key: "anthropic-beta".to_string(),
+                value,
+                raw_value: Vec::new(),
+            }),
+            append_action: HeaderAppendAction::OverwriteIfExistsOrAdd.into(),
+            ..Default::default()
+        });
+    }
+    if let Some(body) = adjustment.body.as_ref() {
+        set_headers.push(ProtoHeaderValueOption {
+            header: Some(ProtoHeaderValue {
+                key: "content-length".to_string(),
+                value: body.len().to_string(),
+                raw_value: Vec::new(),
+            }),
+            append_action: HeaderAppendAction::OverwriteIfExistsOrAdd.into(),
+            ..Default::default()
+        });
+    }
+
+    BodyResponse {
+        response: Some(CommonResponse {
+            status: ResponseStatus::Continue.into(),
+            header_mutation: (!set_headers.is_empty()).then_some(HeaderMutation {
+                set_headers,
+                ..Default::default()
+            }),
+            body_mutation: adjustment.body.map(|body| BodyMutation {
+                mutation: Some(body_mutation::Mutation::Body(body)),
+            }),
+            ..Default::default()
+        }),
+    }
+}
 
 fn active_session_count() -> usize {
     diagnosis::SESSIONS
@@ -4132,6 +4226,7 @@ impl ExternalProcessor for ClauditorProcessor {
             let mut working_dir_str = String::new();
             let mut user_prompt_excerpt_buf = String::new();
             let mut request_context_window_hint: Option<u64> = None;
+            let mut request_anthropic_beta_values: Vec<String> = Vec::new();
             let mut context_window_tokens = STANDARD_CONTEXT_WINDOW_TOKENS;
             let mut finalized = false;
 
@@ -4181,6 +4276,7 @@ impl ExternalProcessor for ClauditorProcessor {
                         started_at = Instant::now();
                         request_id = extract_header(h, "x-request-id")
                             .unwrap_or_else(|| format!("req_{}", started_at.elapsed().as_nanos()));
+                        request_anthropic_beta_values = extract_headers(h, "anthropic-beta");
                         request_context_window_hint =
                             request_uses_1m_context(h).then_some(EXTENDED_CONTEXT_WINDOW_TOKENS);
                         context_window_tokens = configured_context_window_tokens()
@@ -4274,8 +4370,14 @@ impl ExternalProcessor for ClauditorProcessor {
                             continue;
                         }
 
+                        let upstream_adjustment = upstream_request_adjustment_for_body(
+                            &request_anthropic_beta_values,
+                            &b.body,
+                        );
                         let response = ProcessingResponse {
-                            response: Some(ExtProcResponse::RequestBody(body_continue())),
+                            response: Some(ExtProcResponse::RequestBody(
+                                body_continue_with_upstream_adjustment(upstream_adjustment),
+                            )),
                             ..Default::default()
                         };
                         if tx.send(Ok(response)).await.is_err() {
@@ -5370,10 +5472,15 @@ async fn http_server() {
         .route("/api/sessions", get(handle_sessions))
         .route("/watch", get(handle_watch));
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:9090")
+    let addr = std::env::var("CLAUDITOR_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:9090".to_string());
+    let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .expect("failed to bind :9090");
-    info!("HTTP server listening on 0.0.0.0:9090 (/health, /metrics, /api/hooks/claude-code, /api/summary, /api/recall, /api/billing-reconciliations, /api/sessions, /api/cache-rebuilds, /api/degradation, /watch)");
+        .unwrap_or_else(|err| panic!("failed to bind HTTP server at {addr}: {err}"));
+    let bound_addr = listener
+        .local_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| addr.clone());
+    info!("HTTP server listening on {bound_addr} (/health, /metrics, /api/hooks/claude-code, /api/summary, /api/recall, /api/billing-reconciliations, /api/sessions, /api/cache-rebuilds, /api/degradation, /watch)");
     axum::serve(listener, app).await.expect("HTTP server error");
 }
 
@@ -5684,7 +5791,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(quota_burn_monitor());
     tokio::spawn(historical_metrics_monitor());
 
-    let addr = "0.0.0.0:50051".parse()?;
+    let addr = std::env::var("CLAUDITOR_GRPC_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:50051".to_string())
+        .parse()?;
     info!(%addr, "gRPC ext_proc server starting");
 
     Server::builder()
@@ -5700,23 +5809,29 @@ mod tests {
     use std::fs;
     use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use rusqlite::Connection;
 
     use super::{
         build_diagnosis_response_json, build_session_summary_json, build_sessions_response_json,
-        build_summary_response_json, canonical_telemetry_name, compact_response_summary,
-        db_writer_loop, ensure_session_columns, epoch_to_iso8601, extract_explicit_skill_refs,
-        load_degradation_view_from_db, metrics, now_epoch_secs, parse_latest_tool_results,
-        persist_billing_reconciliation, pricing, query_historical_metrics, query_summary,
-        repair_persisted_session_artifacts, repair_turn_snapshot_context_windows,
-        request_uses_1m_context, resolve_context_window_tokens, seed_live_metric_labels_from_db,
-        session_timeout_secs, should_broadcast_quota_snapshot, skill_name_from_tool_input_json,
+        build_summary_response_json, canonical_telemetry_name, clean_user_prompt,
+        compact_response_summary, context_fill_percent, context_fill_ratio, db_writer_loop,
+        derive_display_name, diagnosis, ensure_session_columns, epoch_to_iso8601,
+        extract_explicit_skill_refs, extract_header, extract_headers, extract_working_dir,
+        infer_context_window_tokens, load_degradation_view_from_db, looks_like_machine_recall_line,
+        metrics, model_requests_1m_context, normalize_search_text, now_epoch_secs,
+        parse_latest_tool_results, parse_request_body, persist_billing_reconciliation, pricing,
+        query_historical_metrics, query_summary, repair_persisted_session_artifacts,
+        repair_turn_snapshot_context_windows, request_uses_1m_context,
+        resolve_context_window_tokens, score_recall_doc, seed_live_metric_labels_from_db,
+        session_timeout_secs, should_broadcast_quota_snapshot, skill_name_from_skill_file,
+        skill_name_from_tool_input_json, strip_model_1m_alias, summarize_hook_tool_input,
+        tokenize_search_text, tool_recall_context, upstream_request_adjustment_for_body,
         BillingReconciliationInput, BillingReconciliationWriteError, DbCommand, HttpHeaders,
-        ParsedToolResult, ProtoHeaderValue, SummaryWindowData, ESTIMATED_COST_SOURCE,
-        EXTENDED_CONTEXT_WINDOW_TOKENS, QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA,
-        STANDARD_CONTEXT_WINDOW_TOKENS,
+        ParsedToolResult, ProtoHeaderValue, SummaryWindowData, CONTEXT_1M_BETA,
+        ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS, QUOTA_WATCH_BROADCAST_INTERVAL,
+        SCHEMA, STANDARD_CONTEXT_WINDOW_TOKENS,
     };
 
     static METRICS_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -5816,6 +5931,292 @@ mod tests {
     }
 
     #[test]
+    fn epoch_and_week_formatting_are_utc_stable() {
+        assert_eq!(epoch_to_iso8601(0), "1970-01-01T00:00:00Z");
+        assert_eq!(epoch_to_iso8601(1_582_934_400), "2020-02-29T00:00:00Z");
+        assert_eq!(super::start_of_week_iso_at(0), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            super::start_of_week_iso_at(1_619_827_200),
+            "2021-04-26T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn request_body_parser_extracts_session_identity_inputs() {
+        let body = br#"{
+          "model": "claude-sonnet-4-5[1m]",
+          "system": [
+            { "type": "text", "text": "irrelevant" },
+            { "type": "text", "text": "- Primary working directory: /tmp/clauditor-demo" }
+          ],
+          "tools": [{ "name": "Read" }],
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                { "type": "text", "text": "<system-reminder>noise</system-reminder>" },
+                { "type": "text", "text": "Please inspect the auth cache." }
+              ]
+            },
+            { "role": "assistant", "content": "ok" }
+          ]
+        }"#;
+
+        let (
+            model,
+            message_count,
+            has_tools,
+            system_len,
+            estimated_tokens,
+            hash,
+            working_dir,
+            prompt,
+        ) = parse_request_body(body).expect("parse body");
+
+        assert_eq!(model, "claude-sonnet-4-5[1m]");
+        assert_eq!(message_count, 2);
+        assert!(has_tools);
+        assert!(system_len > 0);
+        assert_eq!(estimated_tokens, body.len() / 4);
+        assert_ne!(hash, 0);
+        assert_eq!(working_dir, "/tmp/clauditor-demo");
+        assert_eq!(prompt, "Please inspect the auth cache.");
+        assert_eq!(
+            extract_working_dir("Primary working directory: /tmp/demo").as_deref(),
+            Some("/tmp/demo")
+        );
+    }
+
+    #[test]
+    fn upstream_adjustment_strips_1m_model_alias_and_adds_beta_header() {
+        let body = br#"{
+          "model": "claude-opus-4-7[1m]",
+          "max_tokens": 10,
+          "messages": [{ "role": "user", "content": "hello" }]
+        }"#;
+
+        let adjustment = upstream_request_adjustment_for_body(&[], body);
+        let rewritten: serde_json::Value =
+            serde_json::from_slice(&adjustment.body.expect("rewritten body"))
+                .expect("valid rewritten json");
+
+        assert_eq!(rewritten["model"], "claude-opus-4-7");
+        assert_eq!(adjustment.anthropic_beta.as_deref(), Some(CONTEXT_1M_BETA));
+        assert_eq!(
+            strip_model_1m_alias("claude-opus-4-7[1M]"),
+            Some("claude-opus-4-7")
+        );
+    }
+
+    #[test]
+    fn upstream_adjustment_preserves_existing_betas_without_duplicate_context_header() {
+        let body = br#"{"model":"claude-sonnet-4-6[1m]","messages":[]}"#;
+        let existing = vec!["prompt-tools-2025-04-02".to_string()];
+
+        let adjustment = upstream_request_adjustment_for_body(&existing, body);
+
+        assert_eq!(
+            adjustment.anthropic_beta.as_deref(),
+            Some("prompt-tools-2025-04-02, context-1m-2025-08-07")
+        );
+
+        let already_has_context =
+            vec!["prompt-tools-2025-04-02, context-1m-2025-08-07".to_string()];
+        let adjustment = upstream_request_adjustment_for_body(&already_has_context, body);
+
+        assert!(adjustment.anthropic_beta.is_none());
+        assert!(adjustment.body.is_some());
+    }
+
+    #[test]
+    fn upstream_adjustment_leaves_normal_models_untouched() {
+        let body = br#"{"model":"claude-sonnet-4-6","messages":[]}"#;
+        let adjustment = upstream_request_adjustment_for_body(&[], body);
+
+        assert_eq!(adjustment, super::UpstreamRequestAdjustment::default());
+    }
+
+    #[test]
+    fn clean_user_prompt_strips_preamble_and_truncates_long_text() {
+        let cleaned = clean_user_prompt(
+            r#"
+            <system-reminder>Ignore this</system-reminder>
+            <command-name>review</command-name>
+            Please review the cache module.
+            "#,
+        );
+        assert_eq!(cleaned, "Please review the cache module.");
+
+        let long = clean_user_prompt(&"x".repeat(400));
+        assert_eq!(long.chars().count(), 321);
+        assert!(long.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn headers_and_context_helpers_handle_common_variants() {
+        let mut headers = make_http_headers(&[
+            ("Anthropic-Beta", "context-1m-2025-08-07, other"),
+            ("X-Context-Window-Tokens", "123456"),
+        ]);
+        headers
+            .headers
+            .as_mut()
+            .expect("headers")
+            .headers
+            .push(ProtoHeaderValue {
+                key: "x-raw".to_string(),
+                value: String::new(),
+                raw_value: b"raw-value".to_vec(),
+            });
+
+        assert_eq!(
+            extract_header(&headers, "anthropic-beta").as_deref(),
+            Some("context-1m-2025-08-07, other")
+        );
+        assert_eq!(
+            extract_header(&headers, "X-RAW").as_deref(),
+            Some("raw-value")
+        );
+        assert_eq!(extract_headers(&headers, "missing"), Vec::<String>::new());
+        assert!(request_uses_1m_context(&headers));
+        assert!(model_requests_1m_context("claude-sonnet[1m]"));
+        assert_eq!(
+            infer_context_window_tokens(Some("sonnet"), None, 200_001, 0, 0),
+            EXTENDED_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            infer_context_window_tokens(Some("sonnet"), None, 100, 50, 25),
+            STANDARD_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(context_fill_ratio(100, 50, 50, 200), 1.0);
+        assert_eq!(context_fill_percent(100, 50, 50, 200), 100.0);
+    }
+
+    #[test]
+    fn display_names_use_workdir_and_collision_suffix() {
+        assert_eq!(
+            derive_display_name("/Users/pradeep/code/clauditor", "claude-sonnet", 0xabc),
+            "clauditor"
+        );
+
+        let hash = 0xabc_u64;
+        diagnosis::SESSIONS.insert(
+            hash,
+            diagnosis::SessionState {
+                session_id: "session_existing".to_string(),
+                display_name: "clauditor".to_string(),
+                model: "claude-sonnet".to_string(),
+                initial_prompt: None,
+                created_at: Instant::now(),
+                last_activity: Instant::now(),
+                session_inserted: true,
+                cache_warning_sent: false,
+            },
+        );
+        let display = derive_display_name("/tmp/clauditor", "claude-sonnet", hash);
+        let _ = diagnosis::SESSIONS.remove(&hash);
+        assert_eq!(display, "clauditor-abc");
+    }
+
+    #[test]
+    fn recall_text_helpers_score_human_content_not_machine_noise() {
+        assert!(looks_like_machine_recall_line("```json"));
+        assert!(looks_like_machine_recall_line(r#""tool_use": "Bash","#));
+        assert!(!looks_like_machine_recall_line(
+            "Fixed the auth cache warm path."
+        ));
+
+        let results = vec![
+            ParsedToolResult {
+                tool_name: "Read".to_string(),
+                input_summary: "src/main.rs".to_string(),
+                outcome: "success".to_string(),
+                is_error: false,
+                duration_ms: 12,
+            },
+            ParsedToolResult {
+                tool_name: "Bash".to_string(),
+                input_summary: "cargo test".to_string(),
+                outcome: "error".to_string(),
+                is_error: true,
+                duration_ms: 34,
+            },
+        ];
+        assert_eq!(
+            tool_recall_context(&results).as_deref(),
+            Some("Tools: Read src/main.rs; Bash cargo test (error)")
+        );
+
+        assert_eq!(normalize_search_text("Auth-cache!!"), "auth cache");
+        let terms = tokenize_search_text("auth cache x");
+        assert_eq!(terms, vec!["auth", "cache"]);
+        let score = score_recall_doc(
+            "auth cache",
+            &terms,
+            "Investigate auth cache",
+            "Fixed cache warm path",
+            "claude-sonnet",
+        )
+        .expect("score");
+        assert!(score > 80);
+        assert!(score_recall_doc("billing", &["billing".to_string()], "", "", "sonnet").is_none());
+    }
+
+    #[test]
+    fn skill_discovery_helpers_accept_frontmatter_and_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "clauditor-skill-test-{}-{}",
+            std::process::id(),
+            now_epoch_secs()
+        ));
+        let skill_dir = dir.join(".claude/skills/test-skill");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        let skill_file = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_file,
+            "---\nname: Fancy Skill\n---\nUse this for fancy work.\n",
+        )
+        .expect("write skill");
+
+        assert_eq!(
+            skill_name_from_skill_file(&skill_file, &fs::read_to_string(&skill_file).unwrap())
+                .as_deref(),
+            Some("fancy-skill")
+        );
+        let expected = super::expected_skill_names_from_prompt(
+            "Please use the fancy skill for this.",
+            Some(dir.to_str().expect("utf8 temp dir")),
+        );
+        assert!(expected.contains("fancy-skill"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hook_tool_input_summaries_cover_common_shapes() {
+        assert_eq!(
+            summarize_hook_tool_input(Some(&serde_json::json!({"command": "cargo test"})))
+                .as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            summarize_hook_tool_input(Some(&serde_json::json!({"file_path": "/tmp/demo.rs"})))
+                .as_deref(),
+            Some("/tmp/demo.rs")
+        );
+        assert_eq!(
+            summarize_hook_tool_input(Some(&serde_json::json!({"query": "auth cache"}))).as_deref(),
+            Some("auth cache")
+        );
+        assert!(
+            summarize_hook_tool_input(Some(&serde_json::json!({"other": "value"})))
+                .expect("json summary")
+                .contains("\"other\"")
+        );
+        assert_eq!(summarize_hook_tool_input(None), None);
+    }
+
+    #[test]
     fn ensure_session_columns_drops_legacy_cache_hit_ratio() {
         let conn = Connection::open_in_memory().expect("open sqlite");
         conn.execute_batch(
@@ -5885,6 +6286,7 @@ mod tests {
         .expect("insert session");
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_request(
         conn: &Connection,
         request_id: &str,

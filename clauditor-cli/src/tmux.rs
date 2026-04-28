@@ -156,7 +156,7 @@ struct ManagedPane {
 }
 
 /// Activity level derived from `last_activity` elapsed time.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Activity {
     Active,
     Warm,
@@ -209,6 +209,51 @@ fn format_duration(secs: u64) -> String {
             format!("{}d {}h", d, h)
         }
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':' | '='))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn shell_join(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|part| shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn build_child_watch_command(
+    cli_path: &str,
+    session_id: &str,
+    watch_url: &str,
+    no_cache: bool,
+    no_signals: bool,
+) -> String {
+    let mut cmd_parts = vec![
+        cli_path.to_string(),
+        "watch".to_string(),
+        "--session".to_string(),
+        session_id.to_string(),
+        "--url".to_string(),
+        watch_url.to_string(),
+    ];
+    if no_cache {
+        cmd_parts.push("--no-cache".to_string());
+    }
+    if no_signals {
+        cmd_parts.push("--no-signals".to_string());
+    }
+    shell_join(&cmd_parts)
 }
 
 impl ManagedPane {
@@ -290,21 +335,13 @@ impl TmuxOrchestrator {
         model: &str,
     ) -> Result<String, String> {
         // Build child command.
-        let mut cmd_parts = vec![
-            self.cli_path.clone(),
-            "watch".into(),
-            "--session".into(),
-            session_id.into(),
-            "--url".into(),
-            self.watch_url.clone(),
-        ];
-        if self.no_cache {
-            cmd_parts.push("--no-cache".into());
-        }
-        if self.no_signals {
-            cmd_parts.push("--no-signals".into());
-        }
-        let child_cmd = cmd_parts.join(" ");
+        let child_cmd = build_child_watch_command(
+            &self.cli_path,
+            session_id,
+            &self.watch_url,
+            self.no_cache,
+            self.no_signals,
+        );
 
         // Determine split strategy.
         // Always target a specific pane so the split happens in the orchestrator's window.
@@ -967,5 +1004,275 @@ impl TmuxOrchestrator {
             self.render_status();
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_count, format_duration, format_observed_tool_calls, Activity, ManagedPane};
+    use crate::WatchEvent;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn pane_with_last_activity(last_activity: Instant, ended: bool) -> ManagedPane {
+        ManagedPane {
+            pane_id: "%1".to_string(),
+            session_id: "session_test".to_string(),
+            display_name: "test".to_string(),
+            model: "sonnet".to_string(),
+            observed_tool_calls: 0,
+            ended,
+            last_activity,
+            cache_expires_at_epoch: None,
+            estimated_rebuild_cost_dollars: None,
+            fill_percent: None,
+            turns_to_compact: None,
+            model_fallback: None,
+            applied_activity: None,
+        }
+    }
+
+    fn active_pane() -> ManagedPane {
+        let mut pane = pane_with_last_activity(Instant::now(), false);
+        pane.applied_activity = Some(Activity::Active);
+        pane
+    }
+
+    fn test_orchestrator(max_panes: usize) -> super::TmuxOrchestrator {
+        super::TmuxOrchestrator {
+            panes: HashMap::new(),
+            own_pane_id: "%0".to_string(),
+            own_window_id: "@0".to_string(),
+            first_session_pane_id: None,
+            watch_url: "http://localhost:9091".to_string(),
+            cli_path: "clauditor".to_string(),
+            no_cache: false,
+            no_signals: false,
+            max_panes,
+            rate_limit: None,
+        }
+    }
+
+    #[test]
+    fn count_and_duration_formatting_are_compact() {
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(12_345), "12K");
+        assert_eq!(format_count(3_400_000), "3.4M");
+
+        assert_eq!(format_duration(45), "45s");
+        assert_eq!(format_duration(12 * 60), "12m");
+        assert_eq!(format_duration(3 * 60 * 60 + 20 * 60), "3h 20m");
+        assert_eq!(format_duration(5 * 24 * 60 * 60 + 14 * 60 * 60), "5d 14h");
+    }
+
+    #[test]
+    fn observed_tool_call_labels_match_counts() {
+        assert_eq!(format_observed_tool_calls(0), "no tool calls seen");
+        assert_eq!(format_observed_tool_calls(1), "1 tool call seen");
+        assert_eq!(format_observed_tool_calls(2), "2 tool calls seen");
+    }
+
+    #[test]
+    fn child_watch_command_preserves_session_url_and_visibility_flags() {
+        assert_eq!(
+            super::build_child_watch_command(
+                "clauditor",
+                "session_a",
+                "http://localhost:9091",
+                false,
+                false,
+            ),
+            "clauditor watch --session session_a --url http://localhost:9091"
+        );
+
+        assert_eq!(
+            super::build_child_watch_command(
+                "/tmp/clauditor cli",
+                "session with spaces",
+                "http://localhost:9091/watch?session=session with spaces",
+                true,
+                true,
+            ),
+            "'/tmp/clauditor cli' watch --session 'session with spaces' --url 'http://localhost:9091/watch?session=session with spaces' --no-cache --no-signals"
+        );
+    }
+
+    #[test]
+    fn pane_activity_tracks_idle_time_and_end_state() {
+        assert_eq!(
+            pane_with_last_activity(Instant::now(), false).activity(),
+            Activity::Active
+        );
+        assert_eq!(
+            pane_with_last_activity(Instant::now() - Duration::from_secs(15), false).activity(),
+            Activity::Warm
+        );
+        assert_eq!(
+            pane_with_last_activity(Instant::now() - Duration::from_secs(31), false).activity(),
+            Activity::Idle
+        );
+        assert_eq!(
+            pane_with_last_activity(Instant::now(), true).activity(),
+            Activity::Ended
+        );
+    }
+
+    #[test]
+    fn ensure_pane_exists_respects_max_panes_before_shelling_out() {
+        let mut orchestrator = test_orchestrator(0);
+        let cleanup = Arc::new(Mutex::new(Vec::new()));
+
+        orchestrator.ensure_pane_exists("session_new", &cleanup);
+
+        assert!(orchestrator.panes.is_empty());
+        assert!(cleanup.lock().expect("cleanup ids").is_empty());
+    }
+
+    #[test]
+    fn session_start_respects_max_panes_before_shelling_out() {
+        let mut orchestrator = test_orchestrator(0);
+        let cleanup = Arc::new(Mutex::new(Vec::new()));
+
+        orchestrator.handle_event(
+            &WatchEvent::SessionStart {
+                session_id: "session_new".to_string(),
+                display_name: "api".to_string(),
+                model: "sonnet".to_string(),
+                initial_prompt: Some("hello".to_string()),
+            },
+            &cleanup,
+        );
+
+        assert!(orchestrator.panes.is_empty());
+        assert!(cleanup.lock().expect("cleanup ids").is_empty());
+    }
+
+    #[test]
+    fn handle_event_updates_existing_pane_state() {
+        let mut orchestrator = test_orchestrator(4);
+        orchestrator
+            .panes
+            .insert("session_a".to_string(), active_pane());
+        let cleanup = Arc::new(Mutex::new(Vec::new()));
+
+        orchestrator.handle_event(
+            &WatchEvent::SessionStart {
+                session_id: "session_a".to_string(),
+                display_name: "api".to_string(),
+                model: "sonnet".to_string(),
+                initial_prompt: Some("hello".to_string()),
+            },
+            &cleanup,
+        );
+        let pane = orchestrator.panes.get("session_a").expect("pane");
+        assert_eq!(pane.display_name, "api");
+        assert_eq!(pane.model, "sonnet");
+
+        orchestrator.handle_event(
+            &WatchEvent::ToolUse {
+                session_id: "session_a".to_string(),
+                timestamp: "2026-04-28T00:00:00Z".to_string(),
+                tool_name: "Read".to_string(),
+                summary: "src/main.rs".to_string(),
+            },
+            &cleanup,
+        );
+        assert_eq!(
+            orchestrator
+                .panes
+                .get("session_a")
+                .expect("pane")
+                .observed_tool_calls,
+            1
+        );
+
+        orchestrator.handle_event(
+            &WatchEvent::CacheEvent {
+                session_id: "session_a".to_string(),
+                event_type: "hit".to_string(),
+                cache_expires_at_epoch: Some(4_102_444_800),
+                estimated_rebuild_cost_dollars: Some(1.23),
+            },
+            &cleanup,
+        );
+        let pane = orchestrator.panes.get("session_a").expect("pane");
+        assert_eq!(pane.cache_expires_at_epoch, Some(4_102_444_800));
+        assert_eq!(pane.estimated_rebuild_cost_dollars, Some(1.23));
+
+        orchestrator.handle_event(
+            &WatchEvent::ContextStatus {
+                session_id: "session_a".to_string(),
+                fill_percent: 82.0,
+                context_window_tokens: Some(200_000),
+                turns_to_compact: Some(1),
+            },
+            &cleanup,
+        );
+        let pane = orchestrator.panes.get("session_a").expect("pane");
+        assert_eq!(pane.fill_percent, Some(82.0));
+        assert_eq!(pane.turns_to_compact, Some(1));
+
+        orchestrator.handle_event(
+            &WatchEvent::ModelFallback {
+                session_id: "session_a".to_string(),
+                requested: "opus".to_string(),
+                actual: "sonnet".to_string(),
+            },
+            &cleanup,
+        );
+        assert_eq!(
+            orchestrator
+                .panes
+                .get("session_a")
+                .expect("pane")
+                .model_fallback,
+            Some(("opus".to_string(), "sonnet".to_string()))
+        );
+
+        orchestrator
+            .panes
+            .get_mut("session_a")
+            .expect("pane")
+            .applied_activity = Some(Activity::Ended);
+        orchestrator.handle_event(
+            &WatchEvent::SessionEnd {
+                session_id: "session_a".to_string(),
+                outcome: "Likely Completed".to_string(),
+                total_tokens: 123,
+                total_turns: 4,
+            },
+            &cleanup,
+        );
+        assert!(orchestrator.panes.get("session_a").expect("pane").ended);
+    }
+
+    #[test]
+    fn handle_event_tracks_rate_limit_summary() {
+        let mut orchestrator = test_orchestrator(4);
+        let cleanup = Arc::new(Mutex::new(Vec::new()));
+
+        orchestrator.handle_event(
+            &WatchEvent::RateLimitStatus {
+                seconds_to_reset: Some(3600),
+                requests_remaining: Some(2),
+                requests_limit: Some(10),
+                input_tokens_remaining: None,
+                output_tokens_remaining: None,
+                tokens_used_this_week: Some(1_000),
+                tokens_limit: Some(10_000),
+                tokens_remaining: Some(9_000),
+                budget_source: Some("auto_p95_4w".to_string()),
+                projected_exhaustion_secs: Some(1800),
+            },
+            &cleanup,
+        );
+
+        let rate_limit = orchestrator.rate_limit.expect("rate limit");
+        assert_eq!(rate_limit.seconds_to_reset, Some(3600));
+        assert_eq!(rate_limit.requests_remaining, Some(2));
+        assert_eq!(rate_limit.tokens_remaining, Some(9_000));
+        assert_eq!(rate_limit.budget_source.as_deref(), Some("auto_p95_4w"));
+        assert_eq!(rate_limit.projected_exhaustion_secs, Some(1800));
     }
 }

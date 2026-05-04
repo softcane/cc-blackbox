@@ -50,7 +50,7 @@ clauditor up
 clauditor run claude --watch
 ```
 
-`clauditor doctor` checks Docker, Docker Compose, Claude Code, tmux, local ports, health endpoints, and environment variables. `clauditor up` starts the local Clauditor stack. `clauditor run claude --watch` routes only that Claude Code process through Clauditor and starts a watcher; it does not permanently modify shell config, shell startup files, or other Claude Code sessions.
+`clauditor doctor` checks Docker, Docker Compose, Claude Code, tmux, local ports, health endpoints, and environment variables. `clauditor up` starts the local Clauditor stack. `clauditor run claude --watch` routes only that Claude Code process through Clauditor and starts a watcher; it does not permanently modify shell config, shell startup files, or other Claude Code sessions. When a watched session ends, Clauditor prints a redacted postmortem by default.
 
 Open Grafana at [http://127.0.0.1:3000/d/clauditor-main](http://127.0.0.1:3000/d/clauditor-main). Anonymous viewer mode is enabled, and the local admin login is `admin` / `admin`.
 
@@ -66,8 +66,11 @@ session-auth     ⚠ MODEL FALLBACK requested opus, got sonnet
 ## Core Workflows
 
 - **Watch all active sessions:** `clauditor watch --url http://127.0.0.1:9091`
+- **Skip automatic postmortems while watching:** `clauditor watch --no-postmortem`
 - **Watch all sessions in tmux:** `clauditor watch --tmux`
 - **Watch one session:** `clauditor watch --session session_1776... --url http://127.0.0.1:9091`
+- **Read the latest postmortem:** `clauditor postmortem last --redact`
+- **Force local-only postmortem synthesis:** `clauditor postmortem last --redact --no-analyze-with-claude`
 - **Review recent sessions:** `clauditor sessions --limit 20 --days 7`
 - **Open the local session API:** `curl -s 'http://127.0.0.1:9091/api/sessions?limit=5'`
 - **Read the current local summary:** `curl -s http://127.0.0.1:9091/api/summary`
@@ -87,6 +90,7 @@ Replace `session_1776...` and `<session_id>` with real session IDs from `/api/se
 - **Model fallback:** Detection when the response model differs from the requested one.
 - **Quota burn:** Weekly token use, reset time, and projected exhaustion if you set a budget.
 - **Session diagnosis:** Post-session hints for cache expiry, thrash, tool failure streaks, compaction loops, and context pressure.
+- **Session postmortems:** Redacted markdown summaries that explain likely cause, evidence, confidence, token/cost impact, and next action. Claude-assisted synthesis is used by default from redacted evidence and falls back to deterministic local markdown if unavailable.
 - **Session history:** Recent sessions in SQLite plus lightweight recall.
 - **Prometheus metrics:** Local `/metrics` output for scripting, dashboards, and alerts you control.
 - **Grafana trends:** Local dashboards for sessions, quality, cache reuse, model fallback, and estimated cost over time.

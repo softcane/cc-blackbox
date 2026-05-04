@@ -1,10 +1,11 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+use regex::Regex;
 use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::Value;
@@ -1184,7 +1185,12 @@ impl CostAccumulator {
 }
 
 fn rounded_estimated_cost_dollars(amount: f64) -> f64 {
-    (amount * 100.0).round() / 100.0
+    let rounded = (amount.max(0.0) * 100.0).round() / 100.0;
+    if rounded == -0.0 {
+        0.0
+    } else {
+        rounded
+    }
 }
 
 fn rounded_billed_cost_dollars(amount: Option<f64>) -> Option<f64> {
@@ -1499,6 +1505,1078 @@ fn build_sessions_response_json(sessions: Vec<Value>) -> Value {
         "trusted_for_budget_enforcement": pricing::trusted_for_budget_enforcement(),
         "sessions": sessions,
     })
+}
+
+#[derive(Clone, Debug)]
+struct PostmortemSessionRow {
+    session_id: String,
+    started_at: String,
+    ended_at: Option<String>,
+    model: Option<String>,
+    initial_prompt: Option<String>,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    total_cache_read_tokens: u64,
+    total_cache_creation_tokens: u64,
+    request_count: u64,
+    duration_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct PostmortemTokenTotals {
+    request_count: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+}
+
+impl PostmortemTokenTotals {
+    fn total_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_creation_tokens
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PostmortemDiagnosisRow {
+    completed_at: String,
+    outcome: String,
+    total_turns: u64,
+    total_cost: f64,
+    cache_hit_ratio: f64,
+    degraded: bool,
+    degradation_turn: Option<u64>,
+    causes: Value,
+    advice: Value,
+}
+
+#[derive(Clone, Debug)]
+struct PostmortemTurnRow {
+    turn_number: u64,
+    timestamp: String,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+    gap_from_prev_secs: f64,
+    context_fill_percent: f64,
+    context_window_tokens: u64,
+    tool_failures: u64,
+    requested_model: Option<String>,
+    actual_model: Option<String>,
+    response_summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ToolAggregate {
+    tool_name: String,
+    calls: u64,
+    failures: u64,
+    total_duration_ms: u64,
+    first_turn: u64,
+    last_turn: u64,
+    sample: Option<String>,
+}
+
+#[derive(Debug)]
+enum PostmortemError {
+    DbUnavailable(String),
+    NoSessions,
+    UnknownSession(String),
+}
+
+static URL_QUERY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(https?://[^\s<>"'\)\]]+)\?[^\s<>"'\)\]]*"#)
+        .expect("valid URL query redaction regex")
+});
+static UNIX_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?P<prefix>^|[\s\(\["'=])/(Users|home|private|tmp|var|etc|opt|Volumes|data)(/[^\s,;\)"'\]]+)+"#)
+        .expect("valid unix path redaction regex")
+});
+static WINDOWS_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b[A-Z]:\\[^\s,;\)"'\]]+"#).expect("valid windows path redaction regex")
+});
+static SECRET_ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b(api[_-]?key|token|secret|password|authorization|bearer)\s*[:=]\s*["']?[^"'\s,;\)]+["']?"#)
+        .expect("valid secret assignment redaction regex")
+});
+static SECRET_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\b(sk-ant-[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]{12,}|xox[baprs]-[A-Za-z0-9_-]+|gh[pousr]_[A-Za-z0-9_]{12,})\b"#)
+        .expect("valid secret token redaction regex")
+});
+static LONG_SECRET_LIKE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\b[A-Za-z0-9+/=_-]{40,}\b"#).expect("valid long secret-like redaction regex")
+});
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn redact_operational_text(value: &str, redact: bool) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if redact
+        && ((trimmed.starts_with('{') && trimmed.ends_with('}'))
+            || (trimmed.starts_with('[') && trimmed.ends_with(']')))
+    {
+        return "<structured payload redacted>".to_string();
+    }
+    if !redact {
+        return truncate_chars(trimmed, 240);
+    }
+
+    let mut out = trimmed.to_string();
+    out = URL_QUERY_RE
+        .replace_all(&out, "${1}?<redacted>")
+        .to_string();
+    out = UNIX_PATH_RE
+        .replace_all(&out, "${prefix}<path>")
+        .to_string();
+    out = WINDOWS_PATH_RE.replace_all(&out, "<path>").to_string();
+    out = SECRET_ASSIGNMENT_RE
+        .replace_all(&out, "$1=<redacted>")
+        .to_string();
+    out = SECRET_TOKEN_RE.replace_all(&out, "<secret>").to_string();
+    out = LONG_SECRET_LIKE_RE
+        .replace_all(&out, "<secret-like>")
+        .to_string();
+    truncate_chars(out.trim(), 240)
+}
+
+fn redacted_human_summary(label: &str, value: &str, redact: bool) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if redact {
+        let words = trimmed.split_whitespace().count();
+        return Some(format!("{label} captured (redacted, {words} words)."));
+    }
+    Some(redact_operational_text(trimmed, false))
+}
+
+fn query_latest_postmortem_session_id(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT s.session_id \
+         FROM sessions s \
+         LEFT JOIN session_diagnoses d ON d.session_id = s.session_id \
+         ORDER BY COALESCE(d.completed_at, s.ended_at, s.started_at) DESC \
+         LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+}
+
+fn load_postmortem_session(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<PostmortemSessionRow>> {
+    conn.query_row(
+        "SELECT session_id, started_at, ended_at, model, initial_prompt, \
+                total_input_tokens, total_output_tokens, total_cache_read_tokens, \
+                total_cache_creation_tokens, request_count, \
+                CASE WHEN ended_at IS NOT NULL \
+                     THEN CAST(strftime('%s', ended_at) AS INTEGER) - CAST(strftime('%s', started_at) AS INTEGER) \
+                END \
+         FROM sessions WHERE session_id = ?1",
+        rusqlite::params![session_id],
+        |row| {
+            Ok(PostmortemSessionRow {
+                session_id: row.get(0)?,
+                started_at: row.get(1)?,
+                ended_at: row.get(2)?,
+                model: row.get(3)?,
+                initial_prompt: row.get(4)?,
+                total_input_tokens: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as u64,
+                total_output_tokens: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u64,
+                total_cache_read_tokens: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0) as u64,
+                total_cache_creation_tokens: row.get::<_, Option<i64>>(8)?.unwrap_or(0).max(0)
+                    as u64,
+                request_count: row.get::<_, Option<i64>>(9)?.unwrap_or(0).max(0) as u64,
+                duration_secs: row
+                    .get::<_, Option<i64>>(10)?
+                    .map(|value| value.max(0) as u64),
+            })
+        },
+    )
+    .optional()
+}
+
+fn load_postmortem_token_totals(
+    conn: &Connection,
+    session: &PostmortemSessionRow,
+) -> rusqlite::Result<PostmortemTokenTotals> {
+    let mut totals = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), \
+                COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_creation_tokens), 0) \
+         FROM requests WHERE session_id = ?1",
+        rusqlite::params![&session.session_id],
+        |row| {
+            Ok(PostmortemTokenTotals {
+                request_count: row.get::<_, i64>(0)?.max(0) as u64,
+                input_tokens: row.get::<_, i64>(1)?.max(0) as u64,
+                output_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                cache_read_tokens: row.get::<_, i64>(3)?.max(0) as u64,
+                cache_creation_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+            })
+        },
+    )?;
+
+    if totals.total_tokens() == 0 {
+        totals = PostmortemTokenTotals {
+            request_count: session.request_count,
+            input_tokens: session.total_input_tokens,
+            output_tokens: session.total_output_tokens,
+            cache_read_tokens: session.total_cache_read_tokens,
+            cache_creation_tokens: session.total_cache_creation_tokens,
+        };
+    }
+
+    Ok(totals)
+}
+
+fn load_postmortem_diagnosis(
+    conn: &Connection,
+    session: &PostmortemSessionRow,
+) -> rusqlite::Result<Option<PostmortemDiagnosisRow>> {
+    if session.ended_at.is_none() {
+        return Ok(None);
+    }
+
+    let stored = conn
+        .query_row(
+            "SELECT completed_at, outcome, total_turns, total_cost, cache_hit_ratio, degraded, \
+                    degradation_turn, causes_json, advice_json \
+             FROM session_diagnoses WHERE session_id = ?1",
+            rusqlite::params![&session.session_id],
+            |row| {
+                let causes_json: String = row.get(7)?;
+                let advice_json: String = row.get(8)?;
+                Ok(PostmortemDiagnosisRow {
+                    completed_at: row.get(0)?,
+                    outcome: row.get(1)?,
+                    total_turns: row.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as u64,
+                    total_cost: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0).max(0.0),
+                    cache_hit_ratio: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0).clamp(0.0, 1.0),
+                    degraded: row.get::<_, i32>(5)? != 0,
+                    degradation_turn: row
+                        .get::<_, Option<i64>>(6)?
+                        .map(|value| value.max(0) as u64),
+                    causes: serde_json::from_str::<Value>(&causes_json)
+                        .unwrap_or_else(|_| Value::Array(vec![])),
+                    advice: serde_json::from_str::<Value>(&advice_json)
+                        .unwrap_or_else(|_| Value::Array(vec![])),
+                })
+            },
+        )
+        .optional()?;
+
+    if stored.is_some() {
+        return Ok(stored);
+    }
+
+    let turns = load_turn_snapshots_from_db(conn, &session.session_id)?;
+    if turns.is_empty() {
+        return Ok(None);
+    }
+
+    let report = diagnosis::analyze_session(&session.session_id, &turns);
+    let completed_at = session
+        .ended_at
+        .clone()
+        .unwrap_or_else(|| session.started_at.clone());
+    if session.ended_at.is_some() {
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO session_diagnoses (session_id, completed_at, \
+             outcome, total_turns, total_cost, cache_hit_ratio, degraded, degradation_turn, \
+             causes_json, advice_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            rusqlite::params![
+                &session.session_id,
+                &completed_at,
+                &report.outcome,
+                report.total_turns,
+                report.estimated_total_cost_dollars,
+                report.cache_hit_ratio,
+                report.degraded as i32,
+                report.degradation_turn,
+                serde_json::to_string(&report.causes).unwrap_or_default(),
+                serde_json::to_string(&report.advice).unwrap_or_default(),
+            ],
+        );
+    }
+
+    Ok(Some(PostmortemDiagnosisRow {
+        completed_at,
+        outcome: report.outcome,
+        total_turns: report.total_turns as u64,
+        total_cost: report.estimated_total_cost_dollars,
+        cache_hit_ratio: report.cache_hit_ratio,
+        degraded: report.degraded,
+        degradation_turn: report.degradation_turn.map(u64::from),
+        causes: serde_json::to_value(&report.causes).unwrap_or_else(|_| Value::Array(vec![])),
+        advice: serde_json::to_value(&report.advice).unwrap_or_else(|_| Value::Array(vec![])),
+    }))
+}
+
+fn load_postmortem_turns(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Vec<PostmortemTurnRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT turn_number, timestamp, input_tokens, cache_read_tokens, cache_creation_tokens, \
+                gap_from_prev_secs, context_window_tokens, tool_failures, \
+                requested_model, actual_model, response_summary \
+         FROM turn_snapshots WHERE session_id = ?1 ORDER BY turn_number ASC",
+    )?;
+
+    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+        let input_tokens = row.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as u64;
+        let cache_read_tokens = row.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0) as u64;
+        let cache_creation_tokens = row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64;
+        let requested_model = row.get::<_, Option<String>>(8)?;
+        let actual_model = row.get::<_, Option<String>>(9)?;
+        let context_window_tokens = row
+            .get::<_, Option<i64>>(6)?
+            .map(|value| value.max(0) as u64)
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| {
+                infer_context_window_tokens(
+                    requested_model.as_deref(),
+                    actual_model.as_deref(),
+                    input_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                )
+            });
+        Ok(PostmortemTurnRow {
+            turn_number: row.get::<_, i64>(0)?.max(0) as u64,
+            timestamp: row.get(1)?,
+            cache_read_tokens,
+            cache_creation_tokens,
+            gap_from_prev_secs: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0).max(0.0),
+            context_fill_percent: context_fill_percent(
+                input_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                context_window_tokens,
+            ),
+            context_window_tokens,
+            tool_failures: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0) as u64,
+            requested_model,
+            actual_model,
+            response_summary: row
+                .get::<_, Option<String>>(10)?
+                .filter(|value| !value.trim().is_empty()),
+        })
+    })?;
+
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+fn load_postmortem_recall(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<(Option<String>, Option<String>)> {
+    conn.query_row(
+        "SELECT initial_prompt, final_response_summary FROM session_recall WHERE session_id = ?1",
+        rusqlite::params![session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map(|row| row.unwrap_or((None, None)))
+}
+
+fn load_postmortem_tool_summaries(
+    conn: &Connection,
+    session_id: &str,
+    redact: bool,
+) -> rusqlite::Result<Vec<ToolAggregate>> {
+    let mut stmt = conn.prepare(
+        "SELECT turn_number, tool_name, input_summary, outcome, duration_ms \
+         FROM tool_outcomes WHERE session_id = ?1 ORDER BY turn_number ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?.max(0) as u64,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64,
+        ))
+    })?;
+
+    let mut by_tool: BTreeMap<String, ToolAggregate> = BTreeMap::new();
+    for row in rows.flatten() {
+        let (turn, tool_name, input_summary, outcome, duration_ms) = row;
+        let entry = by_tool
+            .entry(tool_name.clone())
+            .or_insert_with(|| ToolAggregate {
+                tool_name,
+                first_turn: turn,
+                last_turn: turn,
+                ..ToolAggregate::default()
+            });
+        entry.calls += 1;
+        entry.total_duration_ms += duration_ms;
+        entry.first_turn = entry.first_turn.min(turn);
+        entry.last_turn = entry.last_turn.max(turn);
+        if matches!(outcome.as_deref(), Some("error" | "failed")) {
+            entry.failures += 1;
+        }
+        if entry.sample.is_none() {
+            entry.sample = input_summary
+                .as_deref()
+                .map(|summary| redact_operational_text(summary, redact))
+                .filter(|summary| !summary.is_empty());
+        }
+    }
+
+    let mut tools = by_tool.into_values().collect::<Vec<_>>();
+    tools.sort_by(|a, b| {
+        b.failures
+            .cmp(&a.failures)
+            .then_with(|| b.calls.cmp(&a.calls))
+            .then_with(|| a.tool_name.cmp(&b.tool_name))
+    });
+    tools.truncate(8);
+    Ok(tools)
+}
+
+fn load_grouped_event_summaries(
+    conn: &Connection,
+    session_id: &str,
+    table: &str,
+) -> rusqlite::Result<Vec<Value>> {
+    let sql = match table {
+        "skill_events" => {
+            "SELECT skill_name, event_type, source, COUNT(*) \
+             FROM skill_events WHERE session_id = ?1 \
+             GROUP BY skill_name, event_type, source \
+             ORDER BY COUNT(*) DESC, skill_name ASC, event_type ASC, source ASC LIMIT 8"
+        }
+        "mcp_events" => {
+            "SELECT server, tool, event_type, source, COUNT(*) \
+             FROM mcp_events WHERE session_id = ?1 \
+             GROUP BY server, tool, event_type, source \
+             ORDER BY COUNT(*) DESC, server ASC, tool ASC, event_type ASC, source ASC LIMIT 8"
+        }
+        _ => return Ok(Vec::new()),
+    };
+
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+        if table == "skill_events" {
+            Ok(serde_json::json!({
+                "skill_name": row.get::<_, String>(0)?,
+                "event_type": row.get::<_, String>(1)?,
+                "source": row.get::<_, String>(2)?,
+                "count": row.get::<_, i64>(3)?.max(0) as u64,
+            }))
+        } else {
+            Ok(serde_json::json!({
+                "server": row.get::<_, String>(0)?,
+                "tool": row.get::<_, String>(1)?,
+                "event_type": row.get::<_, String>(2)?,
+                "source": row.get::<_, String>(3)?,
+                "count": row.get::<_, i64>(4)?.max(0) as u64,
+            }))
+        }
+    })?;
+
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+fn evidence_json(
+    evidence_type: &str,
+    label: &str,
+    detail: String,
+    turn: Option<u64>,
+    timestamp: Option<String>,
+) -> Value {
+    serde_json::json!({
+        "type": evidence_type,
+        "label": label,
+        "detail": detail,
+        "turn": turn,
+        "timestamp": timestamp,
+    })
+}
+
+fn first_cause(causes: &Value) -> Option<&Value> {
+    causes.as_array().and_then(|items| items.first())
+}
+
+fn cause_string(cause: &Value, key: &str) -> Option<String> {
+    cause
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+}
+
+fn cause_u64(cause: &Value, key: &str) -> Option<u64> {
+    cause.get(key).and_then(|value| value.as_u64())
+}
+
+fn cause_f64(cause: &Value, key: &str) -> Option<f64> {
+    cause.get(key).and_then(|value| value.as_f64())
+}
+
+fn cause_is_heuristic(cause: &Value) -> bool {
+    cause
+        .get("is_heuristic")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn sanitize_causes(causes: &Value, redact: bool) -> Vec<Value> {
+    causes
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|cause| {
+                    let cause_type = cause_string(cause, "cause_type")?;
+                    let detail = cause_string(cause, "detail")
+                        .map(|value| redact_operational_text(&value, redact))
+                        .unwrap_or_else(|| cause_type.clone());
+                    Some(serde_json::json!({
+                        "cause_type": cause_type,
+                        "detail": detail,
+                        "turn_first_noticed": cause_u64(cause, "turn_first_noticed"),
+                        "estimated_cost": cause_f64(cause, "estimated_cost").unwrap_or(0.0),
+                        "is_heuristic": cause_is_heuristic(cause),
+                        "requested_model": cause_string(cause, "requested_model"),
+                        "actual_model": cause_string(cause, "actual_model"),
+                    }))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn sanitize_advice(advice: &Value, redact: bool) -> Vec<String> {
+    advice
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(|item| redact_operational_text(item, redact))
+                .filter(|item| !item.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn postmortem_confidence(
+    diagnosis: Option<&PostmortemDiagnosisRow>,
+    evidence_count: usize,
+) -> &'static str {
+    let Some(diagnosis) = diagnosis else {
+        return "low";
+    };
+    if diagnosis.total_turns < 3 && !diagnosis.degraded {
+        return "low";
+    }
+    if let Some(cause) = first_cause(&diagnosis.causes) {
+        if cause_is_heuristic(cause) {
+            "medium"
+        } else if diagnosis.degraded {
+            "high"
+        } else {
+            "medium"
+        }
+    } else if evidence_count >= 3 {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+fn recommended_action(primary_cause: &str, advice: &[String], partial: bool) -> String {
+    if partial {
+        return "Session is still partial; use this as a progress snapshot, not a final diagnosis."
+            .to_string();
+    }
+    if let Some(first) = advice.first() {
+        return first.clone();
+    }
+    match primary_cause {
+        "cache_miss_ttl" => "Restart with a smaller prompt or keep the cache warm before expensive follow-up turns.".to_string(),
+        "cache_miss_thrash" => "Reduce prompt churn before continuing; repeated cache rebuilds are likely wasting tokens.".to_string(),
+        "context_bloat" | "near_compaction" | "compaction_suspected" => {
+            "Compact or start a fresh session with a short state summary before asking for more work.".to_string()
+        }
+        "model_fallback" => "Treat model quality changes as part of the failure; retry later or explicitly choose a model with available quota.".to_string(),
+        "tool_failure_streak" => "Stop the loop, fix the failing command or tool precondition manually, then restart Claude with the result.".to_string(),
+        "" | "none" => "No major degradation signal was found; continue unless the session behavior felt wrong.".to_string(),
+        _ => "Review the evidence below, then restart with a shorter prompt if Claude was slow, costly, or repetitive.".to_string(),
+    }
+}
+
+fn cache_hit_ratio_from_tokens(totals: &PostmortemTokenTotals) -> f64 {
+    let cache_total = totals.cache_read_tokens + totals.cache_creation_tokens;
+    if cache_total == 0 {
+        0.0
+    } else {
+        totals.cache_read_tokens as f64 / cache_total as f64
+    }
+}
+
+fn build_postmortem_response_from_db(
+    conn: &Connection,
+    target: &str,
+    redact: bool,
+) -> Result<Value, PostmortemError> {
+    let _ = repair_persisted_session_artifacts(conn);
+    let session_id = if target == "last" {
+        query_latest_postmortem_session_id(conn)
+            .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?
+            .ok_or(PostmortemError::NoSessions)?
+    } else {
+        target.to_string()
+    };
+
+    let session = load_postmortem_session(conn, &session_id)
+        .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?
+        .ok_or_else(|| PostmortemError::UnknownSession(session_id.clone()))?;
+    let diagnosis = load_postmortem_diagnosis(conn, &session)
+        .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?;
+    let token_totals = load_postmortem_token_totals(conn, &session)
+        .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?;
+    let turns = load_postmortem_turns(conn, &session.session_id)
+        .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?;
+    let tools = load_postmortem_tool_summaries(conn, &session.session_id, redact)
+        .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?;
+    let skill_events = load_grouped_event_summaries(conn, &session.session_id, "skill_events")
+        .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?;
+    let mcp_events = load_grouped_event_summaries(conn, &session.session_id, "mcp_events")
+        .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?;
+    let (recall_prompt, recall_summary) = load_postmortem_recall(conn, &session.session_id)
+        .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?;
+
+    let session_ids = vec![session.session_id.clone()];
+    let estimated = compute_estimated_costs_for_sessions(conn, &session_ids)
+        .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?
+        .remove(&session.session_id)
+        .unwrap_or_else(|| CostAccumulator::new().finish());
+    let billing = load_latest_billing_reconciliations(conn, &session_ids)
+        .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?
+        .remove(&session.session_id);
+
+    let sanitized_causes = diagnosis
+        .as_ref()
+        .map(|diag| sanitize_causes(&diag.causes, redact))
+        .unwrap_or_default();
+    let sanitized_advice = diagnosis
+        .as_ref()
+        .map(|diag| sanitize_advice(&diag.advice, redact))
+        .unwrap_or_default();
+    let partial = session.ended_at.is_none();
+    let primary_cause = sanitized_causes
+        .first()
+        .and_then(|cause| cause.get("cause_type"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("none")
+        .to_string();
+    let default_primary_detail = if partial {
+        "Session is still active; inactivity alone is not a degradation signal."
+    } else {
+        "No primary degradation cause was recorded."
+    };
+    let primary_detail = sanitized_causes
+        .first()
+        .and_then(|cause| cause.get("detail"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(default_primary_detail)
+        .to_string();
+    let next_action = recommended_action(&primary_cause, &sanitized_advice, partial);
+
+    let max_context_fill_percent = turns
+        .iter()
+        .map(|turn| turn.context_fill_percent)
+        .fold(0.0, f64::max);
+    let latest_context_fill_percent = turns
+        .last()
+        .map(|turn| turn.context_fill_percent)
+        .unwrap_or(0.0);
+    let turns_to_compact = if turns.len() >= 2 {
+        let prev = &turns[turns.len() - 2];
+        let current = &turns[turns.len() - 1];
+        project_turns_until_compaction(prev.context_fill_percent, current.context_fill_percent)
+    } else {
+        None
+    };
+
+    let cache_rebuild_turns = turns
+        .iter()
+        .filter(|turn| turn.cache_creation_tokens > 0 && turn.cache_read_tokens == 0)
+        .collect::<Vec<_>>();
+    let non_cold_cache_rebuild_tokens = cache_rebuild_turns
+        .iter()
+        .filter(|turn| turn.turn_number > 1)
+        .map(|turn| turn.cache_creation_tokens)
+        .sum::<u64>();
+    let model_fallbacks = turns
+        .iter()
+        .filter_map(|turn| {
+            let requested = turn.requested_model.as_ref()?;
+            let actual = turn.actual_model.as_ref()?;
+            (!model_matches(requested, actual)).then(|| {
+                serde_json::json!({
+                    "turn": turn.turn_number,
+                    "requested": requested,
+                    "actual": actual,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let tool_failures = tools.iter().map(|tool| tool.failures).sum::<u64>();
+    let repeated_tools = tools
+        .iter()
+        .filter(|tool| tool.calls >= 3)
+        .map(|tool| tool.tool_name.clone())
+        .collect::<Vec<_>>();
+    let estimated_wasted_cost = sanitized_causes
+        .iter()
+        .filter_map(|cause| cause.get("estimated_cost").and_then(|value| value.as_f64()))
+        .sum::<f64>();
+    let estimated_wasted_tokens = non_cold_cache_rebuild_tokens
+        + sanitized_causes
+            .iter()
+            .filter(|cause| {
+                cause.get("cause_type").and_then(|value| value.as_str())
+                    == Some("compaction_suspected")
+            })
+            .filter_map(|cause| {
+                cause
+                    .get("detail")
+                    .and_then(|value| value.as_str())
+                    .and_then(|detail| {
+                        detail.split_whitespace().find_map(|part| {
+                            let digits = part
+                                .chars()
+                                .filter(|ch| ch.is_ascii_digit())
+                                .collect::<String>();
+                            digits.parse::<u64>().ok()
+                        })
+                    })
+            })
+            .sum::<u64>();
+
+    let prompt_source = recall_prompt
+        .as_deref()
+        .or(session.initial_prompt.as_deref())
+        .unwrap_or("");
+    let final_summary_source = recall_summary
+        .as_deref()
+        .or_else(|| {
+            turns
+                .iter()
+                .rev()
+                .find_map(|turn| turn.response_summary.as_deref())
+        })
+        .unwrap_or("");
+
+    let mut evidence = Vec::new();
+    if let Some(diag) = &diagnosis {
+        evidence.push(evidence_json(
+            if sanitized_causes
+                .first()
+                .and_then(|cause| cause.get("is_heuristic"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+            {
+                "heuristic"
+            } else {
+                "derived"
+            },
+            "diagnosis",
+            format!("{} with outcome {}", primary_detail, diag.outcome),
+            diag.degradation_turn,
+            Some(diag.completed_at.clone()),
+        ));
+    }
+    evidence.push(evidence_json(
+        "direct",
+        "tokens",
+        format!(
+            "{} total tokens across {} requests",
+            token_totals.total_tokens(),
+            token_totals.request_count
+        ),
+        None,
+        session.ended_at.clone(),
+    ));
+    if !cache_rebuild_turns.is_empty() {
+        evidence.push(evidence_json(
+            "derived",
+            "cache",
+            format!(
+                "{} cache rebuild turns, {} non-cold-start cache creation tokens",
+                cache_rebuild_turns.len(),
+                non_cold_cache_rebuild_tokens
+            ),
+            cache_rebuild_turns.first().map(|turn| turn.turn_number),
+            cache_rebuild_turns
+                .first()
+                .map(|turn| turn.timestamp.clone()),
+        ));
+    }
+    if max_context_fill_percent >= 60.0 {
+        evidence.push(evidence_json(
+            "heuristic",
+            "context",
+            format!(
+                "context reached {:.0}% full; turns to compact: {}",
+                max_context_fill_percent,
+                turns_to_compact
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ),
+            turns
+                .iter()
+                .max_by(|a, b| a.context_fill_percent.total_cmp(&b.context_fill_percent))
+                .map(|turn| turn.turn_number),
+            None,
+        ));
+    }
+    if !model_fallbacks.is_empty() {
+        evidence.push(evidence_json(
+            "direct",
+            "model",
+            format!(
+                "{} requested/actual model mismatches",
+                model_fallbacks.len()
+            ),
+            model_fallbacks
+                .first()
+                .and_then(|value| value.get("turn"))
+                .and_then(|value| value.as_u64()),
+            None,
+        ));
+    }
+    if tool_failures > 0 || !repeated_tools.is_empty() {
+        evidence.push(evidence_json(
+            "direct",
+            "tools",
+            format!(
+                "{} tool failures; repeated tools: {}",
+                tool_failures,
+                if repeated_tools.is_empty() {
+                    "none".to_string()
+                } else {
+                    repeated_tools.join(", ")
+                }
+            ),
+            tools.first().map(|tool| tool.first_turn),
+            None,
+        ));
+    }
+    if !skill_events.is_empty() {
+        evidence.push(evidence_json(
+            "hook",
+            "skills",
+            format!("{} grouped skill event signals", skill_events.len()),
+            None,
+            None,
+        ));
+    }
+    if !mcp_events.is_empty() {
+        evidence.push(evidence_json(
+            "hook",
+            "mcp",
+            format!("{} grouped MCP event signals", mcp_events.len()),
+            None,
+            None,
+        ));
+    }
+
+    let confidence = postmortem_confidence(diagnosis.as_ref(), evidence.len()).to_string();
+
+    let mut timeline = Vec::new();
+    timeline.push(serde_json::json!({
+        "timestamp": session.started_at,
+        "turn": null,
+        "label": "session_started",
+        "detail": "Session row created.",
+        "evidence_type": "direct",
+    }));
+    for turn in &turns {
+        let mut details = Vec::new();
+        if turn.cache_creation_tokens > 0 && turn.cache_read_tokens == 0 {
+            let cache_kind = if turn.turn_number <= 1 {
+                "cold cache build"
+            } else if turn.gap_from_prev_secs > 300.0 {
+                "cache rebuild after idle gap"
+            } else {
+                "cache rebuild without long idle gap"
+            };
+            details.push(format!(
+                "{cache_kind}: {} creation tokens",
+                turn.cache_creation_tokens
+            ));
+        }
+        if turn.context_fill_percent >= 80.0 {
+            details.push(format!("context {:.0}% full", turn.context_fill_percent));
+        }
+        if turn.tool_failures > 0 {
+            details.push(format!("{} tool failures", turn.tool_failures));
+        }
+        if let (Some(requested), Some(actual)) = (
+            turn.requested_model.as_deref(),
+            turn.actual_model.as_deref(),
+        ) {
+            if !model_matches(requested, actual) {
+                details.push(format!(
+                    "model fallback requested {requested}, got {actual}"
+                ));
+            }
+        }
+        if !details.is_empty() {
+            timeline.push(serde_json::json!({
+                "timestamp": turn.timestamp,
+                "turn": turn.turn_number,
+                "label": "turn_signal",
+                "detail": redact_operational_text(&details.join("; "), redact),
+                "evidence_type": "direct",
+            }));
+        }
+        if timeline.len() >= 9 {
+            break;
+        }
+    }
+    if let Some(ended_at) = &session.ended_at {
+        timeline.push(serde_json::json!({
+            "timestamp": ended_at,
+            "turn": null,
+            "label": "session_ended",
+            "detail": diagnosis
+                .as_ref()
+                .map(|diag| diag.outcome.clone())
+                .unwrap_or_else(|| "Session ended; no diagnosis row was available.".to_string()),
+            "evidence_type": "direct",
+        }));
+    }
+
+    let tool_values = tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "tool_name": tool.tool_name,
+                "calls": tool.calls,
+                "failures": tool.failures,
+                "first_turn": tool.first_turn,
+                "last_turn": tool.last_turn,
+                "avg_duration_ms": tool.total_duration_ms.checked_div(tool.calls).unwrap_or(0),
+                "sample": tool.sample,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut recommendations = sanitized_advice.clone();
+    if !recommendations.iter().any(|item| item == &next_action) {
+        recommendations.insert(0, next_action.clone());
+    }
+    if recommendations.is_empty() {
+        recommendations.push(next_action.clone());
+    }
+
+    Ok(serde_json::json!({
+        "session_id": session.session_id,
+        "redacted": redact,
+        "redaction_status": if redact { "redacted" } else { "local_unredacted" },
+        "partial": partial,
+        "summary": {
+            "started_at": session.started_at,
+            "ended_at": session.ended_at,
+            "duration_secs": session.duration_secs,
+            "model": session.model,
+            "outcome": diagnosis
+                .as_ref()
+                .map(|diag| diag.outcome.clone())
+                .unwrap_or_else(|| if partial { "In Progress".to_string() } else { "Completed state unknown".to_string() }),
+            "total_turns": diagnosis
+                .as_ref()
+                .map(|diag| diag.total_turns)
+                .filter(|turns| *turns > 0)
+                .unwrap_or(turns.len() as u64),
+            "total_tokens": token_totals.total_tokens(),
+            "initial_prompt_summary": redacted_human_summary("Initial prompt", prompt_source, redact),
+            "final_response_summary": redacted_human_summary("Final response summary", final_summary_source, redact),
+        },
+        "diagnosis": {
+            "degraded": diagnosis.as_ref().map(|diag| diag.degraded).unwrap_or(false),
+            "degradation_turn": diagnosis.as_ref().and_then(|diag| diag.degradation_turn),
+            "likely_cause": primary_cause,
+            "detail": primary_detail,
+            "confidence": confidence,
+            "causes": sanitized_causes,
+            "next_action": next_action,
+        },
+        "impact": {
+            "request_count": token_totals.request_count,
+            "input_tokens": token_totals.input_tokens,
+            "output_tokens": token_totals.output_tokens,
+            "cache_read_tokens": token_totals.cache_read_tokens,
+            "cache_creation_tokens": token_totals.cache_creation_tokens,
+            "total_tokens": token_totals.total_tokens(),
+            "estimated_total_cost_dollars": rounded_estimated_cost_dollars(estimated.estimated_cost_dollars),
+            "diagnosis_estimated_total_cost_dollars": diagnosis.as_ref().map(|diag| rounded_estimated_cost_dollars(diag.total_cost)),
+            "estimated_likely_wasted_tokens": estimated_wasted_tokens,
+            "estimated_likely_wasted_cost_dollars": rounded_estimated_cost_dollars(estimated_wasted_cost),
+            "cost_source": estimated.cost_source,
+            "trusted_for_budget_enforcement": estimated.trusted_for_budget_enforcement,
+            "billed_cost_dollars": billing.as_ref().map(|record| rounded_estimated_cost_dollars(record.billed_cost_dollars)),
+            "billing_source": billing.as_ref().map(|record| record.source.clone()),
+            "billing_imported_at": billing.as_ref().map(|record| record.imported_at.clone()),
+            "cost_caveat": "Estimated costs are local calculations, not authoritative billing records.",
+        },
+        "signals": {
+            "cache": {
+                "cache_hit_ratio": diagnosis
+                    .as_ref()
+                    .map(|diag| diag.cache_hit_ratio)
+                    .unwrap_or_else(|| cache_hit_ratio_from_tokens(&token_totals)),
+                "rebuild_turns": cache_rebuild_turns.len(),
+                "non_cold_rebuild_tokens": non_cold_cache_rebuild_tokens,
+            },
+            "context": {
+                "latest_fill_percent": (latest_context_fill_percent * 10.0).round() / 10.0,
+                "max_fill_percent": (max_context_fill_percent * 10.0).round() / 10.0,
+                "turns_to_compact": turns_to_compact,
+                "context_window_tokens": turns.last().map(|turn| turn.context_window_tokens),
+                "heuristic": true,
+            },
+            "model": {
+                "fallbacks": model_fallbacks,
+            },
+            "tools": tool_values,
+            "skills": skill_events,
+            "mcp": mcp_events,
+        },
+        "evidence": evidence,
+        "timeline": timeline,
+        "recommendations": recommendations,
+        "caveats": [
+            "This report is deterministic and generated from local Clauditor SQLite data.",
+            "Estimated costs are not billing truth unless a billed reconciliation is shown.",
+            "Context runway and some degradation causes are heuristics.",
+            if redact {
+                "Redacted output omits raw prompts, absolute paths, query strings, secret-like values, and structured tool payloads."
+            } else {
+                "Unredacted output may contain local prompt summaries and tool summaries from your machine."
+            }
+        ],
+    }))
 }
 
 #[derive(Deserialize)]
@@ -1901,10 +2979,7 @@ impl ResponseAccumulator {
 
     fn process_chunk(&mut self, chunk: &[u8]) {
         self.sse_buffer.extend_from_slice(chunk);
-        loop {
-            let Some(pos) = self.sse_buffer.iter().position(|&b| b == b'\n') else {
-                break;
-            };
+        while let Some(pos) = self.sse_buffer.iter().position(|&b| b == b'\n') {
             let line = String::from_utf8_lossy(&self.sse_buffer[..pos]);
             let line = line.trim_end_matches('\r');
             if let Some(data) = line.strip_prefix("data: ") {
@@ -2134,6 +3209,7 @@ fn finalize_response(
     let session_id = if let Some(mut existing) = diagnosis::SESSIONS.get_mut(&sys_prompt_hash) {
         existing.last_activity = Instant::now();
         existing.cache_warning_sent = false;
+        existing.idle_postmortem_sent = false;
         existing.session_id.clone()
     } else {
         // Derive display name BEFORE taking the entry lock to avoid deadlock
@@ -2158,6 +3234,7 @@ fn finalize_response(
                 last_activity: Instant::now(),
                 session_inserted: false,
                 cache_warning_sent: false,
+                idle_postmortem_sent: false,
             },
         );
         sid_clone
@@ -2622,7 +3699,11 @@ fn last_session_response_summary(turns: &[diagnosis::TurnSnapshot]) -> String {
 }
 
 fn session_timeout_secs() -> u64 {
-    env_u64("CLAUDITOR_SESSION_TIMEOUT_MINUTES", 5) * 60
+    env_u64("CLAUDITOR_SESSION_TIMEOUT_MINUTES", 60) * 60
+}
+
+fn postmortem_idle_secs() -> u64 {
+    env_u64("CLAUDITOR_POSTMORTEM_IDLE_SECS", 90)
 }
 
 fn parse_tool_calls_json(raw: &str) -> Vec<String> {
@@ -3929,43 +5010,42 @@ fn process_claude_code_hook_payload(payload: &Value, timestamp: String) {
                 });
             }
         }
-        "UserPromptExpansion" => {
+        "UserPromptExpansion"
             if payload
                 .get("expansion_type")
                 .and_then(|value| value.as_str())
-                == Some("slash_command")
-            {
-                let Some(skill_name) = payload
-                    .get("command_name")
-                    .and_then(|value| value.as_str())
-                    .and_then(canonical_telemetry_name)
-                else {
-                    return;
-                };
-                let detail = payload
-                    .get("command_args")
-                    .and_then(|value| value.as_str())
-                    .filter(|value| !value.is_empty())
-                    .map(|value| truncate_detail(value, 100));
-                emit_skill_event(SkillTelemetryEvent {
-                    session_id: session_id.clone(),
-                    timestamp: timestamp.clone(),
-                    skill_name: skill_name.clone(),
-                    event_type: "expected".to_string(),
-                    source: "hook".to_string(),
-                    confidence: 1.0,
-                    detail: Some("direct slash command expansion".to_string()),
-                });
-                emit_skill_event(SkillTelemetryEvent {
-                    session_id,
-                    timestamp,
-                    skill_name,
-                    event_type: "fired".to_string(),
-                    source: "hook".to_string(),
-                    confidence: 1.0,
-                    detail,
-                });
-            }
+                == Some("slash_command") =>
+        {
+            let Some(skill_name) = payload
+                .get("command_name")
+                .and_then(|value| value.as_str())
+                .and_then(canonical_telemetry_name)
+            else {
+                return;
+            };
+            let detail = payload
+                .get("command_args")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(|value| truncate_detail(value, 100));
+            emit_skill_event(SkillTelemetryEvent {
+                session_id: session_id.clone(),
+                timestamp: timestamp.clone(),
+                skill_name: skill_name.clone(),
+                event_type: "expected".to_string(),
+                source: "hook".to_string(),
+                confidence: 1.0,
+                detail: Some("direct slash command expansion".to_string()),
+            });
+            emit_skill_event(SkillTelemetryEvent {
+                session_id,
+                timestamp,
+                skill_name,
+                event_type: "fired".to_string(),
+                source: "hook".to_string(),
+                confidence: 1.0,
+                detail,
+            });
         }
         "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "PermissionDenied" => {
             let tool_name = payload
@@ -4583,6 +5663,10 @@ async fn handle_watch(
             }
         })
     });
+    let synthetic_session_id = synthetic_start.as_ref().map(|event| match event {
+        watch::WatchEvent::SessionStart { session_id, .. } => session_id.clone(),
+        _ => String::new(),
+    });
 
     let stream = async_stream::stream! {
         // Synthetic SessionStart first if we're filtered to a session.
@@ -4596,6 +5680,15 @@ async fn handle_watch(
         for event in history {
             if !event_matches_session(&event, session_filter.as_deref()) {
                 continue;
+            }
+            if let (
+                Some(injected_session_id),
+                watch::WatchEvent::SessionStart { session_id, .. },
+            ) = (&synthetic_session_id, &event)
+            {
+                if session_id == injected_session_id {
+                    continue;
+                }
             }
             if let Ok(json) = serde_json::to_string(&event) {
                 yield Ok(Event::default().data(json));
@@ -4640,6 +5733,7 @@ fn event_matches_session(ev: &watch::WatchEvent, filter: Option<&str>) -> bool {
         | watch::WatchEvent::CacheEvent { session_id, .. }
         | watch::WatchEvent::SessionStart { session_id, .. }
         | watch::WatchEvent::SessionEnd { session_id, .. }
+        | watch::WatchEvent::PostmortemReady { session_id, .. }
         | watch::WatchEvent::FrustrationSignal { session_id, .. }
         | watch::WatchEvent::CompactionLoop { session_id, .. }
         | watch::WatchEvent::Diagnosis { session_id, .. }
@@ -4706,6 +5800,60 @@ async fn handle_diagnosis(
         )
             .into_response(),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    }
+}
+
+fn query_redact_enabled(params: &std::collections::HashMap<String, String>) -> bool {
+    params
+        .get("redact")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+async fn handle_postmortem(
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    handle_postmortem_target(session_id, query_redact_enabled(&params)).await
+}
+
+async fn handle_postmortem_last(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    handle_postmortem_target("last".to_string(), query_redact_enabled(&params)).await
+}
+
+async fn handle_postmortem_target(target: String, redact: bool) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = Connection::open(db_path())
+            .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?;
+        build_postmortem_response_from_db(&conn, &target, redact)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(report)) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            serde_json::to_string_pretty(&report).unwrap_or_default(),
+        )
+            .into_response(),
+        Ok(Err(PostmortemError::NoSessions)) => {
+            (StatusCode::NOT_FOUND, "no sessions found").into_response()
+        }
+        Ok(Err(PostmortemError::UnknownSession(session_id))) => (
+            StatusCode::NOT_FOUND,
+            format!("unknown session_id: {session_id}"),
+        )
+            .into_response(),
+        Ok(Err(PostmortemError::DbUnavailable(err))) => {
+            warn!(error = %err, "postmortem query failed");
+            (StatusCode::SERVICE_UNAVAILABLE, "db unavailable").into_response()
+        }
+        Err(err) => {
+            warn!(error = %err, "postmortem task failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
     }
 }
 
@@ -5467,6 +6615,8 @@ async fn http_server() {
             post(handle_billing_reconciliations),
         )
         .route("/api/diagnosis/:session_id", get(handle_diagnosis))
+        .route("/api/postmortem/last", get(handle_postmortem_last))
+        .route("/api/postmortem/:session_id", get(handle_postmortem))
         .route("/api/degradation/:session_id", get(handle_degradation))
         .route("/api/cache-rebuilds", get(handle_cache_rebuilds))
         .route("/api/sessions", get(handle_sessions))
@@ -5480,7 +6630,7 @@ async fn http_server() {
         .local_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| addr.clone());
-    info!("HTTP server listening on {bound_addr} (/health, /metrics, /api/hooks/claude-code, /api/summary, /api/recall, /api/billing-reconciliations, /api/sessions, /api/cache-rebuilds, /api/degradation, /watch)");
+    info!("HTTP server listening on {bound_addr} (/health, /metrics, /api/hooks/claude-code, /api/summary, /api/recall, /api/billing-reconciliations, /api/sessions, /api/postmortem, /api/cache-rebuilds, /api/degradation, /watch)");
     axum::serve(listener, app).await.expect("HTTP server error");
 }
 
@@ -5680,7 +6830,7 @@ async fn data_retention_cleanup() {
 }
 
 // ---------------------------------------------------------------------------
-// Per-session monitors: inactivity timeout and cache expiry warning.
+// Per-session monitors: idle postmortem, inactivity timeout, and cache expiry warning.
 // Both use periodic scanning of diagnosis::SESSIONS instead of a global Notify.
 // ---------------------------------------------------------------------------
 async fn cache_expiry_warning_monitor() {
@@ -5712,8 +6862,80 @@ async fn cache_expiry_warning_monitor() {
     }
 }
 
+fn in_memory_postmortem_totals(session_id: &str) -> Option<(u64, u32)> {
+    let turns = diagnosis::SESSION_TURNS.get(session_id)?;
+    if turns.is_empty() {
+        return None;
+    }
+
+    let total_tokens = turns
+        .iter()
+        .map(|turn| {
+            turn.input_tokens as u64
+                + turn.cache_read_tokens as u64
+                + turn.cache_creation_tokens as u64
+                + turn.output_tokens as u64
+        })
+        .sum::<u64>();
+    Some((total_tokens, turns.len() as u32))
+}
+
+async fn idle_postmortem_monitor() {
+    let check_interval = Duration::from_secs(30);
+
+    loop {
+        tokio::time::sleep(check_interval).await;
+
+        let threshold_secs = postmortem_idle_secs();
+        if threshold_secs == 0 {
+            continue;
+        }
+
+        let now = Instant::now();
+        let mut ready = Vec::new();
+
+        for mut entry in diagnosis::SESSIONS.iter_mut() {
+            if !entry.session_inserted || entry.idle_postmortem_sent {
+                continue;
+            }
+
+            let idle_secs = now.duration_since(entry.last_activity).as_secs();
+            if idle_secs < threshold_secs {
+                continue;
+            }
+
+            let Some((total_tokens, total_turns)) = in_memory_postmortem_totals(&entry.session_id)
+            else {
+                continue;
+            };
+            entry.idle_postmortem_sent = true;
+            ready.push((
+                entry.session_id.clone(),
+                idle_secs,
+                total_tokens,
+                total_turns,
+            ));
+        }
+
+        for (session_id, idle_secs, total_tokens, total_turns) in ready {
+            watch::BROADCASTER.broadcast(watch::WatchEvent::PostmortemReady {
+                session_id: session_id.clone(),
+                idle_secs,
+                total_tokens,
+                total_turns,
+            });
+            info!(
+                session_id = %session_id,
+                idle_secs,
+                total_turns,
+                "idle postmortem ready"
+            );
+        }
+    }
+}
+
 async fn session_inactivity_monitor() {
-    let timeout_mins = env_u64("CLAUDITOR_SESSION_TIMEOUT_MINUTES", 5);
+    let timeout_mins = env_u64("CLAUDITOR_SESSION_TIMEOUT_MINUTES", 60);
     let timeout_secs = timeout_mins * 60;
     let check_interval = Duration::from_secs(30);
 
@@ -5785,6 +7007,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(http_server());
     tokio::spawn(cleanup_stale_requests());
+    tokio::spawn(idle_postmortem_monitor());
     tokio::spawn(session_inactivity_monitor());
     tokio::spawn(cache_expiry_warning_monitor());
     tokio::spawn(data_retention_cleanup());
@@ -5814,24 +7037,26 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        build_diagnosis_response_json, build_session_summary_json, build_sessions_response_json,
-        build_summary_response_json, canonical_telemetry_name, clean_user_prompt,
-        compact_response_summary, context_fill_percent, context_fill_ratio, db_writer_loop,
-        derive_display_name, diagnosis, ensure_session_columns, epoch_to_iso8601,
-        extract_explicit_skill_refs, extract_header, extract_headers, extract_working_dir,
+        build_diagnosis_response_json, build_postmortem_response_from_db,
+        build_session_summary_json, build_sessions_response_json, build_summary_response_json,
+        canonical_telemetry_name, clean_user_prompt, compact_response_summary,
+        context_fill_percent, context_fill_ratio, db_writer_loop, derive_display_name, diagnosis,
+        ensure_session_columns, epoch_to_iso8601, extract_explicit_skill_refs, extract_header,
+        extract_headers, extract_working_dir, in_memory_postmortem_totals,
         infer_context_window_tokens, load_degradation_view_from_db, looks_like_machine_recall_line,
         metrics, model_requests_1m_context, normalize_search_text, now_epoch_secs,
         parse_latest_tool_results, parse_request_body, persist_billing_reconciliation, pricing,
-        query_historical_metrics, query_summary, repair_persisted_session_artifacts,
-        repair_turn_snapshot_context_windows, request_uses_1m_context,
-        resolve_context_window_tokens, score_recall_doc, seed_live_metric_labels_from_db,
-        session_timeout_secs, should_broadcast_quota_snapshot, skill_name_from_skill_file,
-        skill_name_from_tool_input_json, strip_model_1m_alias, summarize_hook_tool_input,
-        tokenize_search_text, tool_recall_context, upstream_request_adjustment_for_body,
-        BillingReconciliationInput, BillingReconciliationWriteError, DbCommand, HttpHeaders,
-        ParsedToolResult, ProtoHeaderValue, SummaryWindowData, CONTEXT_1M_BETA,
-        ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS, QUOTA_WATCH_BROADCAST_INTERVAL,
-        SCHEMA, STANDARD_CONTEXT_WINDOW_TOKENS,
+        query_historical_metrics, query_summary, redact_operational_text,
+        repair_persisted_session_artifacts, repair_turn_snapshot_context_windows,
+        request_uses_1m_context, resolve_context_window_tokens, score_recall_doc,
+        seed_live_metric_labels_from_db, session_timeout_secs, should_broadcast_quota_snapshot,
+        skill_name_from_skill_file, skill_name_from_tool_input_json, strip_model_1m_alias,
+        summarize_hook_tool_input, tokenize_search_text, tool_recall_context,
+        upstream_request_adjustment_for_body, BillingReconciliationInput,
+        BillingReconciliationWriteError, DbCommand, HttpHeaders, ParsedToolResult, PostmortemError,
+        ProtoHeaderValue, SummaryWindowData, CONTEXT_1M_BETA, ESTIMATED_COST_SOURCE,
+        EXTENDED_CONTEXT_WINDOW_TOKENS, QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA,
+        STANDARD_CONTEXT_WINDOW_TOKENS,
     };
 
     static METRICS_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -6111,6 +7336,7 @@ mod tests {
                 last_activity: Instant::now(),
                 session_inserted: true,
                 cache_warning_sent: false,
+                idle_postmortem_sent: false,
             },
         );
         let display = derive_display_name("/tmp/clauditor", "claude-sonnet", hash);
@@ -7220,6 +8446,283 @@ mod tests {
             Some(1)
         );
         assert!(json.get("cost").is_none());
+    }
+
+    #[test]
+    fn postmortem_from_synthetic_db_includes_structured_redacted_evidence() {
+        let conn = create_full_test_db();
+        insert_session(
+            &conn,
+            "session-post",
+            "2026-01-01T00:00:00Z",
+            Some("2026-01-01T00:08:00Z"),
+            "claude-opus-4-7",
+            Some("Investigate /Users/pradeep/code/private auth with token=sk-ant-secretvalue"),
+        );
+        insert_request(
+            &conn,
+            "req-post-1",
+            "session-post",
+            "2026-01-01T00:01:00Z",
+            "claude-opus-4-7",
+            160_000,
+            1_000,
+            0,
+            12_000,
+        );
+        insert_request(
+            &conn,
+            "req-post-2",
+            "session-post",
+            "2026-01-01T00:03:00Z",
+            "claude-sonnet-4-6",
+            170_000,
+            1_500,
+            0,
+            14_000,
+        );
+        conn.execute(
+            "INSERT INTO session_diagnoses (
+                session_id, completed_at, outcome, total_turns, total_cost, cache_hit_ratio,
+                degraded, degradation_turn, causes_json, advice_json
+            ) VALUES (?1, ?2, 'Likely Partially Completed', 3, 2.0, 0.10, 1, 2, ?3, ?4)",
+            rusqlite::params![
+                "session-post",
+                "2026-01-01T00:08:00Z",
+                r#"[{"turn_first_noticed":2,"cause_type":"model_fallback","detail":"Requested opus for /Users/pradeep/code/private?x=1 with password=hunter2, got sonnet","estimated_cost":0.42,"is_heuristic":false,"requested_model":"claude-opus-4-7","actual_model":"claude-sonnet-4-6"}]"#,
+                r#"["Restart with a shorter prompt after fixing /Users/pradeep/code/private."]"#,
+            ],
+        )
+        .expect("insert diagnosis");
+        conn.execute(
+            "INSERT INTO turn_snapshots (
+                session_id, turn_number, timestamp, input_tokens, cache_read_tokens,
+                cache_creation_tokens, output_tokens, ttft_ms, tool_calls, tool_failures,
+                gap_from_prev_secs, context_utilization, context_window_tokens,
+                frustration_signals, requested_model, actual_model, response_summary
+            ) VALUES
+                ('session-post', 1, '2026-01-01T00:01:00Z', 160000, 0, 12000, 1000, 1200, '[\"Read\"]', 0, 0.0, 0.86, 200000, 0, 'claude-opus-4-7', 'claude-opus-4-7', 'Read /Users/pradeep/code/private'),
+                ('session-post', 2, '2026-01-01T00:03:00Z', 170000, 0, 14000, 1500, 2400, '[\"Bash\"]', 1, 600.0, 0.92, 200000, 0, 'claude-opus-4-7', 'claude-sonnet-4-6', 'Ran https://example.com/callback?token=secret'),
+                ('session-post', 3, '2026-01-01T00:08:00Z', 175000, 10000, 0, 900, 900, '[\"Edit\"]', 0, 10.0, 0.93, 200000, 0, 'claude-opus-4-7', 'claude-opus-4-7', 'Stopped after fallback')",
+            [],
+        )
+        .expect("insert turns");
+        conn.execute(
+            "INSERT INTO tool_outcomes (session_id, turn_number, timestamp, tool_name, input_summary, outcome, duration_ms)
+             VALUES
+                ('session-post', 1, '2026-01-01T00:01:00Z', 'Read', '/Users/pradeep/code/private/src/main.rs', 'success', 10),
+                ('session-post', 2, '2026-01-01T00:03:00Z', 'Bash', '{\"command\":\"curl https://example.com?token=secret\"}', 'error', 50),
+                ('session-post', 3, '2026-01-01T00:08:00Z', 'Read', '/Users/pradeep/code/private/src/lib.rs', 'success', 12)",
+            [],
+        )
+        .expect("insert tool outcomes");
+        conn.execute(
+            "INSERT INTO skill_events (session_id, timestamp, skill_name, event_type, confidence, source, detail)
+             VALUES ('session-post', '2026-01-01T00:02:00Z', 'tdd', 'fired', 1.0, 'hook', 'ok')",
+            [],
+        )
+        .expect("insert skill event");
+        conn.execute(
+            "INSERT INTO mcp_events (session_id, timestamp, server, tool, event_type, source, detail)
+             VALUES ('session-post', '2026-01-01T00:04:00Z', 'github', 'get_issue', 'called', 'hook', 'ok')",
+            [],
+        )
+        .expect("insert mcp event");
+        conn.execute(
+            "INSERT INTO session_recall (session_id, initial_prompt, final_response_summary)
+             VALUES ('session-post', 'Investigate auth with token=sk-ant-secretvalue', 'Finished via https://example.com/path?secret=yes')",
+            [],
+        )
+        .expect("insert recall");
+
+        let json =
+            build_postmortem_response_from_db(&conn, "session-post", true).expect("postmortem");
+        assert_eq!(json.get("redacted").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            json.pointer("/diagnosis/likely_cause")
+                .and_then(|v| v.as_str()),
+            Some("model_fallback")
+        );
+        assert_eq!(
+            json.pointer("/diagnosis/confidence")
+                .and_then(|v| v.as_str()),
+            Some("high")
+        );
+        assert_eq!(
+            json.pointer("/signals/model/fallbacks/0/requested")
+                .and_then(|v| v.as_str()),
+            Some("claude-opus-4-7")
+        );
+        assert_eq!(
+            json.pointer("/signals/skills/0/skill_name")
+                .and_then(|v| v.as_str()),
+            Some("tdd")
+        );
+        assert_eq!(
+            json.pointer("/signals/mcp/0/server")
+                .and_then(|v| v.as_str()),
+            Some("github")
+        );
+        let rendered = serde_json::to_string(&json).expect("serialize postmortem");
+        assert!(rendered.contains("Initial prompt captured (redacted"));
+        assert!(!rendered.contains("/Users/pradeep"));
+        assert!(!rendered.contains("hunter2"));
+        assert!(!rendered.contains("sk-ant-secretvalue"));
+        assert!(!rendered.contains("secret=yes"));
+        assert!(rendered.contains("<path>"));
+    }
+
+    #[test]
+    fn postmortem_last_reports_empty_state_when_no_sessions_exist() {
+        let conn = create_full_test_db();
+        let err = build_postmortem_response_from_db(&conn, "last", true).unwrap_err();
+        assert!(matches!(err, PostmortemError::NoSessions));
+    }
+
+    #[test]
+    fn postmortem_last_can_render_active_session_snapshot() {
+        let conn = create_full_test_db();
+        insert_session(
+            &conn,
+            "session-active",
+            "2026-01-01T00:00:00Z",
+            None,
+            "claude-sonnet",
+            Some("Work on active session"),
+        );
+        insert_request(
+            &conn,
+            "req-active",
+            "session-active",
+            "2026-01-01T00:01:00Z",
+            "claude-sonnet",
+            10_000,
+            500,
+            0,
+            1_000,
+        );
+        insert_turn_snapshot(
+            &conn,
+            "session-active",
+            1,
+            "2026-01-01T00:01:00Z",
+            500,
+            10_000,
+            1_000,
+            0.0,
+            0.02,
+            Some("Still active."),
+        );
+
+        let json = build_postmortem_response_from_db(&conn, "last", true).expect("postmortem");
+        assert_eq!(
+            json.get("session_id").and_then(|value| value.as_str()),
+            Some("session-active")
+        );
+        assert_eq!(
+            json.get("partial").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert!(json
+            .pointer("/summary/ended_at")
+            .is_some_and(|value| value.is_null()));
+        assert_eq!(
+            json.pointer("/summary/outcome")
+                .and_then(|value| value.as_str()),
+            Some("In Progress")
+        );
+        assert_eq!(
+            json.pointer("/diagnosis/degraded")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            json.pointer("/diagnosis/likely_cause")
+                .and_then(|value| value.as_str()),
+            Some("none")
+        );
+        assert_eq!(
+            json.pointer("/diagnosis/detail")
+                .and_then(|value| value.as_str()),
+            Some("Session is still active; inactivity alone is not a degradation signal.")
+        );
+        let diagnosis_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_diagnoses WHERE session_id = 'session-active'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count active diagnosis rows");
+        assert_eq!(diagnosis_rows, 0);
+    }
+
+    #[test]
+    fn in_memory_postmortem_totals_summarize_active_turns() {
+        let session_id = "session-idle-totals";
+        let _ = diagnosis::SESSION_TURNS.remove(session_id);
+        diagnosis::SESSION_TURNS.insert(
+            session_id.to_string(),
+            vec![
+                diagnosis::TurnSnapshot {
+                    turn_number: 1,
+                    timestamp: Instant::now(),
+                    input_tokens: 100,
+                    cache_read_tokens: 50,
+                    cache_creation_tokens: 10,
+                    output_tokens: 20,
+                    ttft_ms: 100,
+                    tool_calls: vec![],
+                    tool_results_failed: 0,
+                    gap_from_prev_secs: 0.0,
+                    context_utilization: 0.1,
+                    context_window_tokens: STANDARD_CONTEXT_WINDOW_TOKENS,
+                    frustration_signals: 0,
+                    requested_model: None,
+                    actual_model: None,
+                    response_summary: None,
+                },
+                diagnosis::TurnSnapshot {
+                    turn_number: 2,
+                    timestamp: Instant::now(),
+                    input_tokens: 200,
+                    cache_read_tokens: 100,
+                    cache_creation_tokens: 0,
+                    output_tokens: 30,
+                    ttft_ms: 120,
+                    tool_calls: vec![],
+                    tool_results_failed: 0,
+                    gap_from_prev_secs: 5.0,
+                    context_utilization: 0.2,
+                    context_window_tokens: STANDARD_CONTEXT_WINDOW_TOKENS,
+                    frustration_signals: 0,
+                    requested_model: None,
+                    actual_model: None,
+                    response_summary: None,
+                },
+            ],
+        );
+
+        assert_eq!(in_memory_postmortem_totals(session_id), Some((510, 2)));
+        let _ = diagnosis::SESSION_TURNS.remove(session_id);
+        assert_eq!(in_memory_postmortem_totals(session_id), None);
+    }
+
+    #[test]
+    fn postmortem_redaction_removes_paths_query_strings_and_secrets() {
+        let redacted = redact_operational_text(
+            "Run /Users/pradeep/code/app with password=hunter2 and token=sk-ant-abcdef123456 at https://example.com/a?token=secret plus ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd",
+            true,
+        );
+
+        assert!(redacted.contains("<path>"));
+        assert!(redacted.contains("password=<redacted>"));
+        assert!(redacted.contains("token=<redacted>"));
+        assert!(redacted.contains("https://example.com/a?<redacted>"));
+        assert!(!redacted.contains("/Users/pradeep"));
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("sk-ant-abcdef123456"));
+        assert!(!redacted.contains("token=secret"));
+        assert!(!redacted.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcd"));
     }
 
     #[test]

@@ -32,6 +32,8 @@ docker-compose.override.yml
 
 # Demo recordings
 docs/demo.cast
+docs/clauditor-product-assessment.md
+docs/prd-postmortem-command.md
 
 # Scratch / logs
 /tmp/clauditor-repro/

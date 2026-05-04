@@ -24,6 +24,7 @@ pub struct SessionState {
     pub last_activity: Instant,
     pub session_inserted: bool,
     pub cache_warning_sent: bool,
+    pub idle_postmortem_sent: bool,
 }
 
 /// Key: hash of system prompt first 1KB. Value: per-terminal session state.

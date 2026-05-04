@@ -70,6 +70,14 @@ pub enum WatchEvent {
         total_tokens: u64,
         total_turns: u32,
     },
+    /// A session has been quiet long enough to render a useful local
+    /// postmortem snapshot, but it remains open for future turns.
+    PostmortemReady {
+        session_id: String,
+        idle_secs: u64,
+        total_tokens: u64,
+        total_turns: u32,
+    },
     // Note: FrustrationSignal carries a category, NOT the detected phrase text.
     // Phrase text is never stored or displayed — only the category type.
     FrustrationSignal {

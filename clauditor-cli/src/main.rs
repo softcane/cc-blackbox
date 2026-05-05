@@ -212,7 +212,18 @@ pub(crate) enum WatchEvent {
         #[serde(default)]
         cache_expires_at_epoch: Option<u64>,
         #[serde(default)]
+        cache_expires_at_latest_epoch: Option<u64>,
+        #[serde(default)]
+        cache_ttl_source: Option<String>,
+        #[serde(default)]
+        cache_ttl_mixed: Option<bool>,
+        #[serde(default)]
         estimated_rebuild_cost_dollars: Option<f64>,
+    },
+    RequestError {
+        session_id: String,
+        error_type: String,
+        message: String,
     },
     SessionStart {
         session_id: String,
@@ -1299,6 +1310,7 @@ pub(crate) fn event_session_id(event: &WatchEvent) -> Option<&str> {
         | WatchEvent::CompactionLoop { session_id, .. }
         | WatchEvent::Diagnosis { session_id, .. }
         | WatchEvent::CacheWarning { session_id, .. }
+        | WatchEvent::RequestError { session_id, .. }
         | WatchEvent::ModelFallback { session_id, .. }
         | WatchEvent::ContextStatus { session_id, .. } => Some(session_id.as_str()),
         WatchEvent::Lagged { .. } | WatchEvent::RateLimitStatus { .. } => None,
@@ -1653,6 +1665,9 @@ fn render_event(
             session_id: _,
             event_type,
             cache_expires_at_epoch,
+            cache_expires_at_latest_epoch,
+            cache_ttl_source,
+            cache_ttl_mixed,
             estimated_rebuild_cost_dollars,
         } => {
             if no_cache {
@@ -1676,16 +1691,16 @@ fn render_event(
                     .yellow()
                     .dimmed()
                     .to_string(),
-                "miss_ttl" => format!("{}  CACHE   \u{25cb} miss (TTL)", time)
+                "miss_ttl" => format!("{}  CACHE   \u{25cb} miss (TTL inferred)", time)
                     .yellow()
                     .to_string(),
-                "miss_thrash" => format!("{}  CACHE   \u{25cb} miss (thrash)", time)
+                "miss_thrash" => format!("{}  CACHE   \u{25cb} miss (thrash inferred)", time)
                     .red()
                     .dimmed()
                     .to_string(),
                 other => format!("{}  CACHE   {}", time, other).dimmed().to_string(),
             };
-            // Append "expires in Nm · est. rebuild $X.XX" when we have it.
+            // Append TTL and estimated rebuild details when we have them.
             let mut line = base;
             if let Some(exp) = cache_expires_at_epoch {
                 let now = std::time::SystemTime::now()
@@ -1695,17 +1710,53 @@ fn render_event(
                 let remaining = exp.saturating_sub(now);
                 let mins = remaining / 60;
                 let secs = remaining % 60;
+                let expiry_text = if cache_ttl_mixed.unwrap_or(false) {
+                    if let Some(latest) = cache_expires_at_latest_epoch {
+                        let latest_remaining = latest.saturating_sub(now);
+                        format!(
+                            "first expires in {}m{:02}s; latest {}m{:02}s",
+                            mins,
+                            secs,
+                            latest_remaining / 60,
+                            latest_remaining % 60
+                        )
+                    } else {
+                        format!("first expires in {}m{:02}s", mins, secs)
+                    }
+                } else {
+                    format!("expires in {}m{:02}s", mins, secs)
+                };
+                let source_note = cache_ttl_source
+                    .as_deref()
+                    .filter(|source| source.contains("mixed"))
+                    .map(|_| " (mixed TTL)")
+                    .unwrap_or("");
                 let suffix = if let Some(c) = estimated_rebuild_cost_dollars {
                     format!(
-                        "  \u{00b7} expires in {}m{:02}s \u{00b7} est. rebuild ${:.2}",
-                        mins, secs, c
+                        "  \u{00b7} {}{} \u{00b7} est. rebuild ${:.2}",
+                        expiry_text, source_note, c
                     )
                 } else {
-                    format!("  \u{00b7} expires in {}m{:02}s", mins, secs)
+                    format!("  \u{00b7} {}{}", expiry_text, source_note)
                 };
                 line.push_str(&suffix.dimmed().to_string());
             }
             print_tagged(&tag, &line);
+        }
+
+        WatchEvent::RequestError {
+            session_id: _,
+            error_type,
+            message,
+        } => {
+            let time = now_hms();
+            print_tagged(
+                &tag,
+                &format!("{}  \u{2717} API ERROR  {}: {}", time, error_type, message)
+                    .red()
+                    .bold()
+                    .to_string(),
+            );
         }
 
         WatchEvent::ModelFallback {
@@ -1951,6 +2002,7 @@ fn cause_icon(cause_type: &str) -> &'static str {
         "near_compaction" => "\u{23f3}",                      // ⏳
         "compaction_suspected" => "\u{1f504}",                // 🔄
         "model_fallback" => "\u{21c4}",                       // ⇄
+        "api_error" => "\u{2717}",                            // ✗
         "tool_failure_streak" => "\u{1f527}",                 // 🔧
         "harness_pressure" => "\u{26a0}\u{fe0f}",             // ⚠️
         _ => "\u{2022}",                                      // •
@@ -1969,7 +2021,7 @@ fn render_diagnosis(report: &DiagnosisReport, tag: &str) {
     print_tagged(
         tag,
         &format!(
-            "SESSION COMPLETE \u{00b7} {} turns \u{00b7} {} tokens \u{00b7} cache {:.0}% \u{00b7} {}",
+            "SESSION COMPLETE \u{00b7} {} turns \u{00b7} {} tokens \u{00b7} cache reuse {:.0}% \u{00b7} {}",
             report.total_turns,
             tokens_display,
             report.cache_hit_ratio * 100.0,
@@ -2174,8 +2226,15 @@ fn render_postmortem_markdown(report: &serde_json::Value) -> String {
         out.push_str(&format!("- Billed reconciliation: ${billed:.2}\n"));
     }
     out.push_str(&format!(
-        "- Cache hit ratio: {}\n",
-        format_percent(json_f64(report, "/signals/cache/cache_hit_ratio"))
+        "- Cache reusable-prefix ratio: {}\n",
+        format_percent(
+            json_f64(report, "/signals/cache/cache_reusable_prefix_ratio")
+                .or_else(|| json_f64(report, "/signals/cache/cache_hit_ratio"))
+        )
+    ));
+    out.push_str(&format!(
+        "- Total input cache rate: {}\n",
+        format_percent(json_f64(report, "/signals/cache/total_input_cache_rate"))
     ));
     out.push_str(&format!(
         "- Context max: {:.0}% full; turns to compact: {}\n",
@@ -2747,7 +2806,7 @@ async fn fetch_sessions(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Header
     println!(
         "{:<22} {:<18} {:<8} {:<22} {:<16} {:<14} {:<8} CAUSE",
-        "SESSION", "MODEL", "TURNS", "OUTCOME", "ESTIMATED COST", "BILLED COST", "CACHE%"
+        "SESSION", "MODEL", "TURNS", "OUTCOME", "ESTIMATED COST", "BILLED COST", "REUSE%"
     );
     println!("{}", "-".repeat(122));
 

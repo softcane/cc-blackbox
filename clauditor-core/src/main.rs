@@ -370,6 +370,12 @@ CREATE TABLE IF NOT EXISTS requests (
     cache_creation_tokens INTEGER DEFAULT 0,
     cache_creation_5m_tokens INTEGER DEFAULT 0,
     cache_creation_1h_tokens INTEGER DEFAULT 0,
+    cache_ttl_min_secs INTEGER DEFAULT 300,
+    cache_ttl_max_secs INTEGER DEFAULT 300,
+    cache_ttl_source TEXT DEFAULT 'default_5m',
+    outcome TEXT DEFAULT 'success',
+    error_type TEXT,
+    error_message TEXT,
     cost_dollars REAL,
     cost_source TEXT,
     trusted_for_budget_enforcement INTEGER DEFAULT 0,
@@ -399,6 +405,9 @@ CREATE TABLE IF NOT EXISTS turn_snapshots (
     input_tokens          INTEGER,
     cache_read_tokens     INTEGER DEFAULT 0,
     cache_creation_tokens INTEGER DEFAULT 0,
+    cache_ttl_min_secs    INTEGER DEFAULT 300,
+    cache_ttl_max_secs    INTEGER DEFAULT 300,
+    cache_ttl_source      TEXT DEFAULT 'default_5m',
     output_tokens         INTEGER,
     ttft_ms               INTEGER,
     tool_calls            TEXT,
@@ -410,6 +419,8 @@ CREATE TABLE IF NOT EXISTS turn_snapshots (
     requested_model       TEXT,
     actual_model          TEXT,
     response_summary      TEXT,
+    response_error_type   TEXT,
+    response_error_message TEXT,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
@@ -504,6 +515,12 @@ enum DbCommand {
         cache_creation_tokens: u64,
         cache_creation_5m_tokens: u64,
         cache_creation_1h_tokens: u64,
+        cache_ttl_min_secs: u64,
+        cache_ttl_max_secs: u64,
+        cache_ttl_source: String,
+        outcome: String,
+        error_type: Option<String>,
+        error_message: Option<String>,
         cost_dollars: f64,
         cost_source: String,
         trusted_for_budget_enforcement: bool,
@@ -519,6 +536,9 @@ enum DbCommand {
         input_tokens: u64,
         cache_read_tokens: u64,
         cache_creation_tokens: u64,
+        cache_ttl_min_secs: u64,
+        cache_ttl_max_secs: u64,
+        cache_ttl_source: String,
         output_tokens: u64,
         ttft_ms: u64,
         tool_calls_json: String,
@@ -530,6 +550,8 @@ enum DbCommand {
         requested_model: Option<String>,
         actual_model: Option<String>,
         response_summary: Option<String>,
+        response_error_type: Option<String>,
+        response_error_message: Option<String>,
     },
     WriteDiagnosis {
         session_id: String,
@@ -629,6 +651,36 @@ fn ensure_turn_snapshot_model_columns(conn: &Connection) -> rusqlite::Result<()>
             [],
         )?;
     }
+    if !columns.contains("cache_ttl_min_secs") {
+        conn.execute(
+            "ALTER TABLE turn_snapshots ADD COLUMN cache_ttl_min_secs INTEGER DEFAULT 300",
+            [],
+        )?;
+    }
+    if !columns.contains("cache_ttl_max_secs") {
+        conn.execute(
+            "ALTER TABLE turn_snapshots ADD COLUMN cache_ttl_max_secs INTEGER DEFAULT 300",
+            [],
+        )?;
+    }
+    if !columns.contains("cache_ttl_source") {
+        conn.execute(
+            "ALTER TABLE turn_snapshots ADD COLUMN cache_ttl_source TEXT DEFAULT 'default_5m'",
+            [],
+        )?;
+    }
+    if !columns.contains("response_error_type") {
+        conn.execute(
+            "ALTER TABLE turn_snapshots ADD COLUMN response_error_type TEXT",
+            [],
+        )?;
+    }
+    if !columns.contains("response_error_message") {
+        conn.execute(
+            "ALTER TABLE turn_snapshots ADD COLUMN response_error_message TEXT",
+            [],
+        )?;
+    }
 
     Ok(())
 }
@@ -677,6 +729,36 @@ fn ensure_request_cost_columns(conn: &Connection) -> rusqlite::Result<()> {
             "ALTER TABLE requests ADD COLUMN cache_creation_1h_tokens INTEGER DEFAULT 0",
             [],
         )?;
+    }
+    if !columns.contains("cache_ttl_min_secs") {
+        conn.execute(
+            "ALTER TABLE requests ADD COLUMN cache_ttl_min_secs INTEGER DEFAULT 300",
+            [],
+        )?;
+    }
+    if !columns.contains("cache_ttl_max_secs") {
+        conn.execute(
+            "ALTER TABLE requests ADD COLUMN cache_ttl_max_secs INTEGER DEFAULT 300",
+            [],
+        )?;
+    }
+    if !columns.contains("cache_ttl_source") {
+        conn.execute(
+            "ALTER TABLE requests ADD COLUMN cache_ttl_source TEXT DEFAULT 'default_5m'",
+            [],
+        )?;
+    }
+    if !columns.contains("outcome") {
+        conn.execute(
+            "ALTER TABLE requests ADD COLUMN outcome TEXT DEFAULT 'success'",
+            [],
+        )?;
+    }
+    if !columns.contains("error_type") {
+        conn.execute("ALTER TABLE requests ADD COLUMN error_type TEXT", [])?;
+    }
+    if !columns.contains("error_message") {
+        conn.execute("ALTER TABLE requests ADD COLUMN error_message TEXT", [])?;
     }
 
     Ok(())
@@ -863,6 +945,12 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 cache_creation_tokens,
                 cache_creation_5m_tokens,
                 cache_creation_1h_tokens,
+                cache_ttl_min_secs,
+                cache_ttl_max_secs,
+                cache_ttl_source,
+                outcome,
+                error_type,
+                error_message,
                 cost_dollars,
                 cost_source,
                 trusted_for_budget_enforcement,
@@ -875,9 +963,11 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                     .execute(
                     "INSERT OR IGNORE INTO requests (request_id, session_id, timestamp, model, \
                      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, \
-                     cache_creation_5m_tokens, cache_creation_1h_tokens, cost_dollars, \
-                     cost_source, trusted_for_budget_enforcement, duration_ms, tool_calls, cache_event) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                     cache_creation_5m_tokens, cache_creation_1h_tokens, cache_ttl_min_secs, \
+                     cache_ttl_max_secs, cache_ttl_source, outcome, error_type, error_message, \
+                     cost_dollars, cost_source, trusted_for_budget_enforcement, duration_ms, \
+                     tool_calls, cache_event) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
                     rusqlite::params![
                         &request_id,
                         &session_id,
@@ -889,6 +979,12 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                         cache_creation_tokens,
                         cache_creation_5m_tokens,
                         cache_creation_1h_tokens,
+                        cache_ttl_min_secs,
+                        cache_ttl_max_secs,
+                        cache_ttl_source,
+                        outcome,
+                        error_type,
+                        error_message,
                         cost_dollars,
                         cost_source,
                         trusted_for_budget_enforcement as i32,
@@ -938,6 +1034,9 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 input_tokens,
                 cache_read_tokens,
                 cache_creation_tokens,
+                cache_ttl_min_secs,
+                cache_ttl_max_secs,
+                cache_ttl_source,
                 output_tokens,
                 ttft_ms,
                 tool_calls_json,
@@ -949,14 +1048,17 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 requested_model,
                 actual_model,
                 response_summary,
+                response_error_type,
+                response_error_message,
             } => {
                 let _ = conn.execute(
                     "INSERT INTO turn_snapshots (session_id, turn_number, timestamp, \
                      input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, \
                      ttft_ms, tool_calls, tool_failures, gap_from_prev_secs, \
                      context_utilization, context_window_tokens, frustration_signals, \
-                     requested_model, actual_model, response_summary) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                     requested_model, actual_model, response_summary, cache_ttl_min_secs, \
+                     cache_ttl_max_secs, cache_ttl_source, response_error_type, response_error_message) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
                     rusqlite::params![
                         session_id,
                         turn_number,
@@ -975,6 +1077,11 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                         requested_model,
                         actual_model,
                         response_summary,
+                        cache_ttl_min_secs,
+                        cache_ttl_max_secs,
+                        cache_ttl_source,
+                        response_error_type,
+                        response_error_message,
                     ],
                 );
             }
@@ -1173,6 +1280,7 @@ struct SummaryWindowData {
     billed_cost_dollars: Option<f64>,
     billed_sessions: u64,
     cache_hit_ratio: f64,
+    total_input_cache_rate: f64,
 }
 
 struct CostAccumulator {
@@ -1290,6 +1398,7 @@ fn compute_estimated_costs_for_sessions(
     let placeholders = vec!["?"; session_ids.len()].join(",");
     let sql = format!(
         "SELECT session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, \
+         COALESCE(cache_creation_5m_tokens, 0), COALESCE(cache_creation_1h_tokens, 0), \
          cost_dollars, cost_source, trusted_for_budget_enforcement \
          FROM requests WHERE session_id IN ({placeholders})"
     );
@@ -1302,9 +1411,11 @@ fn compute_estimated_costs_for_sessions(
             row.get::<_, i64>(3)?,
             row.get::<_, i64>(4)?,
             row.get::<_, i64>(5)?,
-            row.get::<_, Option<f64>>(6)?,
-            row.get::<_, Option<String>>(7)?,
-            row.get::<_, Option<i64>>(8)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, Option<f64>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<i64>>(10)?,
         ))
     })?;
 
@@ -1317,6 +1428,8 @@ fn compute_estimated_costs_for_sessions(
             output,
             cache_read,
             cache_create,
+            cache_create_5m_raw,
+            cache_create_1h_raw,
             stored_cost,
             stored_source,
             stored_trusted,
@@ -1327,12 +1440,18 @@ fn compute_estimated_costs_for_sessions(
         if let Some(cost) = stored_cost {
             accumulator.record_persisted(cost, stored_source, stored_trusted.map(|n| n != 0));
         } else {
-            accumulator.record(pricing::estimate_cost_dollars(
+            let mut cache_create_5m = cache_create_5m_raw.max(0) as u64;
+            let cache_create_1h = cache_create_1h_raw.max(0) as u64;
+            if cache_create.max(0) > 0 && cache_create_5m == 0 && cache_create_1h == 0 {
+                cache_create_5m = cache_create.max(0) as u64;
+            }
+            accumulator.record(pricing::estimate_cost_dollars_with_cache_buckets(
                 &model,
                 input.max(0) as u64,
                 output.max(0) as u64,
                 cache_read.max(0) as u64,
-                cache_create.max(0) as u64,
+                cache_create_5m,
+                cache_create_1h,
             ));
         }
     }
@@ -1352,7 +1471,8 @@ fn compute_estimated_costs_for_sessions(
 fn query_summary(conn: &Connection, since: &str) -> rusqlite::Result<SummaryWindowData> {
     let mut stmt = conn.prepare(
         "SELECT r.session_id, r.model, r.input_tokens, r.output_tokens, r.cache_read_tokens, \
-                r.cache_creation_tokens, r.cost_dollars, r.cost_source, \
+                r.cache_creation_tokens, COALESCE(r.cache_creation_5m_tokens, 0), \
+                COALESCE(r.cache_creation_1h_tokens, 0), r.cost_dollars, r.cost_source, \
                 r.trusted_for_budget_enforcement, CASE WHEN s.session_id IS NULL THEN 0 ELSE 1 END \
          FROM requests r \
          LEFT JOIN sessions s ON s.session_id = r.session_id \
@@ -1366,10 +1486,12 @@ fn query_summary(conn: &Connection, since: &str) -> rusqlite::Result<SummaryWind
             row.get::<_, i64>(3)?,
             row.get::<_, i64>(4)?,
             row.get::<_, i64>(5)?,
-            row.get::<_, Option<f64>>(6)?,
-            row.get::<_, Option<String>>(7)?,
-            row.get::<_, Option<i64>>(8)?,
-            row.get::<_, i64>(9)? != 0,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, Option<f64>>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<i64>>(10)?,
+            row.get::<_, i64>(11)? != 0,
         ))
     })?;
 
@@ -1377,6 +1499,7 @@ fn query_summary(conn: &Connection, since: &str) -> rusqlite::Result<SummaryWind
     let mut cost_accumulator = CostAccumulator::new();
     let mut cache_read_tokens: i64 = 0;
     let mut cache_total_tokens: i64 = 0;
+    let mut total_input_side_tokens: i64 = 0;
 
     for row in rows {
         let (
@@ -1386,6 +1509,8 @@ fn query_summary(conn: &Connection, since: &str) -> rusqlite::Result<SummaryWind
             output,
             cache_read,
             cache_create,
+            cache_create_5m_raw,
+            cache_create_1h_raw,
             stored_cost,
             stored_source,
             stored_trusted,
@@ -1396,15 +1521,22 @@ fn query_summary(conn: &Connection, since: &str) -> rusqlite::Result<SummaryWind
         }
         cache_read_tokens += cache_read.max(0);
         cache_total_tokens += (cache_read + cache_create).max(0);
+        total_input_side_tokens += (input + cache_read + cache_create).max(0);
         if let Some(cost) = stored_cost {
             cost_accumulator.record_persisted(cost, stored_source, stored_trusted.map(|n| n != 0));
         } else {
-            cost_accumulator.record(pricing::estimate_cost_dollars(
+            let mut cache_create_5m = cache_create_5m_raw.max(0) as u64;
+            let cache_create_1h = cache_create_1h_raw.max(0) as u64;
+            if cache_create.max(0) > 0 && cache_create_5m == 0 && cache_create_1h == 0 {
+                cache_create_5m = cache_create.max(0) as u64;
+            }
+            cost_accumulator.record(pricing::estimate_cost_dollars_with_cache_buckets(
                 &model,
                 input.max(0) as u64,
                 output.max(0) as u64,
                 cache_read.max(0) as u64,
-                cache_create.max(0) as u64,
+                cache_create_5m,
+                cache_create_1h,
             ));
         }
     }
@@ -1430,6 +1562,11 @@ fn query_summary(conn: &Connection, since: &str) -> rusqlite::Result<SummaryWind
     } else {
         0.0
     };
+    let total_input_cache_rate = if total_input_side_tokens > 0 {
+        cache_read_tokens.max(0) as f64 / total_input_side_tokens.max(0) as f64
+    } else {
+        0.0
+    };
 
     let estimate = cost_accumulator.finish();
     Ok(SummaryWindowData {
@@ -1440,6 +1577,7 @@ fn query_summary(conn: &Connection, since: &str) -> rusqlite::Result<SummaryWind
         billed_cost_dollars,
         billed_sessions,
         cache_hit_ratio,
+        total_input_cache_rate,
     })
 }
 
@@ -1451,7 +1589,9 @@ fn summary_window_json(summary: &SummaryWindowData) -> Value {
         "trusted_for_budget_enforcement": summary.trusted_for_budget_enforcement,
         "billed_cost_dollars": rounded_billed_cost_dollars(summary.billed_cost_dollars),
         "billed_sessions": summary.billed_sessions,
+        "cache_reusable_prefix_ratio": (summary.cache_hit_ratio * 100.0).round() / 100.0,
         "cache_hit_ratio": (summary.cache_hit_ratio * 100.0).round() / 100.0,
+        "total_input_cache_rate": (summary.total_input_cache_rate * 100.0).round() / 100.0,
     })
 }
 
@@ -1463,6 +1603,7 @@ fn build_summary_response_json(
     serde_json::json!({
         "cost_source": pricing::active_catalog_source(),
         "trusted_for_budget_enforcement": pricing::trusted_for_budget_enforcement(),
+        "pricing_caveats": pricing::pricing_caveats(),
         "today": summary_window_json(today),
         "this_week": summary_window_json(week),
         "this_month": summary_window_json(month),
@@ -1495,10 +1636,13 @@ fn build_diagnosis_response_json(
         "estimated_total_cost_dollars": estimated_total_cost_dollars,
         "cost_source": cost_source,
         "trusted_for_budget_enforcement": trusted_for_budget_enforcement,
+        "pricing_caveats": pricing::pricing_caveats(),
         "billed_cost_dollars": rounded_billed_cost_dollars(billed_cost_dollars),
         "billing_source": billing_source,
         "billing_imported_at": billing_imported_at,
+        "cache_reusable_prefix_ratio": cache_hit_ratio,
         "cache_hit_ratio": cache_hit_ratio,
+        "cache_ratio_label": "reusable_prefix_ratio",
         "degraded": degraded,
         "degradation_turn": if degraded { degradation_turn } else { None },
         "causes": causes,
@@ -1532,11 +1676,14 @@ fn build_session_summary_json(
         "estimated_total_cost_dollars": estimated_total_cost_dollars,
         "cost_source": cost_source,
         "trusted_for_budget_enforcement": trusted_for_budget_enforcement,
+        "pricing_caveats": pricing::pricing_caveats(),
         "billed_cost_dollars": rounded_billed_cost_dollars(billed_cost_dollars),
         "billing_source": billing_source,
         "billing_imported_at": billing_imported_at,
         "primary_cause": primary_cause,
+        "cache_reusable_prefix_ratio": cache_hit_ratio,
         "cache_hit_ratio": cache_hit_ratio,
+        "cache_ratio_label": "reusable_prefix_ratio",
         "model": model,
     })
 }
@@ -1545,6 +1692,7 @@ fn build_sessions_response_json(sessions: Vec<Value>) -> Value {
     serde_json::json!({
         "cost_source": pricing::active_catalog_source(),
         "trusted_for_budget_enforcement": pricing::trusted_for_budget_enforcement(),
+        "pricing_caveats": pricing::pricing_caveats(),
         "sessions": sessions,
     })
 }
@@ -2174,6 +2322,16 @@ fn cache_hit_ratio_from_tokens(totals: &PostmortemTokenTotals) -> f64 {
     }
 }
 
+fn total_input_cache_rate_from_tokens(totals: &PostmortemTokenTotals) -> f64 {
+    let input_side_total =
+        totals.input_tokens + totals.cache_read_tokens + totals.cache_creation_tokens;
+    if input_side_total == 0 {
+        0.0
+    } else {
+        totals.cache_read_tokens as f64 / input_side_total as f64
+    }
+}
+
 fn build_postmortem_response_from_db(
     conn: &Connection,
     target: &str,
@@ -2580,14 +2738,21 @@ fn build_postmortem_response_from_db(
             "billed_cost_dollars": billing.as_ref().map(|record| rounded_estimated_cost_dollars(record.billed_cost_dollars)),
             "billing_source": billing.as_ref().map(|record| record.source.clone()),
             "billing_imported_at": billing.as_ref().map(|record| record.imported_at.clone()),
-            "cost_caveat": "Estimated costs are local calculations, not authoritative billing records.",
+            "cost_caveat": pricing::pricing_caveats().join(" "),
+            "pricing_caveats": pricing::pricing_caveats(),
         },
         "signals": {
             "cache": {
+                "cache_reusable_prefix_ratio": diagnosis
+                    .as_ref()
+                    .map(|diag| diag.cache_hit_ratio)
+                    .unwrap_or_else(|| cache_hit_ratio_from_tokens(&token_totals)),
                 "cache_hit_ratio": diagnosis
                     .as_ref()
                     .map(|diag| diag.cache_hit_ratio)
                     .unwrap_or_else(|| cache_hit_ratio_from_tokens(&token_totals)),
+                "cache_ratio_label": "reusable_prefix_ratio",
+                "total_input_cache_rate": total_input_cache_rate_from_tokens(&token_totals),
                 "rebuild_turns": cache_rebuild_turns.len(),
                 "non_cold_rebuild_tokens": non_cold_cache_rebuild_tokens,
             },
@@ -2611,6 +2776,7 @@ fn build_postmortem_response_from_db(
         "caveats": [
             "This report is deterministic and generated from local Clauditor SQLite data.",
             "Estimated costs are not billing truth unless a billed reconciliation is shown.",
+            "Built-in pricing does not include contract discounts, data residency, fast-mode modifiers, or server-tool charges unless separately reconciled.",
             "Context runway and some degradation causes are heuristics.",
             if redact {
                 "Redacted output omits raw prompts, absolute paths, query strings, secret-like values, and structured tool payloads."
@@ -2868,10 +3034,65 @@ fn query_historical_metrics(
 // ---------------------------------------------------------------------------
 // Cache intelligence tracker
 // ---------------------------------------------------------------------------
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CacheTtlEvidence {
+    min_secs: u64,
+    max_secs: u64,
+    source: &'static str,
+}
+
+impl CacheTtlEvidence {
+    fn default_5m() -> Self {
+        Self {
+            min_secs: CACHE_TTL_SECS,
+            max_secs: CACHE_TTL_SECS,
+            source: "default_5m",
+        }
+    }
+
+    fn from_ttls(ttls: &[u64], source: &'static str) -> Option<Self> {
+        let min_secs = ttls.iter().copied().min()?;
+        let max_secs = ttls.iter().copied().max().unwrap_or(min_secs);
+        Some(Self {
+            min_secs,
+            max_secs,
+            source,
+        })
+    }
+
+    fn from_response_buckets(acc: &ResponseAccumulator) -> Option<Self> {
+        let has_5m = acc.cache_creation_5m_tokens > 0;
+        let has_1h = acc.cache_creation_1h_tokens > 0;
+        match (has_5m, has_1h) {
+            (true, true) => Some(Self {
+                min_secs: 300,
+                max_secs: 3600,
+                source: "response_cache_creation_mixed",
+            }),
+            (true, false) => Some(Self {
+                min_secs: 300,
+                max_secs: 300,
+                source: "response_cache_creation_5m",
+            }),
+            (false, true) => Some(Self {
+                min_secs: 3600,
+                max_secs: 3600,
+                source: "response_cache_creation_1h",
+            }),
+            (false, false) => None,
+        }
+    }
+
+    fn is_mixed(&self) -> bool {
+        self.min_secs != self.max_secs
+    }
+}
+
 struct CacheTracker {
     consecutive_misses: u64,
     last_request_time: Option<Instant>,
-    last_ttl_secs: u64,
+    last_ttl_min_secs: u64,
+    last_ttl_max_secs: u64,
 }
 
 impl CacheTracker {
@@ -2879,7 +3100,8 @@ impl CacheTracker {
         Self {
             consecutive_misses: 0,
             last_request_time: None,
-            last_ttl_secs: CACHE_TTL_SECS,
+            last_ttl_min_secs: CACHE_TTL_SECS,
+            last_ttl_max_secs: CACHE_TTL_SECS,
         }
     }
 }
@@ -2894,13 +3116,13 @@ fn update_cache_intelligence(
     session_id: &str,
     cache_read: u64,
     cache_create: u64,
-    ttl_secs: u64,
+    ttl: &CacheTtlEvidence,
 ) -> &'static str {
     let mut t = CACHE_TRACKERS
         .entry(session_id.to_string())
         .or_insert_with(CacheTracker::new);
     let now = Instant::now();
-    classify_cache_event(&mut t, now, cache_read, cache_create, ttl_secs)
+    classify_cache_event(&mut t, now, cache_read, cache_create, ttl)
 }
 
 fn classify_cache_event(
@@ -2908,16 +3130,17 @@ fn classify_cache_event(
     now: Instant,
     cache_read: u64,
     cache_create: u64,
-    ttl_secs: u64,
+    ttl: &CacheTtlEvidence,
 ) -> &'static str {
-    tracker.last_ttl_secs = ttl_secs;
+    tracker.last_ttl_min_secs = ttl.min_secs;
+    tracker.last_ttl_max_secs = ttl.max_secs;
     let is_full_miss = cache_create > 0 && cache_read == 0;
     let is_first = tracker.last_request_time.is_none();
     let gap = tracker
         .last_request_time
         .map(|p| now.duration_since(p).as_secs())
         .unwrap_or(0);
-    let is_ttl = is_full_miss && gap > ttl_secs;
+    let is_ttl = is_full_miss && gap > ttl.max_secs;
 
     let event = if cache_read == 0 && cache_create == 0 {
         "none"
@@ -2927,7 +3150,12 @@ fn classify_cache_event(
             "cold_start"
         } else if is_ttl {
             tracker.consecutive_misses = 0;
-            info!(gap, cache_create, "cache miss attributed to TTL expiry");
+            info!(
+                gap,
+                cache_create,
+                ttl_max_secs = ttl.max_secs,
+                "cache miss inferred from TTL expiry evidence"
+            );
             "miss_ttl"
         } else {
             tracker.consecutive_misses += 1;
@@ -2952,14 +3180,26 @@ fn classify_cache_event(
     event
 }
 
+fn response_cache_ttl_evidence(
+    acc: &ResponseAccumulator,
+    request_cache_ttl: Option<CacheTtlEvidence>,
+) -> CacheTtlEvidence {
+    CacheTtlEvidence::from_response_buckets(acc)
+        .or(request_cache_ttl)
+        .unwrap_or_else(CacheTtlEvidence::default_5m)
+}
+
+#[cfg(test)]
 fn response_cache_ttl_secs(acc: &ResponseAccumulator, request_cache_ttl_secs: Option<u64>) -> u64 {
-    if acc.cache_creation_1h_tokens > 0 && acc.cache_creation_5m_tokens == 0 {
-        3600
-    } else if acc.cache_creation_5m_tokens > 0 {
-        300
-    } else {
-        request_cache_ttl_secs.unwrap_or(CACHE_TTL_SECS)
-    }
+    response_cache_ttl_evidence(
+        acc,
+        request_cache_ttl_secs.map(|ttl| CacheTtlEvidence {
+            min_secs: ttl,
+            max_secs: ttl,
+            source: "request_cache_control",
+        }),
+    )
+    .min_secs
 }
 
 // ---------------------------------------------------------------------------
@@ -2967,6 +3207,36 @@ fn response_cache_ttl_secs(acc: &ResponseAccumulator, request_cache_ttl_secs: Op
 // ---------------------------------------------------------------------------
 pub fn token_cost(tokens: u64, price_per_mtok: f64) -> f64 {
     pricing::token_cost(tokens, price_per_mtok)
+}
+
+fn estimated_rebuild_cost_for_cache_event(
+    acc: &ResponseAccumulator,
+    model: &str,
+    ttl: &CacheTtlEvidence,
+) -> f64 {
+    let resolved = pricing::resolve_pricing(model);
+    if acc.cache_creation_tokens > 0 {
+        return token_cost(
+            acc.cache_creation_5m_tokens,
+            resolved.pricing.cache_write_5m,
+        ) + token_cost(
+            acc.cache_creation_1h_tokens,
+            resolved.pricing.cache_write_1h,
+        );
+    }
+
+    let prompt_size_tokens = acc.input_tokens + acc.cache_read_tokens + acc.cache_creation_tokens;
+    let write_price = if ttl.min_secs >= 3600 && ttl.max_secs >= 3600 {
+        resolved.pricing.cache_write_1h
+    } else if ttl.is_mixed() {
+        // A cache-hit turn does not expose bucket sizes. Use the 1h write
+        // rate as a conservative upper-bound estimate when request evidence
+        // says the reusable prefix is mixed 5m/1h.
+        resolved.pricing.cache_write_1h
+    } else {
+        resolved.pricing.cache_write_5m
+    };
+    token_cost(prompt_size_tokens, write_price)
 }
 
 // ---------------------------------------------------------------------------
@@ -3025,6 +3295,9 @@ struct ResponseAccumulator {
     is_json: bool,
     http_status: u32,
     error_body: Vec<u8>,
+    stream_error_type: Option<String>,
+    stream_error_message: Option<String>,
+    current_sse_event: Option<String>,
     /// Model Anthropic reported in `message_start` or non-streaming JSON. This
     /// may differ from what the client requested when Anthropic routes the
     /// request to a different model.
@@ -3060,6 +3333,9 @@ impl ResponseAccumulator {
             is_json: false,
             http_status: 0,
             error_body: Vec::new(),
+            stream_error_type: None,
+            stream_error_message: None,
+            current_sse_event: None,
             response_model: None,
             response_text: String::new(),
             text_buffer: String::new(),
@@ -3078,9 +3354,16 @@ impl ResponseAccumulator {
                 continue;
             };
             let line = line.trim_end_matches('\r');
-            if let Some(data) = line.strip_prefix("data: ") {
+            if line.is_empty() {
+                self.current_sse_event = None;
+            } else if let Some(event) = line.strip_prefix("event: ") {
+                self.current_sse_event = Some(event.trim().to_string());
+            } else if let Some(data) = line.strip_prefix("data: ") {
                 if data != "[DONE]" {
                     if let Ok(v) = serde_json::from_str::<Value>(data) {
+                        if self.current_sse_event.as_deref() == Some("error") {
+                            self.process_sse_error(&v);
+                        }
                         self.process_event(&v);
                     }
                 }
@@ -3106,6 +3389,11 @@ impl ResponseAccumulator {
     }
 
     fn process_message_json(&mut self, value: &Value) {
+        if value.get("type").and_then(|kind| kind.as_str()) == Some("error")
+            || value.get("error").is_some()
+        {
+            self.process_sse_error(value);
+        }
         if let Some(usage) = value.get("usage") {
             self.apply_usage(usage);
         }
@@ -3221,8 +3509,31 @@ impl ResponseAccumulator {
         }
     }
 
+    fn process_sse_error(&mut self, v: &Value) {
+        let error = v.get("error").unwrap_or(v);
+        let error_type = error
+            .get("type")
+            .and_then(|value| value.as_str())
+            .or_else(|| v.get("type").and_then(|value| value.as_str()))
+            .unwrap_or("stream_error");
+        let message = error
+            .get("message")
+            .and_then(|value| value.as_str())
+            .or_else(|| v.get("message").and_then(|value| value.as_str()))
+            .unwrap_or("Claude API stream returned an error event");
+        self.stream_error_type = Some(error_type.to_string());
+        self.stream_error_message = Some(message.to_string());
+    }
+
+    fn has_response_error(&self) -> bool {
+        self.http_status >= 400 || self.stream_error_type.is_some()
+    }
+
     fn process_event(&mut self, v: &Value) {
         match v.get("type").and_then(|t| t.as_str()) {
+            Some("error") => {
+                self.process_sse_error(v);
+            }
             Some("message_start") => {
                 if let Some(u) = v.pointer("/message/usage") {
                     self.apply_usage(u);
@@ -3548,7 +3859,7 @@ fn finalize_response(
     user_prompt_excerpt: &str,
     context_window_tokens: u64,
     is_internal_request: bool,
-    request_cache_ttl_secs: Option<u64>,
+    request_cache_ttl: Option<CacheTtlEvidence>,
 ) {
     let duration = started_at.elapsed();
     let duration_secs = duration.as_secs_f64();
@@ -3582,15 +3893,23 @@ fn finalize_response(
         duration_secs,
     );
 
-    let cache_ttl_secs = response_cache_ttl_secs(acc, request_cache_ttl_secs);
-    let cache_event = if is_internal_request {
+    let cache_ttl = response_cache_ttl_evidence(acc, request_cache_ttl);
+    let response_error_type = acc
+        .stream_error_type
+        .clone()
+        .or_else(|| (acc.http_status >= 400).then(|| format!("http_{}", acc.http_status)));
+    let response_error_message = acc.stream_error_message.clone().or_else(|| {
+        (acc.http_status >= 400 && !acc.error_body.is_empty())
+            .then(|| String::from_utf8_lossy(&acc.error_body).to_string())
+    });
+    let cache_event = if is_internal_request || acc.has_response_error() {
         "none"
     } else {
         update_cache_intelligence(
             &session_id,
             acc.cache_read_tokens,
             acc.cache_creation_tokens,
-            cache_ttl_secs,
+            &cache_ttl,
         )
     };
 
@@ -3680,28 +3999,32 @@ fn finalize_response(
         }
 
         // Broadcast all cache events except "none" — hits confirm the stream is alive.
-        if cache_event != "none" {
-            let resolved = pricing::resolve_pricing(&billing_model);
-            let exact_create_cost = token_cost(
-                acc.cache_creation_5m_tokens,
-                resolved.pricing.cache_write_5m,
-            ) + token_cost(
-                acc.cache_creation_1h_tokens,
-                resolved.pricing.cache_write_1h,
-            );
-            let prompt_size_tokens =
-                acc.input_tokens + acc.cache_read_tokens + acc.cache_creation_tokens;
-            let rebuild_cost = if acc.cache_creation_tokens > 0 {
-                exact_create_cost
-            } else {
-                token_cost(prompt_size_tokens, resolved.pricing.cache_write_5m)
-            };
-            let expires_at = now_epoch_secs() + cache_ttl_secs;
+        if let Some(error_type) = acc.stream_error_type.as_ref() {
+            watch::BROADCASTER.broadcast(watch::WatchEvent::RequestError {
+                session_id: session_id.clone(),
+                error_type: error_type.clone(),
+                message: acc
+                    .stream_error_message
+                    .clone()
+                    .unwrap_or_else(|| "Claude API stream returned an error event".to_string()),
+            });
+        }
+
+        if cache_event != "none" && !acc.has_response_error() {
+            let rebuild_cost =
+                estimated_rebuild_cost_for_cache_event(acc, &billing_model, &cache_ttl);
+            let now_epoch = now_epoch_secs();
+            let expires_at = now_epoch + cache_ttl.min_secs;
+            let latest_expires_at = (cache_ttl.max_secs != cache_ttl.min_secs)
+                .then_some(now_epoch + cache_ttl.max_secs);
             metrics::record_cache_event(&billing_model, cache_event, estimated_cache_waste_dollars);
             watch::BROADCASTER.broadcast(watch::WatchEvent::CacheEvent {
                 session_id: session_id.clone(),
                 event_type: cache_event.to_string(),
                 cache_expires_at_epoch: Some(expires_at),
+                cache_expires_at_latest_epoch: latest_expires_at,
+                cache_ttl_source: Some(cache_ttl.source.to_string()),
+                cache_ttl_mixed: cache_ttl.is_mixed().then_some(true),
                 estimated_rebuild_cost_dollars: Some(rebuild_cost),
             });
         }
@@ -3763,6 +4086,9 @@ fn finalize_response(
                 input_tokens: acc.input_tokens as u32,
                 cache_read_tokens: acc.cache_read_tokens as u32,
                 cache_creation_tokens: acc.cache_creation_tokens as u32,
+                cache_ttl_min_secs: cache_ttl.min_secs,
+                cache_ttl_max_secs: cache_ttl.max_secs,
+                cache_ttl_source: cache_ttl.source.to_string(),
                 output_tokens: acc.output_tokens as u32,
                 ttft_ms: duration_ms,
                 tool_calls: acc.tool_calls.clone(),
@@ -3779,6 +4105,8 @@ fn finalize_response(
                 requested_model: Some(model.to_string()),
                 actual_model: acc.response_model.clone(),
                 response_summary: response_summary.clone(),
+                response_error_type: response_error_type.clone(),
+                response_error_message: response_error_message.clone(),
             };
             entry.push(snapshot);
             let signal = diagnosis::compaction_loop_signal_ending_at(
@@ -3807,6 +4135,9 @@ fn finalize_response(
         let snap_output = acc.output_tokens;
         let snap_cache_read = acc.cache_read_tokens;
         let snap_cache_create = acc.cache_creation_tokens;
+        let snap_cache_ttl_min_secs = cache_ttl.min_secs;
+        let snap_cache_ttl_max_secs = cache_ttl.max_secs;
+        let snap_cache_ttl_source = cache_ttl.source.to_string();
         let snap_ttft = duration_ms;
         let snap_failures = tool_failures;
         let snap_gap = {
@@ -3827,6 +4158,8 @@ fn finalize_response(
         let snap_requested_model = Some(model.to_string());
         let snap_actual_model = acc.response_model.clone();
         let snap_response_summary = compact_response_summary(&acc.response_text, tool_results);
+        let snap_response_error_type = response_error_type.clone();
+        let snap_response_error_message = response_error_message.clone();
         let _ = DB_TX.send(DbCommand::WriteTurnSnapshot {
             session_id: snap_session,
             turn_number,
@@ -3834,6 +4167,9 @@ fn finalize_response(
             input_tokens: snap_input,
             cache_read_tokens: snap_cache_read,
             cache_creation_tokens: snap_cache_create,
+            cache_ttl_min_secs: snap_cache_ttl_min_secs,
+            cache_ttl_max_secs: snap_cache_ttl_max_secs,
+            cache_ttl_source: snap_cache_ttl_source,
             output_tokens: snap_output,
             ttft_ms: snap_ttft,
             tool_calls_json: snap_tools,
@@ -3845,6 +4181,8 @@ fn finalize_response(
             requested_model: snap_requested_model,
             actual_model: snap_actual_model,
             response_summary: snap_response_summary,
+            response_error_type: snap_response_error_type,
+            response_error_message: snap_response_error_message,
         });
 
         for tool_result in tool_results {
@@ -3879,6 +4217,16 @@ fn finalize_response(
         cache_creation_tokens: acc.cache_creation_tokens,
         cache_creation_5m_tokens: acc.cache_creation_5m_tokens,
         cache_creation_1h_tokens: acc.cache_creation_1h_tokens,
+        cache_ttl_min_secs: cache_ttl.min_secs,
+        cache_ttl_max_secs: cache_ttl.max_secs,
+        cache_ttl_source: cache_ttl.source.to_string(),
+        outcome: if acc.has_response_error() {
+            "failed".to_string()
+        } else {
+            "success".to_string()
+        },
+        error_type: response_error_type,
+        error_message: response_error_message,
         cost_dollars: total_cost,
         cost_source: estimated_cost.cost_source.clone(),
         trusted_for_budget_enforcement: estimated_cost.trusted_for_budget_enforcement,
@@ -3888,7 +4236,17 @@ fn finalize_response(
         cache_event: cache_event.to_string(),
     });
 
-    if acc.http_status >= 400 && !acc.error_body.is_empty() {
+    if let Some(error_type) = acc.stream_error_type.as_deref() {
+        warn!(
+            request_id,
+            model,
+            http_status = acc.http_status,
+            error_type,
+            error = %acc.stream_error_message.as_deref().unwrap_or("Claude API stream returned an error event"),
+            duration_s = format!("{:.2}", duration_secs),
+            "request failed"
+        );
+    } else if acc.http_status >= 400 {
         let error_text = String::from_utf8_lossy(&acc.error_body);
         warn!(request_id, model, http_status = acc.http_status,
             error = %error_text, duration_s = format!("{:.2}", duration_secs),
@@ -3951,7 +4309,9 @@ fn load_turn_snapshots_from_db(
     let mut stmt = conn.prepare(
         "SELECT turn_number, input_tokens, cache_read_tokens, cache_creation_tokens, \
          output_tokens, ttft_ms, tool_calls, tool_failures, gap_from_prev_secs, \
-         context_utilization, context_window_tokens, frustration_signals, requested_model, actual_model, response_summary \
+         context_utilization, context_window_tokens, frustration_signals, requested_model, actual_model, response_summary, \
+         COALESCE(cache_ttl_min_secs, 300), COALESCE(cache_ttl_max_secs, 300), \
+         COALESCE(cache_ttl_source, 'default_5m'), response_error_type, response_error_message \
          FROM turn_snapshots WHERE session_id = ?1 ORDER BY turn_number ASC",
     )?;
 
@@ -3977,12 +4337,24 @@ fn load_turn_snapshots_from_db(
                     )
                 });
             let response_summary = row.get::<_, Option<String>>(14)?;
+            let cache_ttl_min_secs = row.get::<_, Option<i64>>(15)?.unwrap_or(300).max(1) as u64;
+            let cache_ttl_max_secs = row
+                .get::<_, Option<i64>>(16)?
+                .unwrap_or(cache_ttl_min_secs as i64)
+                .max(cache_ttl_min_secs as i64) as u64;
+            let cache_ttl_source = row
+                .get::<_, Option<String>>(17)?
+                .filter(|source| !source.trim().is_empty())
+                .unwrap_or_else(|| "default_5m".to_string());
             Ok(diagnosis::TurnSnapshot {
                 turn_number: row.get::<_, i64>(0)?.max(0) as u32,
                 timestamp: Instant::now(),
                 input_tokens,
                 cache_read_tokens,
                 cache_creation_tokens,
+                cache_ttl_min_secs,
+                cache_ttl_max_secs,
+                cache_ttl_source,
                 output_tokens: row.get::<_, i64>(4)?.max(0) as u32,
                 ttft_ms: row.get::<_, i64>(5)?.max(0) as u64,
                 tool_calls: parse_tool_calls_json(&tool_calls_raw),
@@ -3999,6 +4371,12 @@ fn load_turn_snapshots_from_db(
                 requested_model,
                 actual_model,
                 response_summary: response_summary.filter(|s| !s.trim().is_empty()),
+                response_error_type: row
+                    .get::<_, Option<String>>(18)?
+                    .filter(|s| !s.trim().is_empty()),
+                response_error_message: row
+                    .get::<_, Option<String>>(19)?
+                    .filter(|s| !s.trim().is_empty()),
             })
         })?
         .filter_map(|row| row.ok())
@@ -4395,7 +4773,8 @@ fn beta_values_use_1m_context(values: &[String]) -> bool {
 }
 
 fn request_uses_1m_context(headers: &HttpHeaders) -> bool {
-    beta_values_use_1m_context(&extract_headers(headers, "anthropic-beta"))
+    let _ = headers;
+    false
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -4424,25 +4803,36 @@ fn upstream_request_adjustment_for_body(
     beta_values: &[String],
     body: &[u8],
 ) -> UpstreamRequestAdjustment {
-    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
-        return UpstreamRequestAdjustment::default();
-    };
-
-    let Some(model) = value.get("model").and_then(|model| model.as_str()) else {
-        return UpstreamRequestAdjustment::default();
-    };
-    let Some(upstream_model) = strip_model_1m_alias(model) else {
-        return UpstreamRequestAdjustment::default();
-    };
-
-    value["model"] = Value::String(upstream_model.to_string());
     let cleaned_beta = anthropic_beta_without_1m_context(beta_values);
     let had_retired_context_beta = beta_values_use_1m_context(beta_values);
-    UpstreamRequestAdjustment {
-        body: serde_json::to_vec(&value).ok(),
+    let mut adjustment = UpstreamRequestAdjustment {
+        body: None,
         anthropic_beta: (had_retired_context_beta && !cleaned_beta.is_empty())
             .then_some(cleaned_beta),
         remove_anthropic_beta: had_retired_context_beta,
+    };
+
+    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+        return adjustment;
+    };
+
+    let Some(model) = value.get("model").and_then(|model| model.as_str()) else {
+        return adjustment;
+    };
+    let Some(upstream_model) = strip_model_1m_alias(model) else {
+        return adjustment;
+    };
+
+    value["model"] = Value::String(upstream_model.to_string());
+    adjustment.body = serde_json::to_vec(&value).ok();
+    adjustment
+}
+
+fn request_context_window_hint_from_headers(headers: &HttpHeaders) -> Option<u64> {
+    if request_uses_1m_context(headers) {
+        Some(EXTENDED_CONTEXT_WINDOW_TOKENS)
+    } else {
+        None
     }
 }
 
@@ -4678,7 +5068,7 @@ struct ParsedRequestBody {
     working_dir: String,
     user_prompt_excerpt: String,
     is_internal_request: bool,
-    cache_ttl_secs: Option<u64>,
+    cache_ttl_evidence: Option<CacheTtlEvidence>,
 }
 
 fn cache_control_ttl_secs(cache_control: &Value) -> Option<u64> {
@@ -4713,10 +5103,15 @@ fn collect_cache_control_ttls(value: &Value, ttls: &mut Vec<u64>) {
     }
 }
 
+#[cfg(test)]
 fn request_cache_ttl_secs(value: &Value) -> Option<u64> {
+    request_cache_ttl_evidence(value).map(|evidence| evidence.min_secs)
+}
+
+fn request_cache_ttl_evidence(value: &Value) -> Option<CacheTtlEvidence> {
     let mut ttls = Vec::new();
     collect_cache_control_ttls(value, &mut ttls);
-    ttls.into_iter().min()
+    CacheTtlEvidence::from_ttls(&ttls, "request_cache_control")
 }
 
 fn looks_like_title_request(prompt: &str, message_count: usize, has_tools: bool) -> bool {
@@ -4828,7 +5223,7 @@ fn parse_request_body(body: &[u8]) -> Option<ParsedRequestBody> {
     };
 
     let user_prompt_excerpt = clean_user_prompt(&first_user_message);
-    let cache_ttl_secs = request_cache_ttl_secs(&v);
+    let cache_ttl_evidence = request_cache_ttl_evidence(&v);
     let is_internal_request =
         is_internal_request_shape(&working_dir, sl, mc, ht, &user_prompt_excerpt);
 
@@ -4842,7 +5237,7 @@ fn parse_request_body(body: &[u8]) -> Option<ParsedRequestBody> {
         working_dir,
         user_prompt_excerpt,
         is_internal_request,
-        cache_ttl_secs,
+        cache_ttl_evidence,
     })
 }
 
@@ -5698,7 +6093,7 @@ impl ExternalProcessor for ClauditorProcessor {
             let mut working_dir_str = String::new();
             let mut user_prompt_excerpt_buf = String::new();
             let mut is_internal_request = false;
-            let mut request_cache_ttl_secs: Option<u64> = None;
+            let mut request_cache_ttl: Option<CacheTtlEvidence> = None;
             let mut request_context_window_hint: Option<u64> = None;
             let mut request_anthropic_beta_values: Vec<String> = Vec::new();
             let mut context_window_tokens = STANDARD_CONTEXT_WINDOW_TOKENS;
@@ -5721,7 +6116,7 @@ impl ExternalProcessor for ClauditorProcessor {
                                 &user_prompt_excerpt_buf,
                                 context_window_tokens,
                                 is_internal_request,
-                                request_cache_ttl_secs,
+                                request_cache_ttl.clone(),
                             );
                             REQUEST_STATE.remove(&request_id);
                         }
@@ -5741,7 +6136,7 @@ impl ExternalProcessor for ClauditorProcessor {
                                 &user_prompt_excerpt_buf,
                                 context_window_tokens,
                                 is_internal_request,
-                                request_cache_ttl_secs,
+                                request_cache_ttl.clone(),
                             );
                             REQUEST_STATE.remove(&request_id);
                         }
@@ -5756,8 +6151,7 @@ impl ExternalProcessor for ClauditorProcessor {
                             .filter(|value| !value.trim().is_empty())
                             .unwrap_or_else(fallback_request_id);
                         request_anthropic_beta_values = extract_headers(h, "anthropic-beta");
-                        request_context_window_hint =
-                            request_uses_1m_context(h).then_some(EXTENDED_CONTEXT_WINDOW_TOKENS);
+                        request_context_window_hint = request_context_window_hint_from_headers(h);
                         context_window_tokens = configured_context_window_tokens()
                             .unwrap_or(STANDARD_CONTEXT_WINDOW_TOKENS);
 
@@ -5819,7 +6213,7 @@ impl ExternalProcessor for ClauditorProcessor {
                                 // passing the excerpt every time is harmless and first-write-wins.
                                 user_prompt_excerpt_buf = parsed.user_prompt_excerpt;
                                 is_internal_request = parsed.is_internal_request;
-                                request_cache_ttl_secs = parsed.cache_ttl_secs;
+                                request_cache_ttl = parsed.cache_ttl_evidence.clone();
                                 if !blocked {
                                     context_window_tokens = resolve_context_window_tokens(
                                         request_context_window_hint,
@@ -5992,7 +6386,7 @@ impl ExternalProcessor for ClauditorProcessor {
                                     &user_prompt_excerpt_buf,
                                     context_window_tokens,
                                     is_internal_request,
-                                    request_cache_ttl_secs,
+                                    request_cache_ttl.clone(),
                                 );
                             }
                             REQUEST_STATE.remove(&request_id);
@@ -6172,6 +6566,7 @@ fn event_matches_session(ev: &watch::WatchEvent, filter: Option<&str>) -> bool {
         | watch::WatchEvent::CompactionLoop { session_id, .. }
         | watch::WatchEvent::Diagnosis { session_id, .. }
         | watch::WatchEvent::CacheWarning { session_id, .. }
+        | watch::WatchEvent::RequestError { session_id, .. }
         | watch::WatchEvent::ModelFallback { session_id, .. }
         | watch::WatchEvent::ContextStatus { session_id, .. } => session_id == want,
         watch::WatchEvent::RateLimitStatus { .. } => true,
@@ -6772,6 +7167,94 @@ async fn handle_recall(
     }
 }
 
+fn build_cache_rebuilds_response_from_db(
+    conn: &Connection,
+    days: u64,
+    now_epoch: u64,
+) -> Option<Value> {
+    let _ = repair_persisted_session_artifacts(conn);
+    let since_secs = now_epoch.saturating_sub(days * 86400);
+    let since = epoch_to_iso8601(since_secs);
+
+    // Find turns where cache was fully rebuilt (creation > 0, read == 0).
+    let mut stmt = conn
+        .prepare(
+            "SELECT turn_number, cache_creation_tokens, cache_read_tokens, gap_from_prev_secs, \
+         input_tokens, COALESCE(cache_ttl_min_secs, 300), COALESCE(cache_ttl_max_secs, 300) \
+         FROM turn_snapshots WHERE timestamp >= ?1",
+        )
+        .ok()?;
+
+    let mut total_rebuilds: u64 = 0;
+    let mut idle_gap_rebuilds: u64 = 0;
+    let mut rebuilds_without_idle_gap: u64 = 0;
+    let mut partial_ttl_gap_rebuilds: u64 = 0;
+    let mut cold_start_builds: u64 = 0;
+    let mut tokens_wasted: u64 = 0;
+    let mut total_tokens: u64 = 0;
+    let mut longest_gap: f64 = 0.0;
+
+    let rows = stmt
+        .query_map(rusqlite::params![since], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,                               // turn_number
+                row.get::<_, i64>(1)?,                               // cache_creation_tokens
+                row.get::<_, i64>(2)?,                               // cache_read_tokens
+                row.get::<_, f64>(3)?,                               // gap_from_prev_secs
+                row.get::<_, i64>(4)?,                               // input_tokens
+                row.get::<_, Option<i64>>(5)?.unwrap_or(300).max(1), // cache_ttl_min_secs
+                row.get::<_, Option<i64>>(6)?.unwrap_or(300).max(1), // cache_ttl_max_secs
+            ))
+        })
+        .ok()?;
+
+    for row in rows.flatten() {
+        let (turn_number, cache_create, cache_read, gap, input, ttl_min, ttl_max_raw) = row;
+        let ttl_max = ttl_max_raw.max(ttl_min);
+        total_tokens += (input + cache_read + cache_create).max(0) as u64;
+
+        if cache_create > 0 && cache_read == 0 {
+            if turn_number <= 1 {
+                cold_start_builds += 1;
+                continue;
+            }
+            total_rebuilds += 1;
+            tokens_wasted += cache_create.max(0) as u64;
+            if gap > ttl_max as f64 {
+                idle_gap_rebuilds += 1;
+                if gap > longest_gap {
+                    longest_gap = gap;
+                }
+            } else if ttl_max > ttl_min && gap > ttl_min as f64 {
+                partial_ttl_gap_rebuilds += 1;
+                rebuilds_without_idle_gap += 1;
+            } else {
+                rebuilds_without_idle_gap += 1;
+            }
+        }
+    }
+
+    let wasted_ratio = if total_tokens > 0 {
+        tokens_wasted as f64 / total_tokens as f64
+    } else {
+        0.0
+    };
+
+    Some(serde_json::json!({
+        "period_days": days,
+        "total_rebuilds": total_rebuilds,
+        "cold_start_builds": cold_start_builds,
+        "rebuilds_from_idle_gaps": idle_gap_rebuilds,
+        "rebuilds_from_inferred_idle_gaps": idle_gap_rebuilds,
+        "mixed_ttl_partial_gap_rebuilds": partial_ttl_gap_rebuilds,
+        "rebuilds_without_idle_gap": rebuilds_without_idle_gap,
+        "tokens_wasted_on_rebuilds": tokens_wasted,
+        "tokens_wasted_ratio": (wasted_ratio * 1000.0).round() / 1000.0,
+        "longest_gap_before_rebuild_secs": longest_gap.round() as u64,
+        "miss_cause_caveat": "Cache miss causes are inferred from local TTL and token evidence; Anthropic does not expose provider-confirmed miss causes.",
+    }))
+}
+
 async fn handle_cache_rebuilds(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
@@ -6779,77 +7262,7 @@ async fn handle_cache_rebuilds(
 
     let result = tokio::task::spawn_blocking(move || {
         let conn = Connection::open(db_path()).ok()?;
-        let _ = repair_persisted_session_artifacts(&conn);
-        let since_secs = now_epoch_secs() - (days * 86400);
-        let since = epoch_to_iso8601(since_secs);
-
-        // Find turns where cache was fully rebuilt (creation > 0, read == 0).
-        let mut stmt = conn
-            .prepare(
-                "SELECT turn_number, cache_creation_tokens, cache_read_tokens, gap_from_prev_secs, \
-             input_tokens \
-             FROM turn_snapshots WHERE timestamp >= ?1",
-            )
-            .ok()?;
-
-        let mut total_rebuilds: u64 = 0;
-        let mut idle_gap_rebuilds: u64 = 0;
-        let mut rebuilds_without_idle_gap: u64 = 0;
-        let mut cold_start_builds: u64 = 0;
-        let mut tokens_wasted: u64 = 0;
-        let mut total_tokens: u64 = 0;
-        let mut longest_gap: f64 = 0.0;
-
-        let rows = stmt
-            .query_map(rusqlite::params![since], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?, // turn_number
-                    row.get::<_, i64>(1)?, // cache_creation_tokens
-                    row.get::<_, i64>(2)?, // cache_read_tokens
-                    row.get::<_, f64>(3)?, // gap_from_prev_secs
-                    row.get::<_, i64>(4)?, // input_tokens
-                ))
-            })
-            .ok()?;
-
-        for row in rows.flatten() {
-            let (turn_number, cache_create, cache_read, gap, input) = row;
-            total_tokens += (input + cache_read + cache_create) as u64;
-
-            if cache_create > 0 && cache_read == 0 {
-                if turn_number <= 1 {
-                    cold_start_builds += 1;
-                    continue;
-                }
-                total_rebuilds += 1;
-                tokens_wasted += cache_create as u64;
-                if gap > 300.0 {
-                    idle_gap_rebuilds += 1;
-                    if gap > longest_gap {
-                        longest_gap = gap;
-                    }
-                } else {
-                    rebuilds_without_idle_gap += 1;
-                }
-            }
-        }
-
-        let wasted_ratio = if total_tokens > 0 {
-            tokens_wasted as f64 / total_tokens as f64
-        } else {
-            0.0
-        };
-
-        Some(serde_json::json!({
-            "period_days": days,
-            "total_rebuilds": total_rebuilds,
-            "cold_start_builds": cold_start_builds,
-            "rebuilds_from_idle_gaps": idle_gap_rebuilds,
-            "rebuilds_without_idle_gap": rebuilds_without_idle_gap,
-            "tokens_wasted_on_rebuilds": tokens_wasted,
-            "tokens_wasted_ratio": (wasted_ratio * 1000.0).round() / 1000.0,
-            "longest_gap_before_rebuild_secs": longest_gap.round() as u64,
-        }))
+        build_cache_rebuilds_response_from_db(&conn, days, now_epoch_secs())
     })
     .await
     .ok()
@@ -6881,7 +7294,9 @@ fn load_degradation_view_from_db(conn: &Connection, session_id: &str) -> Option<
         .prepare(
             "SELECT turn_number, input_tokens, cache_read_tokens, cache_creation_tokens, \
              output_tokens, ttft_ms, gap_from_prev_secs, context_utilization, \
-             context_window_tokens, tool_failures, requested_model, actual_model \
+             context_window_tokens, tool_failures, requested_model, actual_model, \
+             COALESCE(cache_ttl_min_secs, 300), COALESCE(cache_ttl_max_secs, 300), \
+             COALESCE(cache_ttl_source, 'default_5m'), response_error_type, response_error_message \
              FROM turn_snapshots WHERE session_id = ?1 ORDER BY turn_number",
         )
         .ok()?;
@@ -6899,6 +7314,11 @@ fn load_degradation_view_from_db(conn: &Connection, session_id: &str) -> Option<
         failures: i64,
         requested_model: Option<String>,
         actual_model: Option<String>,
+        cache_ttl_min_secs: i64,
+        cache_ttl_max_secs: i64,
+        cache_ttl_source: String,
+        response_error_type: Option<String>,
+        response_error_message: Option<String>,
     }
 
     let turns: Vec<TurnRow> = stmt
@@ -6908,6 +7328,11 @@ fn load_degradation_view_from_db(conn: &Connection, session_id: &str) -> Option<
             let cache_create = row.get::<_, i64>(3)?.max(0);
             let requested_model = row.get::<_, Option<String>>(10)?;
             let actual_model = row.get::<_, Option<String>>(11)?;
+            let cache_ttl_min_secs = row.get::<_, Option<i64>>(12)?.unwrap_or(300).max(1);
+            let cache_ttl_max_secs = row
+                .get::<_, Option<i64>>(13)?
+                .unwrap_or(cache_ttl_min_secs)
+                .max(cache_ttl_min_secs);
             let context_window_tokens = row
                 .get::<_, Option<i64>>(8)?
                 .map(|value| value.max(0))
@@ -6939,6 +7364,18 @@ fn load_degradation_view_from_db(conn: &Connection, session_id: &str) -> Option<
                 failures: row.get(9)?,
                 requested_model,
                 actual_model,
+                cache_ttl_min_secs,
+                cache_ttl_max_secs,
+                cache_ttl_source: row
+                    .get::<_, Option<String>>(14)?
+                    .filter(|source| !source.trim().is_empty())
+                    .unwrap_or_else(|| "default_5m".to_string()),
+                response_error_type: row
+                    .get::<_, Option<String>>(15)?
+                    .filter(|value| !value.trim().is_empty()),
+                response_error_message: row
+                    .get::<_, Option<String>>(16)?
+                    .filter(|value| !value.trim().is_empty()),
             })
         })
         .ok()?
@@ -6966,11 +7403,18 @@ fn load_degradation_view_from_db(conn: &Connection, session_id: &str) -> Option<
             if t.cache_create > 0 && t.cache_read == 0 {
                 if t.turn <= 1 {
                     flags.push("cold_start");
-                } else if t.gap > 300.0 {
+                } else if t.gap > t.cache_ttl_max_secs as f64 {
                     flags.push("cache_miss_ttl");
+                } else if t.cache_ttl_max_secs > t.cache_ttl_min_secs
+                    && t.gap > t.cache_ttl_min_secs as f64
+                {
+                    flags.push("cache_miss_partial_ttl");
                 } else {
-                    flags.push("cache_miss_thrash");
+                    flags.push("cache_miss_inferred_rebuild");
                 }
+            }
+            if t.response_error_type.is_some() {
+                flags.push("api_error");
             }
             if t.ctx > 0.60 {
                 flags.push("context_bloat");
@@ -6993,6 +7437,9 @@ fn load_degradation_view_from_db(conn: &Connection, session_id: &str) -> Option<
                 "input_tokens": t.input,
                 "cache_read_tokens": t.cache_read,
                 "cache_creation_tokens": t.cache_create,
+                "cache_ttl_min_secs": t.cache_ttl_min_secs,
+                "cache_ttl_max_secs": t.cache_ttl_max_secs,
+                "cache_ttl_source": t.cache_ttl_source,
                 "output_tokens": t.output,
                 "turn_duration_ms": t.ttft_ms,
                 "gap_from_prev_secs": t.gap,
@@ -7001,6 +7448,8 @@ fn load_degradation_view_from_db(conn: &Connection, session_id: &str) -> Option<
                 "tool_failures": t.failures,
                 "requested_model": t.requested_model.clone(),
                 "actual_model": t.actual_model.clone(),
+                "response_error_type": t.response_error_type.clone(),
+                "response_error_message": t.response_error_message.clone(),
                 "flags": flags,
             })
         })
@@ -7282,7 +7731,7 @@ async fn cache_expiry_warning_monitor() {
             let idle = now.duration_since(entry.last_activity).as_secs();
             let ttl_secs = CACHE_TRACKERS
                 .get(&entry.session_id)
-                .map(|tracker| tracker.last_ttl_secs)
+                .map(|tracker| tracker.last_ttl_min_secs)
                 .unwrap_or(CACHE_TTL_SECS);
             if idle >= warning_secs {
                 entry.cache_warning_sent = true;
@@ -7476,30 +7925,31 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        build_diagnosis_response_json, build_postmortem_response_from_db,
-        build_session_summary_json, build_sessions_response_json, build_summary_response_json,
-        canonical_telemetry_name, classify_cache_event, clean_user_prompt,
-        compact_response_summary, context_fill_percent, context_fill_ratio, db_writer_loop,
-        derive_display_name, diagnosis, ensure_session_columns, epoch_to_iso8601,
-        extract_explicit_skill_refs, extract_header, extract_headers, extract_working_dir,
-        fallback_request_id, in_memory_postmortem_totals, infer_context_window_tokens,
-        is_internal_request_shape, load_degradation_view_from_db, lock_or_recover,
-        looks_like_machine_recall_line, looks_like_title_request, metrics,
-        model_has_native_1m_context, model_requests_1m_context, normalize_search_text,
-        now_epoch_secs, parse_latest_tool_results, parse_request_body,
+        build_cache_rebuilds_response_from_db, build_diagnosis_response_json,
+        build_postmortem_response_from_db, build_session_summary_json,
+        build_sessions_response_json, build_summary_response_json, canonical_telemetry_name,
+        classify_cache_event, clean_user_prompt, compact_response_summary, context_fill_percent,
+        context_fill_ratio, db_writer_loop, derive_display_name, diagnosis, ensure_session_columns,
+        epoch_to_iso8601, estimated_rebuild_cost_for_cache_event, extract_explicit_skill_refs,
+        extract_header, extract_headers, extract_working_dir, fallback_request_id,
+        in_memory_postmortem_totals, infer_context_window_tokens, is_internal_request_shape,
+        load_degradation_view_from_db, lock_or_recover, looks_like_machine_recall_line,
+        looks_like_title_request, metrics, model_has_native_1m_context, model_requests_1m_context,
+        normalize_search_text, now_epoch_secs, parse_latest_tool_results, parse_request_body,
         persist_billing_reconciliation, pricing, query_historical_metrics, query_summary,
         redact_operational_text, repair_persisted_session_artifacts,
-        repair_turn_snapshot_context_windows, request_cache_ttl_secs, request_uses_1m_context,
+        repair_turn_snapshot_context_windows, request_cache_ttl_evidence, request_cache_ttl_secs,
+        request_context_window_hint_from_headers, request_uses_1m_context,
         resolve_context_window_tokens, resolve_context_window_tokens_with_config,
         response_cache_ttl_secs, score_recall_doc, seed_live_metric_labels_from_db,
         session_timeout_secs, should_broadcast_quota_snapshot, skill_name_from_skill_file,
         skill_name_from_tool_input_json, strip_model_1m_alias, summarize_hook_tool_input,
         tokenize_search_text, tool_recall_context, truncate_detail,
         upstream_request_adjustment_for_body, BillingReconciliationInput,
-        BillingReconciliationWriteError, CacheTracker, DbCommand, HttpHeaders, ParsedToolResult,
-        PostmortemError, ProtoHeaderValue, ResponseAccumulator, SummaryWindowData,
-        ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS, QUOTA_WATCH_BROADCAST_INTERVAL,
-        SCHEMA, STANDARD_CONTEXT_WINDOW_TOKENS,
+        BillingReconciliationWriteError, CacheTracker, CacheTtlEvidence, DbCommand, HttpHeaders,
+        ParsedToolResult, PostmortemError, ProtoHeaderValue, ResponseAccumulator,
+        SummaryWindowData, ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS,
+        QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA, STANDARD_CONTEXT_WINDOW_TOKENS,
     };
 
     static METRICS_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -7525,6 +7975,12 @@ mod tests {
                 cache_creation_tokens INTEGER DEFAULT 0,
                 cache_creation_5m_tokens INTEGER DEFAULT 0,
                 cache_creation_1h_tokens INTEGER DEFAULT 0,
+                cache_ttl_min_secs INTEGER DEFAULT 300,
+                cache_ttl_max_secs INTEGER DEFAULT 300,
+                cache_ttl_source TEXT DEFAULT 'default_5m',
+                outcome TEXT DEFAULT 'success',
+                error_type TEXT,
+                error_message TEXT,
                 cost_dollars REAL,
                 cost_source TEXT,
                 trusted_for_budget_enforcement INTEGER DEFAULT 0,
@@ -7552,6 +8008,9 @@ mod tests {
                 input_tokens INTEGER,
                 cache_read_tokens INTEGER DEFAULT 0,
                 cache_creation_tokens INTEGER DEFAULT 0,
+                cache_ttl_min_secs INTEGER DEFAULT 300,
+                cache_ttl_max_secs INTEGER DEFAULT 300,
+                cache_ttl_source TEXT DEFAULT 'default_5m',
                 output_tokens INTEGER,
                 ttft_ms INTEGER,
                 tool_calls TEXT,
@@ -7562,7 +8021,9 @@ mod tests {
                 frustration_signals INTEGER DEFAULT 0,
                 requested_model TEXT,
                 actual_model TEXT,
-                response_summary TEXT
+                response_summary TEXT,
+                response_error_type TEXT,
+                response_error_message TEXT
             );
             CREATE TABLE tool_outcomes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -7706,6 +8167,14 @@ mod tests {
             "messages": []
         });
         assert_eq!(request_cache_ttl_secs(&one_hour), Some(3600));
+        assert_eq!(
+            request_cache_ttl_evidence(&one_hour),
+            Some(CacheTtlEvidence {
+                min_secs: 3600,
+                max_secs: 3600,
+                source: "request_cache_control",
+            })
+        );
 
         let mixed = serde_json::json!({
             "system": [
@@ -7729,6 +8198,14 @@ mod tests {
             ]
         });
         assert_eq!(request_cache_ttl_secs(&mixed), Some(300));
+        assert_eq!(
+            request_cache_ttl_evidence(&mixed),
+            Some(CacheTtlEvidence {
+                min_secs: 300,
+                max_secs: 3600,
+                source: "request_cache_control",
+            })
+        );
     }
 
     #[test]
@@ -7857,45 +8334,132 @@ mod tests {
     }
 
     #[test]
+    fn cache_hit_rebuild_estimate_uses_one_hour_ttl_evidence() {
+        let mut acc = ResponseAccumulator::new();
+        acc.input_tokens = 1_000_000;
+        acc.cache_read_tokens = 1_000_000;
+        let five_minute = CacheTtlEvidence::default_5m();
+        let one_hour = CacheTtlEvidence {
+            min_secs: 3600,
+            max_secs: 3600,
+            source: "request_cache_control",
+        };
+
+        let estimate_5m =
+            estimated_rebuild_cost_for_cache_event(&acc, "claude-sonnet-4-6", &five_minute);
+        let estimate_1h =
+            estimated_rebuild_cost_for_cache_event(&acc, "claude-sonnet-4-6", &one_hour);
+
+        assert!((estimate_5m - 7.5).abs() < 1e-9);
+        assert!((estimate_1h - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn response_accumulator_records_streaming_error_events() {
+        let mut acc = ResponseAccumulator::new();
+        let sse = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"server overloaded\"}}\n\n";
+
+        acc.process_chunk(sse.as_bytes());
+
+        assert_eq!(acc.stream_error_type.as_deref(), Some("overloaded_error"));
+        assert_eq!(
+            acc.stream_error_message.as_deref(),
+            Some("server overloaded")
+        );
+        assert!(acc.has_response_error());
+    }
+
+    #[test]
     fn cache_classification_uses_ttl_and_thresholded_thrash() {
         let now = Instant::now();
 
         let mut tracker = CacheTracker::new();
         assert_eq!(
-            classify_cache_event(&mut tracker, now, 0, 100, 300),
+            classify_cache_event(&mut tracker, now, 0, 100, &CacheTtlEvidence::default_5m()),
             "cold_start"
         );
         assert_eq!(
-            classify_cache_event(&mut tracker, now + Duration::from_secs(20), 80, 0, 300),
+            classify_cache_event(
+                &mut tracker,
+                now + Duration::from_secs(20),
+                80,
+                0,
+                &CacheTtlEvidence::default_5m()
+            ),
             "hit"
         );
 
         let mut tracker = CacheTracker::new();
         assert_eq!(
-            classify_cache_event(&mut tracker, now, 0, 100, 300),
+            classify_cache_event(&mut tracker, now, 0, 100, &CacheTtlEvidence::default_5m()),
             "cold_start"
         );
         assert_eq!(
-            classify_cache_event(&mut tracker, now + Duration::from_secs(10), 0, 100, 300),
+            classify_cache_event(
+                &mut tracker,
+                now + Duration::from_secs(10),
+                0,
+                100,
+                &CacheTtlEvidence::default_5m()
+            ),
             "miss_rebuild"
         );
         assert_eq!(
-            classify_cache_event(&mut tracker, now + Duration::from_secs(20), 0, 100, 300),
+            classify_cache_event(
+                &mut tracker,
+                now + Duration::from_secs(20),
+                0,
+                100,
+                &CacheTtlEvidence::default_5m()
+            ),
             "miss_rebuild"
         );
         assert_eq!(
-            classify_cache_event(&mut tracker, now + Duration::from_secs(30), 0, 100, 300),
+            classify_cache_event(
+                &mut tracker,
+                now + Duration::from_secs(30),
+                0,
+                100,
+                &CacheTtlEvidence::default_5m()
+            ),
             "miss_thrash"
         );
 
         let mut tracker = CacheTracker::new();
         assert_eq!(
-            classify_cache_event(&mut tracker, now, 0, 100, 300),
+            classify_cache_event(&mut tracker, now, 0, 100, &CacheTtlEvidence::default_5m()),
             "cold_start"
         );
         assert_eq!(
-            classify_cache_event(&mut tracker, now + Duration::from_secs(301), 0, 100, 300),
+            classify_cache_event(
+                &mut tracker,
+                now + Duration::from_secs(301),
+                0,
+                100,
+                &CacheTtlEvidence::default_5m()
+            ),
             "miss_ttl"
+        );
+
+        let one_hour = CacheTtlEvidence {
+            min_secs: 3600,
+            max_secs: 3600,
+            source: "request_cache_control",
+        };
+        let mut tracker = CacheTracker::new();
+        assert_eq!(
+            classify_cache_event(&mut tracker, now, 0, 100, &one_hour),
+            "cold_start"
+        );
+        assert_eq!(
+            classify_cache_event(
+                &mut tracker,
+                now + Duration::from_secs(600),
+                0,
+                100,
+                &one_hour
+            ),
+            "miss_rebuild"
         );
     }
 
@@ -7952,6 +8516,22 @@ mod tests {
     }
 
     #[test]
+    fn upstream_adjustment_removes_retired_context_beta_without_model_alias() {
+        let body = br#"{"model":"claude-sonnet-4-6","messages":[]}"#;
+        let existing =
+            vec!["prompt-tools-2025-04-02, context-1m-2025-08-07, fine-grained-tool-streaming-2025-05-14".to_string()];
+
+        let adjustment = upstream_request_adjustment_for_body(&existing, body);
+
+        assert_eq!(
+            adjustment.anthropic_beta.as_deref(),
+            Some("prompt-tools-2025-04-02, fine-grained-tool-streaming-2025-05-14")
+        );
+        assert!(adjustment.remove_anthropic_beta);
+        assert!(adjustment.body.is_none());
+    }
+
+    #[test]
     fn clean_user_prompt_strips_preamble_and_truncates_long_text() {
         let cleaned = clean_user_prompt(
             r#"
@@ -7993,7 +8573,7 @@ mod tests {
             Some("raw-value")
         );
         assert_eq!(extract_headers(&headers, "missing"), Vec::<String>::new());
-        assert!(request_uses_1m_context(&headers));
+        assert!(!request_uses_1m_context(&headers));
         assert!(model_requests_1m_context("claude-sonnet[1m]"));
         assert_eq!(
             infer_context_window_tokens(Some("sonnet"), None, 200_001, 0, 0),
@@ -9061,6 +9641,7 @@ mod tests {
             billed_cost_dollars: Some(10.25),
             billed_sessions: 1,
             cache_hit_ratio: 0.5,
+            total_input_cache_rate: 0.2,
         };
         let week = SummaryWindowData {
             sessions: 3,
@@ -9070,6 +9651,7 @@ mod tests {
             billed_cost_dollars: None,
             billed_sessions: 0,
             cache_hit_ratio: 0.25,
+            total_input_cache_rate: 0.1,
         };
         let month = SummaryWindowData {
             sessions: 4,
@@ -9079,6 +9661,7 @@ mod tests {
             billed_cost_dollars: Some(18.0),
             billed_sessions: 2,
             cache_hit_ratio: 0.75,
+            total_input_cache_rate: 0.3,
         };
         let expected_source = pricing::active_catalog_source();
         let json = build_summary_response_json(&today, &week, &month);
@@ -9449,6 +10032,9 @@ mod tests {
                     input_tokens: 100,
                     cache_read_tokens: 50,
                     cache_creation_tokens: 10,
+                    cache_ttl_min_secs: 300,
+                    cache_ttl_max_secs: 300,
+                    cache_ttl_source: "default_5m".to_string(),
                     output_tokens: 20,
                     ttft_ms: 100,
                     tool_calls: vec![],
@@ -9460,6 +10046,8 @@ mod tests {
                     requested_model: None,
                     actual_model: None,
                     response_summary: None,
+                    response_error_type: None,
+                    response_error_message: None,
                 },
                 diagnosis::TurnSnapshot {
                     turn_number: 2,
@@ -9467,6 +10055,9 @@ mod tests {
                     input_tokens: 200,
                     cache_read_tokens: 100,
                     cache_creation_tokens: 0,
+                    cache_ttl_min_secs: 300,
+                    cache_ttl_max_secs: 300,
+                    cache_ttl_source: "default_5m".to_string(),
                     output_tokens: 30,
                     ttft_ms: 120,
                     tool_calls: vec![],
@@ -9478,6 +10069,8 @@ mod tests {
                     requested_model: None,
                     actual_model: None,
                     response_summary: None,
+                    response_error_type: None,
+                    response_error_message: None,
                 },
             ],
         );
@@ -9648,18 +10241,20 @@ mod tests {
     }
 
     #[test]
-    fn request_uses_1m_context_detects_anthropic_beta_header() {
+    fn retired_context_beta_header_does_not_expand_context_window() {
         let headers = make_http_headers(&[(
             "anthropic-beta",
             "prompt-tools-2025-04-02, context-1m-2025-08-07",
         )]);
 
-        assert!(request_uses_1m_context(&headers));
+        assert!(!request_uses_1m_context(&headers));
+        assert_eq!(request_context_window_hint_from_headers(&headers), None);
         assert_eq!(
-            resolve_context_window_tokens(
-                Some(EXTENDED_CONTEXT_WINDOW_TOKENS),
-                "claude-sonnet-4-6"
-            ),
+            resolve_context_window_tokens(None, "claude-haiku-4-5"),
+            STANDARD_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            resolve_context_window_tokens(None, "claude-sonnet-4-6"),
             EXTENDED_CONTEXT_WINDOW_TOKENS
         );
     }
@@ -9862,6 +10457,126 @@ mod tests {
     }
 
     #[test]
+    fn degradation_view_uses_stored_one_hour_cache_ttl_evidence() {
+        let conn = create_full_test_db();
+        let ended_at =
+            epoch_to_iso8601(now_epoch_secs().saturating_sub(session_timeout_secs() + 3_600));
+        insert_session(
+            &conn,
+            "session-1h-ttl",
+            &ended_at,
+            Some(&ended_at),
+            "claude-sonnet",
+            Some("keep long cache warm"),
+        );
+        insert_turn_snapshot(
+            &conn,
+            "session-1h-ttl",
+            1,
+            &ended_at,
+            0,
+            1000,
+            1000,
+            0.0,
+            0.10,
+            None,
+        );
+        insert_turn_snapshot(
+            &conn,
+            "session-1h-ttl",
+            2,
+            &ended_at,
+            0,
+            1000,
+            1200,
+            600.0,
+            0.15,
+            Some("Full cache rebuild after ten minutes"),
+        );
+        conn.execute(
+            "UPDATE turn_snapshots \
+             SET cache_ttl_min_secs = 3600, cache_ttl_max_secs = 3600, cache_ttl_source = 'request_cache_control' \
+             WHERE session_id = 'session-1h-ttl'",
+            [],
+        )
+        .expect("set ttl evidence");
+
+        let json =
+            load_degradation_view_from_db(&conn, "session-1h-ttl").expect("degradation view");
+        let flags = json
+            .pointer("/turns/1/flags")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        assert!(!flags
+            .iter()
+            .any(|flag| flag.as_str() == Some("cache_miss_ttl")));
+        assert!(flags
+            .iter()
+            .any(|flag| flag.as_str() == Some("cache_miss_inferred_rebuild")));
+    }
+
+    #[test]
+    fn cache_rebuilds_api_uses_stored_ttl_evidence() {
+        let conn = create_full_test_db();
+        let now = now_epoch_secs();
+        let timestamp = epoch_to_iso8601(now.saturating_sub(60));
+        insert_session(
+            &conn,
+            "session-cache-rebuilds",
+            &timestamp,
+            Some(&timestamp),
+            "claude-sonnet",
+            None,
+        );
+        insert_turn_snapshot(
+            &conn,
+            "session-cache-rebuilds",
+            1,
+            &timestamp,
+            0,
+            1000,
+            1000,
+            0.0,
+            0.10,
+            None,
+        );
+        insert_turn_snapshot(
+            &conn,
+            "session-cache-rebuilds",
+            2,
+            &timestamp,
+            0,
+            1000,
+            1000,
+            600.0,
+            0.10,
+            None,
+        );
+        conn.execute(
+            "UPDATE turn_snapshots \
+             SET cache_ttl_min_secs = 3600, cache_ttl_max_secs = 3600, cache_ttl_source = 'request_cache_control' \
+             WHERE session_id = 'session-cache-rebuilds'",
+            [],
+        )
+        .expect("set ttl evidence");
+
+        let json = build_cache_rebuilds_response_from_db(&conn, 7, now).expect("cache rebuilds");
+
+        assert_eq!(
+            json.get("rebuilds_from_idle_gaps")
+                .and_then(|value| value.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            json.get("rebuilds_without_idle_gap")
+                .and_then(|value| value.as_u64()),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn repair_clears_degradation_turn_for_non_degraded_sessions() {
         let conn = create_full_test_db();
         let ended_at =
@@ -9907,6 +10622,9 @@ mod tests {
             session_id: "session_1".to_string(),
             event_type: "miss_ttl".to_string(),
             cache_expires_at_epoch: Some(1_776_700_000),
+            cache_expires_at_latest_epoch: None,
+            cache_ttl_source: Some("request_cache_control".to_string()),
+            cache_ttl_mixed: None,
             estimated_rebuild_cost_dollars: Some(0.24),
         })
         .expect("serialize cache event");

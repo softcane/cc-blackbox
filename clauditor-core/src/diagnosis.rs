@@ -50,6 +50,9 @@ pub struct TurnSnapshot {
     pub input_tokens: u32,
     pub cache_read_tokens: u32,
     pub cache_creation_tokens: u32,
+    pub cache_ttl_min_secs: u64,
+    pub cache_ttl_max_secs: u64,
+    pub cache_ttl_source: String,
     pub output_tokens: u32,
     pub ttft_ms: u64,
     pub tool_calls: Vec<String>,
@@ -61,6 +64,8 @@ pub struct TurnSnapshot {
     pub requested_model: Option<String>,
     pub actual_model: Option<String>,
     pub response_summary: Option<String>,
+    pub response_error_type: Option<String>,
+    pub response_error_message: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,7 +119,9 @@ pub struct DiagnosisReport {
     pub estimated_total_cost_dollars: f64,
     pub cost_source: String,
     pub trusted_for_budget_enforcement: bool,
+    pub cache_reusable_prefix_ratio: f64,
     pub cache_hit_ratio: f64,
+    pub total_input_cache_rate: f64,
     pub degraded: bool,
     pub degradation_turn: Option<u32>,
     pub causes: Vec<DegradationCause>,
@@ -140,6 +147,97 @@ fn is_compaction_pair(prev: &TurnSnapshot, current: &TurnSnapshot) -> bool {
     let ratio =
         (current.input_tokens as f64 - prev.input_tokens as f64).abs() / prev.input_tokens as f64;
     ratio < 0.10
+}
+
+fn cache_ttl_min_secs(turn: &TurnSnapshot) -> u64 {
+    turn.cache_ttl_min_secs.max(1)
+}
+
+fn cache_ttl_max_secs(turn: &TurnSnapshot) -> u64 {
+    turn.cache_ttl_max_secs.max(cache_ttl_min_secs(turn))
+}
+
+fn is_cache_cause(cause_type: &str) -> bool {
+    matches!(cause_type, "cache_miss_ttl" | "cache_miss_thrash")
+}
+
+fn cause_counts_as_degradation(cause: &DegradationCause) -> bool {
+    !cause.is_heuristic || is_cache_cause(&cause.cause_type) || cause.cause_type == "api_error"
+}
+
+fn cache_creation_rebuild_buckets_for_turn(turn: &TurnSnapshot) -> (u64, u64) {
+    let tokens = turn.cache_creation_tokens as u64;
+    if tokens == 0 {
+        return (0, 0);
+    }
+
+    if cache_ttl_max_secs(turn) >= 3600 {
+        // Turn snapshots retain TTL evidence, not exact response bucket splits.
+        // If evidence says the cache was 1h or mixed 5m/1h, use the 1h write
+        // rate as the conservative rebuild estimate instead of underpricing it
+        // as a 5m cache.
+        (0, tokens)
+    } else {
+        (tokens, 0)
+    }
+}
+
+fn estimate_cache_rebuild_waste_for_turn(model: &str, turn: &TurnSnapshot) -> f64 {
+    let (cache_create_5m, cache_create_1h) = cache_creation_rebuild_buckets_for_turn(turn);
+    crate::pricing::estimate_cache_rebuild_waste_dollars_with_cache_buckets(
+        model,
+        cache_create_5m,
+        cache_create_1h,
+    )
+    .total_cost_dollars
+}
+
+fn api_error_cause(turn: &TurnSnapshot) -> Option<DegradationCause> {
+    let error_type = turn.response_error_type.as_deref()?;
+    let message = turn
+        .response_error_message
+        .as_deref()
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or("stream ended with an API error");
+    Some(DegradationCause {
+        turn_first_noticed: turn.turn_number,
+        cause_type: "api_error".to_string(),
+        detail: format!(
+            "Claude API streaming error at turn {} ({}): {}",
+            turn.turn_number, error_type, message
+        ),
+        estimated_cost: 0.0,
+        is_heuristic: false,
+        requested_model: None,
+        actual_model: None,
+    })
+}
+
+fn prioritized_advice(causes: &[DegradationCause]) -> Vec<String> {
+    let priority = [
+        "api_error",
+        "model_fallback",
+        "compaction_suspected",
+        "near_compaction",
+        "cache_miss_ttl",
+        "cache_miss_thrash",
+        "context_bloat",
+        "tool_failure_streak",
+        "harness_pressure",
+    ];
+    let mut advice: Vec<String> = Vec::new();
+    for cause_type in &priority {
+        if advice.len() >= 3 {
+            break;
+        }
+        if let Some(cause) = causes.iter().find(|c| c.cause_type == *cause_type) {
+            let a = advice_for_cause(cause);
+            if !a.is_empty() && !advice.contains(&a) {
+                advice.push(a);
+            }
+        }
+    }
+    advice
 }
 
 /// Detect a compaction-loop signature ending at `end_idx`.
@@ -227,10 +325,31 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
     } else {
         0.0
     };
+    let total_input_side_tokens: u64 = turns
+        .iter()
+        .map(|t| {
+            t.input_tokens as u64 + t.cache_read_tokens as u64 + t.cache_creation_tokens as u64
+        })
+        .sum();
+    let total_input_cache_rate = if total_input_side_tokens > 0 {
+        total_cache_read as f64 / total_input_side_tokens as f64
+    } else {
+        0.0
+    };
 
     // Short sessions: skip analysis.
     if total_turns < 3 {
         let outcome = determine_outcome(turns);
+        let causes = turns
+            .iter()
+            .filter_map(api_error_cause)
+            .take(1)
+            .collect::<Vec<_>>();
+        let degraded = causes.iter().any(cause_counts_as_degradation);
+        let degradation_turn = degraded
+            .then(|| causes.first().map(|cause| cause.turn_first_noticed))
+            .flatten();
+        let advice = prioritized_advice(&causes);
         return DiagnosisReport {
             session_id: session_id.to_string(),
             outcome: outcome.to_string(),
@@ -239,11 +358,13 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
             estimated_total_cost_dollars: total_cost,
             cost_source: cost_source.clone(),
             trusted_for_budget_enforcement,
+            cache_reusable_prefix_ratio: cache_hit_ratio,
             cache_hit_ratio,
-            degraded: false,
-            degradation_turn: None,
-            causes: vec![],
-            advice: vec![],
+            total_input_cache_rate,
+            degraded,
+            degradation_turn,
+            causes,
+            advice,
         };
     }
 
@@ -265,10 +386,12 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
 
     // Check each turn for degradation signals.
     for (i, turn) in turns.iter().enumerate() {
-        // CAUSE: cache_miss_ttl
+        // CAUSE: cache_miss_ttl. Anthropic does not expose the exact cache
+        // miss reason, so this remains a local inference even when the idle
+        // gap exceeds all TTL evidence we captured.
         if turn.cache_creation_tokens > 0
             && turn.cache_read_tokens == 0
-            && turn.gap_from_prev_secs > 300.0
+            && turn.gap_from_prev_secs > cache_ttl_max_secs(turn) as f64
         {
             let prev_ttft = if i > 0 { turns[i - 1].ttft_ms } else { 0 };
             let ttl_model = turn
@@ -280,19 +403,26 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                 turn_first_noticed: turn.turn_number,
                 cause_type: "cache_miss_ttl".to_string(),
                 detail: format!(
-                    "Cache expired at turn {} \u{2014} {:.0}min gap between turns. Turn duration jumped from {}ms to {}ms.",
-                    turn.turn_number, turn.gap_from_prev_secs / 60.0, prev_ttft, turn.ttft_ms
+                    "Inferred cache TTL miss at turn {}: {:.0}min gap exceeded observed TTL evidence ({}s). Turn duration jumped from {}ms to {}ms.",
+                    turn.turn_number,
+                    turn.gap_from_prev_secs / 60.0,
+                    cache_ttl_max_secs(turn),
+                    prev_ttft,
+                    turn.ttft_ms
                 ),
-                estimated_cost: crate::pricing::estimate_cache_rebuild_waste_dollars(
-                    ttl_model,
-                    turn.cache_creation_tokens as u64,
-                )
-                .total_cost_dollars,
-                is_heuristic: false,
+                estimated_cost: estimate_cache_rebuild_waste_for_turn(ttl_model, turn),
+                is_heuristic: true,
                 requested_model: None,
                 actual_model: None,
             });
             set_degradation(turn.turn_number);
+        }
+
+        if !causes.iter().any(|c| c.cause_type == "api_error") {
+            if let Some(cause) = api_error_cause(turn) {
+                causes.push(cause);
+                set_degradation(turn.turn_number);
+            }
         }
 
         // CAUSE: cache_miss_thrash — tracked via counter, fires at 3+ consecutive misses.
@@ -414,7 +544,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
             let is_full_miss = turn.turn_number > 1
                 && turn.cache_creation_tokens > 0
                 && turn.cache_read_tokens == 0
-                && turn.gap_from_prev_secs <= 300.0;
+                && turn.gap_from_prev_secs <= cache_ttl_min_secs(turn) as f64;
             if is_full_miss {
                 if consecutive_misses == 0 {
                     thrash_start = turn.turn_number;
@@ -441,26 +571,22 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                                 .as_deref()
                                 .or(t.requested_model.as_deref())
                                 .unwrap_or("sonnet");
-                            crate::pricing::estimate_cache_rebuild_waste_dollars(
-                                thrash_model,
-                                t.cache_creation_tokens as u64,
-                            )
-                            .total_cost_dollars
+                            estimate_cache_rebuild_waste_for_turn(thrash_model, t)
                         })
                         .sum();
                     causes.push(DegradationCause {
                         turn_first_noticed: thrash_start,
                         cause_type: "cache_miss_thrash".to_string(),
                         detail: format!(
-                            "{} consecutive cache rebuilds (turns {}\u{2013}{}) within TTL. \
-                             ~{}K tokens wasted. Check if CLAUDE.md, hooks, or MCP config changed.",
+                            "Inferred cache thrash: {} consecutive cache rebuilds (turns {}\u{2013}{}) within observed TTL evidence. \
+                             ~{}K tokens wasted. Check if CLAUDE.md, hooks, MCP config, prompts, tools, or images changed.",
                             consecutive_misses,
                             thrash_start,
                             turn.turn_number,
                             wasted / 1000
                         ),
                         estimated_cost,
-                        is_heuristic: false,
+                        is_heuristic: true,
                         requested_model: None,
                         actual_model: None,
                     });
@@ -541,32 +667,11 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
         }
     }
 
-    let degraded = causes.iter().any(|cause| !cause.is_heuristic)
+    let degraded = causes.iter().any(cause_counts_as_degradation)
         || matches!(outcome, TaskOutcome::CompactionSuspected);
 
     // Generate advice — deduplicated, max 3, prioritized.
-    let priority = [
-        "model_fallback",
-        "compaction_suspected",
-        "near_compaction",
-        "cache_miss_ttl",
-        "cache_miss_thrash",
-        "context_bloat",
-        "tool_failure_streak",
-        "harness_pressure",
-    ];
-    let mut advice: Vec<String> = Vec::new();
-    for cause_type in &priority {
-        if advice.len() >= 3 {
-            break;
-        }
-        if let Some(cause) = causes.iter().find(|c| c.cause_type == *cause_type) {
-            let a = advice_for_cause(cause);
-            if !a.is_empty() && !advice.contains(&a) {
-                advice.push(a);
-            }
-        }
-    }
+    let advice = prioritized_advice(&causes);
 
     let degradation_turn = if degraded { degradation_turn } else { None };
 
@@ -578,7 +683,9 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
         estimated_total_cost_dollars: total_cost,
         cost_source,
         trusted_for_budget_enforcement,
+        cache_reusable_prefix_ratio: cache_hit_ratio,
         cache_hit_ratio,
+        total_input_cache_rate,
         degraded,
         degradation_turn,
         causes,
@@ -619,8 +726,9 @@ fn determine_outcome(turns: &[TurnSnapshot]) -> TaskOutcome {
 
 fn advice_for_cause(cause: &DegradationCause) -> String {
     match cause.cause_type.as_str() {
-        "cache_miss_ttl" => "Cache expired from idle gap > 5 min. Send a message before the TTL to keep it warm.".to_string(),
-        "cache_miss_thrash" => "Full cache rebuilds within 5 min. Check if CLAUDE.md, hooks, or MCP config changed mid-session.".to_string(),
+        "cache_miss_ttl" => "Cache likely expired after an idle gap beyond the observed TTL evidence. Send a message before the shown TTL countdown elapses to keep it warm.".to_string(),
+        "cache_miss_thrash" => "Full cache rebuilds within the observed TTL. Check whether prompts, tools, images, CLAUDE.md, hooks, or MCP config changed mid-session.".to_string(),
+        "api_error" => "The API returned a streaming error. Treat this turn as failed and retry after fixing the reported provider-side error.".to_string(),
         "context_bloat" => "Point Claude at specific functions, not whole files.".to_string(),
         "model_fallback" => {
             let actual = cause
@@ -674,6 +782,9 @@ mod tests {
             input_tokens,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            cache_ttl_min_secs: 300,
+            cache_ttl_max_secs: 300,
+            cache_ttl_source: "default_5m".to_string(),
             output_tokens,
             ttft_ms: 1000,
             tool_calls: vec![],
@@ -685,6 +796,8 @@ mod tests {
             requested_model: None,
             actual_model: None,
             response_summary: None,
+            response_error_type: None,
+            response_error_message: None,
         }
     }
 
@@ -790,6 +903,40 @@ mod tests {
             .expect("cache TTL cause");
         assert_eq!(cause.turn_first_noticed, 2);
         assert!(cause.estimated_cost > 0.0);
+        assert!(cause.is_heuristic);
+    }
+
+    #[test]
+    fn analyze_session_prices_one_hour_cache_ttl_miss_with_one_hour_rate() {
+        let mut turns = vec![
+            snapshot(1, 10_000, 500, 0.0, 0.20),
+            snapshot(2, 11_000, 600, 3700.0, 0.22),
+            snapshot(3, 9_000, 400, 10.0, 0.18),
+        ];
+        turns[0].tool_calls = vec!["Edit".to_string()];
+        turns[1].tool_calls = vec!["Bash".to_string()];
+        turns[1].cache_creation_tokens = 1_000_000;
+        turns[1].cache_ttl_min_secs = 3600;
+        turns[1].cache_ttl_max_secs = 3600;
+        turns[1].cache_ttl_source = "request_cache_control".to_string();
+        turns[2].tool_calls = vec!["Bash".to_string()];
+
+        let report = analyze_session("session-cache-ttl-1h", &turns);
+        let cause = report
+            .causes
+            .iter()
+            .find(|cause| cause.cause_type == "cache_miss_ttl")
+            .expect("cache TTL cause");
+
+        assert!((cause.estimated_cost - 5.70).abs() < 1e-9);
+        assert!(report
+            .advice
+            .iter()
+            .any(|advice| advice.contains("observed TTL")));
+        assert!(!report
+            .advice
+            .iter()
+            .any(|advice| advice.contains("> 5 min")));
     }
 
     #[test]
@@ -821,6 +968,105 @@ mod tests {
             .expect("cache thrash cause");
         assert_eq!(cause.turn_first_noticed, 2);
         assert!(cause.detail.contains("3 consecutive cache rebuilds"));
+        assert!(cause.is_heuristic);
+    }
+
+    #[test]
+    fn analyze_session_prices_one_hour_cache_thrash_with_one_hour_rate() {
+        let mut turns = vec![
+            snapshot(1, 10_000, 500, 0.0, 0.20),
+            snapshot(2, 11_000, 600, 600.0, 0.22),
+            snapshot(3, 12_000, 700, 600.0, 0.24),
+            snapshot(4, 13_000, 800, 600.0, 0.26),
+            snapshot(5, 9_000, 400, 10.0, 0.18),
+        ];
+        turns[0].tool_calls = vec!["Edit".to_string()];
+        for turn in turns.iter_mut().skip(1) {
+            turn.tool_calls = vec!["Bash".to_string()];
+            turn.cache_ttl_min_secs = 3600;
+            turn.cache_ttl_max_secs = 3600;
+            turn.cache_ttl_source = "request_cache_control".to_string();
+        }
+        for turn in turns.iter_mut().take(4).skip(1) {
+            turn.cache_creation_tokens = 1_000_000;
+            turn.cache_read_tokens = 0;
+        }
+
+        let report = analyze_session("session-cache-thrash-1h", &turns);
+        let cause = report
+            .causes
+            .iter()
+            .find(|cause| cause.cause_type == "cache_miss_thrash")
+            .expect("cache thrash cause");
+
+        assert!((cause.estimated_cost - 17.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn analyze_session_reports_streaming_api_error() {
+        let mut turns = vec![
+            snapshot(1, 10_000, 500, 0.0, 0.20),
+            snapshot(2, 11_000, 600, 10.0, 0.22),
+            snapshot(3, 9_000, 400, 10.0, 0.18),
+        ];
+        turns[0].tool_calls = vec!["Edit".to_string()];
+        turns[1].tool_calls = vec!["Bash".to_string()];
+        turns[1].response_error_type = Some("overloaded_error".to_string());
+        turns[1].response_error_message = Some("server overloaded".to_string());
+        turns[2].tool_calls = vec!["Bash".to_string()];
+
+        let report = analyze_session("session-api-error", &turns);
+
+        assert!(report.degraded);
+        assert_eq!(report.degradation_turn, Some(2));
+        let cause = report
+            .causes
+            .iter()
+            .find(|cause| cause.cause_type == "api_error")
+            .expect("api error cause");
+        assert!(cause.detail.contains("overloaded_error"));
+        assert!(!cause.is_heuristic);
+    }
+
+    #[test]
+    fn analyze_session_reports_api_error_for_short_session() {
+        let mut turns = vec![snapshot(1, 10_000, 500, 0.0, 0.20)];
+        turns[0].response_error_type = Some("overloaded_error".to_string());
+        turns[0].response_error_message = Some("server overloaded".to_string());
+
+        let report = analyze_session("session-short-api-error", &turns);
+
+        assert!(report.degraded);
+        assert_eq!(report.degradation_turn, Some(1));
+        assert_eq!(report.causes.len(), 1);
+        assert_eq!(report.causes[0].cause_type, "api_error");
+        assert!(report
+            .advice
+            .iter()
+            .any(|advice| advice.contains("streaming error")));
+    }
+
+    #[test]
+    fn analyze_session_respects_one_hour_cache_ttl_evidence() {
+        let mut turns = vec![
+            snapshot(1, 10_000, 500, 0.0, 0.20),
+            snapshot(2, 11_000, 600, 600.0, 0.22),
+            snapshot(3, 9_000, 400, 10.0, 0.18),
+        ];
+        turns[0].tool_calls = vec!["Edit".to_string()];
+        turns[1].tool_calls = vec!["Bash".to_string()];
+        turns[1].cache_creation_tokens = 25_000;
+        turns[1].cache_ttl_min_secs = 3600;
+        turns[1].cache_ttl_max_secs = 3600;
+        turns[1].cache_ttl_source = "request_cache_control".to_string();
+        turns[2].tool_calls = vec!["Bash".to_string()];
+
+        let report = analyze_session("session-cache-1h", &turns);
+
+        assert!(!report
+            .causes
+            .iter()
+            .any(|cause| cause.cause_type == "cache_miss_ttl"));
     }
 
     #[test]

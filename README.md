@@ -45,7 +45,7 @@ Watched sessions print a redacted postmortem automatically when they end. You ca
 ## Token And Cost Impact
 - Total tokens: 214k
 - Estimated likely waste: 76k tokens, $1.84
-- Caveat: costs are estimates, not billing truth.
+- Caveat: costs are estimates, not billing truth. Built-in pricing may exclude contract discounts, data residency, fast-mode modifiers, and server-tool charges unless you reconcile billed costs.
 
 ## Claude Analysis
 This session likely went bad because Claude lost the useful cached context, rebuilt a large prompt, and then repeated edits while near compaction. Start fresh with the final summary and ask for one file-level change at a time.
@@ -129,7 +129,7 @@ Clauditor is designed to be safe to try because it stays local and is easy to st
 - **Claude Code still talks to Anthropic:** Normal Claude Code API requests still go to Anthropic, exactly as they would without Clauditor.
 - **No full transcript storage:** By default, Clauditor stores a cleaned first prompt and compact final summary for recall. It does not persist full conversation history, raw file contents, or raw tool payloads.
 - **It fails open:** If the observability service stops, Claude Code traffic can keep going.
-- **Estimates are estimates:** Cost, compaction runway, cache rebuild cost, and diagnosis are best-effort signals, not billing truth.
+- **Estimates are estimates:** Cost, compaction runway, cache rebuild cost, cache miss causes, and diagnosis are best-effort signals, not billing truth or provider-confirmed root cause.
 
 ## What Clauditor Surfaces
 

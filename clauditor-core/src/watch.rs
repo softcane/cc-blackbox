@@ -45,12 +45,21 @@ pub enum WatchEvent {
     },
     CacheEvent {
         session_id: String,
-        event_type: String, // "hit" | "partial" | "cold_start" | "miss_rebuild" | "miss_ttl" | "miss_thrash"
+        event_type: String, // "hit" | "partial" | "cold_start" | "miss_rebuild" | "miss_ttl" | "miss_thrash"; miss causes are inferred locally.
         /// Unix-epoch seconds at which the cache TTL expires if no further
         /// request refreshes it. The orchestrator counts down from here so
         /// users see how long they have to stay warm.
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_expires_at_epoch: Option<u64>,
+        /// Latest possible expiry when a mixed 5m/1h cache is observed. The
+        /// primary expiry remains the earliest known expiry so countdowns stay
+        /// conservative.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_expires_at_latest_epoch: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_ttl_source: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_ttl_mixed: Option<bool>,
         /// Estimated dollars it would cost to rebuild the cache from scratch
         /// if the TTL elapses. Uses exact cache-creation buckets when the
         /// response exposes them, otherwise falls back to a local estimate.
@@ -99,6 +108,11 @@ pub enum WatchEvent {
         session_id: String,
         idle_secs: u64,
         ttl_secs: u64,
+    },
+    RequestError {
+        session_id: String,
+        error_type: String,
+        message: String,
     },
     /// Anthropic routed the request to a different model than the user asked
     /// for. This does not assert the cause unless separate quota evidence is

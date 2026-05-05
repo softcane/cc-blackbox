@@ -342,6 +342,14 @@ fn builtin_pricing(model: &str) -> ModelPricing {
             cache_write_5m: 1.25,
             cache_write_1h: 2.0,
         }
+    } else if model.contains("claude-3-haiku") || model.contains("haiku-3") {
+        ModelPricing {
+            input: 0.25,
+            output: 1.25,
+            cache_read: 0.025,
+            cache_write_5m: 0.3125,
+            cache_write_1h: 0.50,
+        }
     } else if model.contains("haiku") {
         ModelPricing {
             input: 0.80,
@@ -359,6 +367,14 @@ fn builtin_pricing(model: &str) -> ModelPricing {
             cache_write_1h: 6.0,
         }
     }
+}
+
+pub fn pricing_caveats() -> Vec<&'static str> {
+    vec![
+        "Estimated costs are local calculations, not authoritative billing records.",
+        "Built-in pricing does not account for contract discounts, data residency, fast-mode modifiers, or server-tool charges unless a trusted pricing catalog or billed reconciliation supplies them.",
+        "Local quota burn remains separate from provider rate-limit headers.",
+    ]
 }
 
 #[cfg(test)]
@@ -444,6 +460,13 @@ cache_create = 2.45
         assert_eq!(haiku.pricing.cache_read, 0.10);
         assert_eq!(haiku.pricing.cache_write_5m, 1.25);
         assert_eq!(haiku.pricing.cache_write_1h, 2.0);
+
+        let haiku_3 = PricingCatalog::builtin().resolve("claude-3-haiku-20240307");
+        assert_eq!(haiku_3.pricing.input, 0.25);
+        assert_eq!(haiku_3.pricing.output, 1.25);
+        assert_eq!(haiku_3.pricing.cache_read, 0.025);
+        assert_eq!(haiku_3.pricing.cache_write_5m, 0.3125);
+        assert_eq!(haiku_3.pricing.cache_write_1h, 0.50);
     }
 
     #[test]

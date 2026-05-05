@@ -1,14 +1,14 @@
 # Clauditor
 
-**Clauditor gives you a redacted postmortem when Claude Code gets slow, stuck, expensive, or weird.**
+Claude Code sessions sometimes go bad in ways that are hard to explain after the fact. A run gets slow, repeats tool calls, loses cache, nears compaction, routes to a different model, or burns far more tokens than expected. By the time you notice, the terminal scrollback rarely tells you what actually happened.
 
-Run Claude Code through Clauditor and, when the session ends, get a compact report that explains the likely cause, evidence, confidence, token/cost impact, and the next action. The live watcher and Grafana dashboard are still there, but the first useful thing is the postmortem.
+Clauditor runs Claude Code through a local proxy and gives you a redacted postmortem for the session. It tells you the likely cause, the evidence behind it, the token and cost impact, and the next action worth taking. Live watch and Grafana are there when you need them, but the main output is simple: a useful postmortem when the run ends.
 
-Clauditor runs on your machine. It does not phone home and does not send Clauditor telemetry to a hosted service. Claude Code still sends its normal API traffic to Anthropic, exactly as it would without Clauditor, but no additional observability data leaves your machine/network.
+The proxy, database, metrics, dashboard, and CLI run on your machine. Clauditor does not send telemetry to a hosted Clauditor service. Claude Code API traffic is proxied to Anthropic, and Claude-assisted postmortems ask Claude to analyze redacted evidence unless you disable that step.
 
 ![demo](docs/demo.gif)
 
-## First Aha: The Postmortem
+## Postmortem
 
 ```bash
 clauditor run claude --watch
@@ -26,9 +26,12 @@ Watched sessions print a redacted postmortem automatically when they end. You ca
 - Status: redacted
 - Outcome: degraded
 - Model: claude-opus-4
+- Started: 2026-05-05T14:03:10Z
+- Ended: 2026-05-05T14:21:18Z
 - Duration: 18m
-- Turns: 7, tokens: 214k
+- Turns: 7, tokens: 214K
 - Initial prompt: Initial prompt captured (redacted, 12 words).
+- Final response: Final response summary captured (redacted, 27 words).
 
 ## Likely Cause
 - Cause: repeated tool loop after cache rebuild
@@ -37,21 +40,45 @@ Watched sessions print a redacted postmortem automatically when they end. You ca
 - Next action: restart with a shorter prompt and the generated summary, then inspect the repeated Read/Edit path first.
 
 ## Evidence
-- [direct] cache: cache miss followed by 62k cache creation tokens
+- [direct] cache: cache miss followed by 62K cache creation tokens
 - [direct] tools: 14 Read/Edit calls against `<path>`
 - [heuristic] context: peaked at 87% full with about 1 turn to compact
 - [direct] model: requested opus, response used sonnet fallback
 
 ## Token And Cost Impact
-- Total tokens: 214k
-- Estimated likely waste: 76k tokens, $1.84
+- Total tokens: 214K (input 88K, cache read 64K, cache create 62K, output 432)
+- Estimated total cost: $4.91 (builtin_model_family_pricing)
+- Estimated likely waste: 76K tokens, $1.84
+- Cache reusable-prefix ratio: 42%
+- Total input cache rate: 36%
+- Context max: 87% full; turns to compact: 1
 - Caveat: costs are estimates, not billing truth. Built-in pricing may exclude contract discounts, data residency, fast-mode modifiers, and server-tool charges unless you reconcile billed costs.
 
+## Timeline Highlights
+- 2026-05-05T14:03:10Z: session_started: Session row created.
+- 2026-05-05T14:17:42Z: turn 6, turn_signal: cache rebuild without long idle gap; context 87% full
+- 2026-05-05T14:21:18Z: session_ended: Degraded
+
+## Recommendations
+- Restart with a shorter prompt and the generated summary.
+- Inspect the repeated Read/Edit path first.
+
+## Caveats
+- This report is generated from local Clauditor SQLite data.
+- Context runway and some degradation causes are heuristics.
+- Redacted output omits raw prompts, absolute paths, query strings, secret-like values, and structured tool payloads.
+
 ## Claude Analysis
-This session likely went bad because Claude lost the useful cached context, rebuilt a large prompt, and then repeated edits while near compaction. Start fresh with the final summary and ask for one file-level change at a time.
+- Likely cause: Claude lost useful cached context, rebuilt a large prompt, and repeated edits while near compaction.
+- Confidence: high, because cache, tool, context, and model evidence all point at the same turn range.
+- What changed the user's decision: restarting is cheaper than continuing the degraded session.
+- Next action: start fresh with the final summary and ask for one file-level change at a time.
+
+## Restart Prompt
+Continue from this summary. Make one file-level change at a time, and inspect the repeated Read/Edit path before editing.
 ```
 
-Claude-assisted synthesis is on by default, using only redacted evidence. For deterministic local-only output, run:
+Claude-assisted synthesis is on by default. It sends only the redacted postmortem JSON to Claude for analysis. For deterministic output without that extra Claude analysis call, run:
 
 ```bash
 clauditor postmortem last --redact --no-analyze-with-claude
@@ -72,8 +99,6 @@ clauditor doctor
 clauditor up
 clauditor run claude --watch
 ```
-
-`clauditor doctor` checks Docker, Docker Compose, Claude Code, tmux, local ports, health endpoints, and environment variables. `clauditor up` starts the local Clauditor stack. `clauditor run claude --watch` routes only that Claude Code process through Clauditor and starts a watcher; it does not permanently modify shell config, shell startup files, or other Claude Code sessions. Claude Code stays in the terminal where you ran it. When tmux is installed, the live watch view opens separately in a detached tmux session and the CLI prints the `tmux attach` command. When the watched Claude process exits, Clauditor prints the final redacted postmortem back in the original terminal.
 
 ## Supporting Workflows
 
@@ -99,13 +124,13 @@ Open Grafana at [http://127.0.0.1:3000/d/clauditor-main](http://127.0.0.1:3000/d
 Live watch output stays compact:
 
 ```text
-session-api      READ     src/routes.rs
-session-api      CACHE    expires in 2m14s · est. rebuild $0.43
-session-worker   CONTEXT  82% full · ~1 turn to auto-compact
-session-auth     ⚠ MODEL ROUTE requested opus, got sonnet
+[session-api]     14:03:11  READ    src/routes.rs
+[session-api]     14:03:13  CACHE   ○ miss (TTL inferred) · expires in 2m14s · est. rebuild $0.43
+[session-worker]  14:04:02  CONTEXT 82% full · ~2 turns to auto-compact
+[session-auth]    14:05:20  ⚠ MODEL ROUTE requested opus, got sonnet
 ```
 
-Replace `session_1776...` and `<session_id>` with real session IDs from `/api/sessions`. Recall searches the cleaned first prompt and compact final summary for each stored session. If you subscribe after a session already started, Clauditor injects a synthetic `SessionStart` so the watcher still gets the session header and cleaned initial prompt.
+Replace `session_1776...` and `<session_id>` with real session IDs from watch output or `/api/sessions`. Recall searches the cleaned first prompt and compact final summary for each stored session. If you subscribe to a known in-progress session after it already started, Clauditor injects a synthetic `SessionStart` so the watcher still gets the session header and cleaned initial prompt.
 
 ## What Clauditor Catches
 
@@ -124,10 +149,10 @@ Replace `session_1776...` and `<session_id>` with real session IDs from `/api/se
 Clauditor is designed to be safe to try because it stays local and is easy to stop using.
 
 - **It runs on your machine:** The local proxy, core service, database, metrics, dashboard, and CLI all run locally.
-- **It does not phone home:** Clauditor does not send observability data to a hosted Clauditor service.
+- **It does not phone home to Clauditor:** Clauditor does not send observability data to a hosted Clauditor service. The default Claude-assisted postmortem asks Claude to analyze redacted evidence; use `--no-analyze-with-claude` for deterministic local markdown.
 - **Ports stay local by default:** Docker Compose binds the published ports to `127.0.0.1`.
-- **Claude Code still talks to Anthropic:** Normal Claude Code API requests still go to Anthropic, exactly as they would without Clauditor.
-- **No full transcript storage:** By default, Clauditor stores a cleaned first prompt and compact final summary for recall. It does not persist full conversation history, raw file contents, or raw tool payloads.
+- **Claude Code still talks to Anthropic:** Claude Code API requests are proxied through local Envoy to `api.anthropic.com`. Clauditor strips `Accept-Encoding` and may adjust retired context-window aliases so response parsing stays reliable.
+- **No full transcript storage:** By default, Clauditor stores request/session metrics, a cleaned first-prompt excerpt, compact response summaries, and tool names/summaries. It does not persist full conversation history or raw file contents.
 - **It fails open:** If the observability service stops, Claude Code traffic can keep going.
 - **Estimates are estimates:** Cost, compaction runway, cache rebuild cost, cache miss causes, and diagnosis are best-effort signals, not billing truth or provider-confirmed root cause.
 

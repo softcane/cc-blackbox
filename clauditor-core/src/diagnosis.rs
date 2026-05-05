@@ -255,7 +255,10 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
 
     let mut degradation_turn: Option<u32> = None;
     let mut set_degradation = |turn: u32| {
-        if degradation_turn.is_none() || turn < degradation_turn.unwrap() {
+        if degradation_turn
+            .map(|existing| turn < existing)
+            .unwrap_or(true)
+        {
             degradation_turn = Some(turn);
         }
     };
@@ -326,8 +329,8 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                         turn_first_noticed: turn.turn_number,
                         cause_type: "model_fallback".to_string(),
                         detail: format!(
-                            "Anthropic routed this from {} to {} at turn {}. \
-                             This usually means the requested tier was unavailable.",
+                        "Anthropic routed this from {} to {} at turn {}. \
+                             This records a model-route mismatch; it does not prove why routing changed.",
                             requested, actual, turn.turn_number
                         ),
                         estimated_cost: 0.0,
@@ -600,7 +603,7 @@ fn determine_outcome(turns: &[TurnSnapshot]) -> TaskOutcome {
     let last_write_idx = turns
         .iter()
         .rposition(|t| t.tool_calls.iter().any(|tc| tc == "Write" || tc == "Edit"))
-        .unwrap();
+        .unwrap_or(0);
 
     // Check if any subsequent turn has no tool failures.
     let has_passing_follow_up = turns[last_write_idx + 1..]
@@ -624,9 +627,9 @@ fn advice_for_cause(cause: &DegradationCause) -> String {
                 .actual_model
                 .as_deref()
                 .map(friendly_model_name)
-                .unwrap_or_else(|| "a fallback model".to_string());
+                .unwrap_or_else(|| "a different model".to_string());
             format!(
-                "Anthropic routed this to {} at turn {}. Check quota on console.anthropic.com and retry when your preferred tier resets.",
+                "Anthropic routed this to {} at turn {}. Retry or explicitly choose a model if this routing changed the result.",
                 actual,
                 cause.turn_first_noticed
             )
@@ -753,7 +756,15 @@ mod tests {
             .expect("model fallback cause");
         assert_eq!(cause.requested_model.as_deref(), Some("claude-opus-4-5"));
         assert_eq!(cause.actual_model.as_deref(), Some("claude-sonnet-4-5"));
-        assert!(report.advice.iter().any(|advice| advice.contains("Sonnet")));
+        assert!(cause.detail.contains("model-route mismatch"));
+        assert!(report
+            .advice
+            .iter()
+            .any(|advice| advice.contains("Anthropic routed this to")));
+        assert!(!report
+            .advice
+            .iter()
+            .any(|advice| advice.to_ascii_lowercase().contains("quota")));
     }
 
     #[test]

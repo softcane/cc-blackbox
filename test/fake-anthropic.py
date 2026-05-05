@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -70,6 +71,18 @@ class Handler(BaseHTTPRequestHandler):
 
         request_text = _request_text(body)
         model = body.get("model") or "claude-sonnet-4-6-20250514"
+        if self.headers.get("accept-encoding"):
+            self._send_json(
+                400,
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "accept-encoding leaked to upstream",
+                    },
+                },
+            )
+            return
         if "[1m]" in str(model).lower():
             self._send_json(
                 400,
@@ -82,20 +95,55 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
-        if "proxy-1m" in request_text and not _has_context_1m_beta(self.headers):
+        if _has_context_1m_beta(self.headers):
             self._send_json(
                 400,
                 {
                     "type": "error",
                     "error": {
                         "type": "invalid_request_error",
-                        "message": "missing context-1m beta header",
+                        "message": "retired context-1m beta header leaked upstream",
                     },
                 },
             )
             return
 
         skill_name, tools, summary = _scenario(body)
+        if "proxy-delayed" in request_text:
+            tools = [("Bash", {"command": "echo proxy-delayed-live"})] + tools
+            summary = f"{summary} with delayed héllo chunk"
+
+        if body.get("stream") is False:
+            self._send_json(
+                200,
+                {
+                    "id": f"msg_fake_{skill_name.replace(':', '_')}",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": f"toolu_fake_{index}",
+                            "name": tool_name,
+                            "input": tool_input,
+                        }
+                        for index, (tool_name, tool_input) in enumerate(tools)
+                    ]
+                    + [{"type": "text", "text": summary}],
+                    "usage": {
+                        "input_tokens": 1200,
+                        "cache_creation_input_tokens": 320,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 220,
+                            "ephemeral_1h_input_tokens": 100,
+                        },
+                        "cache_read_input_tokens": 80,
+                        "output_tokens": 90,
+                    },
+                },
+            )
+            return
 
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
@@ -114,6 +162,10 @@ class Handler(BaseHTTPRequestHandler):
                     "usage": {
                         "input_tokens": 1200,
                         "cache_creation_input_tokens": 320,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 220,
+                            "ephemeral_1h_input_tokens": 100,
+                        },
                         "cache_read_input_tokens": 80,
                         "output_tokens": 0,
                     },
@@ -170,8 +222,18 @@ class Handler(BaseHTTPRequestHandler):
         )
 
         for chunk in chunks:
-            self.wfile.write(_sse(chunk))
+            encoded = _sse(chunk)
+            if "proxy-delayed" in request_text:
+                midpoint = max(1, len(encoded) // 2)
+                self.wfile.write(encoded[:midpoint])
+                self.wfile.flush()
+                time.sleep(0.05)
+                self.wfile.write(encoded[midpoint:])
+            else:
+                self.wfile.write(encoded)
             self.wfile.flush()
+            if "proxy-delayed" in request_text:
+                time.sleep(0.10)
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
         self.close_connection = True

@@ -292,7 +292,7 @@ impl ManagedPane {
 // TmuxOrchestrator
 // ---------------------------------------------------------------------------
 
-/// Last known Anthropic rate-limit snapshot, rendered in the top strip.
+/// Last known local weekly quota/budget snapshot, rendered in the top strip.
 struct RateLimitSummary {
     seconds_to_reset: Option<u64>,
     tokens_used_this_week: Option<u64>,
@@ -723,7 +723,7 @@ impl TmuxOrchestrator {
                         println!(
                             "{}",
                             format!(
-                                "{}\u{26a0}  fallback: requested {}, got {}",
+                                "{}\u{26a0}  routed: requested {}, got {}",
                                 name_indent, req, actual
                             )
                             .yellow()
@@ -951,7 +951,7 @@ impl TmuxOrchestrator {
         }
 
         let mut stream = resp.bytes_stream();
-        let mut line_buffer = String::new();
+        let mut line_buffer = Vec::new();
         let mut data_buffer = String::new();
 
         // Tick so the orchestrator re-renders even when the SSE stream is
@@ -968,14 +968,15 @@ impl TmuxOrchestrator {
                         Some(Err(e)) => return Err(e.into()),
                         None => break,
                     };
-                    let text = String::from_utf8_lossy(&chunk);
-                    line_buffer.push_str(&text);
+                    line_buffer.extend_from_slice(&chunk);
 
-                    while let Some(newline_pos) = line_buffer.find('\n') {
-                        let line = line_buffer[..newline_pos]
-                            .trim_end_matches('\r')
-                            .to_string();
-                        line_buffer = line_buffer[newline_pos + 1..].to_string();
+                    while let Some(newline_pos) = line_buffer.iter().position(|byte| *byte == b'\n') {
+                        let line_bytes = line_buffer[..newline_pos].to_vec();
+                        line_buffer.drain(..=newline_pos);
+                        let Ok(line) = std::str::from_utf8(&line_bytes) else {
+                            continue;
+                        };
+                        let line = line.trim_end_matches('\r');
 
                         if let Some(data) = line.strip_prefix("data: ") {
                             data_buffer.push_str(data);

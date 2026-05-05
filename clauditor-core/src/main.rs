@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
@@ -224,10 +225,30 @@ struct SessionBudgetState {
 static RUNTIME_STATE: LazyLock<Mutex<RuntimeState>> =
     LazyLock::new(|| Mutex::new(RuntimeState::new()));
 static SESSION_BUDGETS: LazyLock<DashMap<String, SessionBudgetState>> = LazyLock::new(DashMap::new);
+static FALLBACK_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!(lock = name, "recovering poisoned mutex");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn fallback_request_id() -> String {
+    let counter = FALLBACK_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("req_fallback_{nanos}_{counter}")
+}
 
 /// Check if request should be blocked by the process-wide circuit breaker.
 fn check_circuit_breaker() -> Option<(&'static str, String)> {
-    let runtime = RUNTIME_STATE.lock().unwrap();
+    let runtime = lock_or_recover(&RUNTIME_STATE, "runtime_state");
 
     // Circuit breaker check.
     if let Some(until) = runtime.circuit_open_until {
@@ -347,6 +368,8 @@ CREATE TABLE IF NOT EXISTS requests (
     output_tokens INTEGER,
     cache_read_tokens INTEGER DEFAULT 0,
     cache_creation_tokens INTEGER DEFAULT 0,
+    cache_creation_5m_tokens INTEGER DEFAULT 0,
+    cache_creation_1h_tokens INTEGER DEFAULT 0,
     cost_dollars REAL,
     cost_source TEXT,
     trusted_for_budget_enforcement INTEGER DEFAULT 0,
@@ -479,6 +502,8 @@ enum DbCommand {
         output_tokens: u64,
         cache_read_tokens: u64,
         cache_creation_tokens: u64,
+        cache_creation_5m_tokens: u64,
+        cache_creation_1h_tokens: u64,
         cost_dollars: f64,
         cost_source: String,
         trusted_for_budget_enforcement: bool,
@@ -638,6 +663,18 @@ fn ensure_request_cost_columns(conn: &Connection) -> rusqlite::Result<()> {
     if !columns.contains("trusted_for_budget_enforcement") {
         conn.execute(
             "ALTER TABLE requests ADD COLUMN trusted_for_budget_enforcement INTEGER DEFAULT 0",
+            [],
+        )?;
+    }
+    if !columns.contains("cache_creation_5m_tokens") {
+        conn.execute(
+            "ALTER TABLE requests ADD COLUMN cache_creation_5m_tokens INTEGER DEFAULT 0",
+            [],
+        )?;
+    }
+    if !columns.contains("cache_creation_1h_tokens") {
+        conn.execute(
+            "ALTER TABLE requests ADD COLUMN cache_creation_1h_tokens INTEGER DEFAULT 0",
             [],
         )?;
     }
@@ -824,6 +861,8 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 output_tokens,
                 cache_read_tokens,
                 cache_creation_tokens,
+                cache_creation_5m_tokens,
+                cache_creation_1h_tokens,
                 cost_dollars,
                 cost_source,
                 trusted_for_budget_enforcement,
@@ -836,8 +875,9 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                     .execute(
                     "INSERT OR IGNORE INTO requests (request_id, session_id, timestamp, model, \
                      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, \
-                     cost_dollars, cost_source, trusted_for_budget_enforcement, duration_ms, tool_calls, cache_event) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                     cache_creation_5m_tokens, cache_creation_1h_tokens, cost_dollars, \
+                     cost_source, trusted_for_budget_enforcement, duration_ms, tool_calls, cache_event) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                     rusqlite::params![
                         &request_id,
                         &session_id,
@@ -847,6 +887,8 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                         output_tokens,
                         cache_read_tokens,
                         cache_creation_tokens,
+                        cache_creation_5m_tokens,
+                        cache_creation_1h_tokens,
                         cost_dollars,
                         cost_source,
                         trusted_for_budget_enforcement as i32,
@@ -2116,7 +2158,7 @@ fn recommended_action(primary_cause: &str, advice: &[String], partial: bool) -> 
         "context_bloat" | "near_compaction" | "compaction_suspected" => {
             "Compact or start a fresh session with a short state summary before asking for more work.".to_string()
         }
-        "model_fallback" => "Treat model quality changes as part of the failure; retry later or explicitly choose a model with available quota.".to_string(),
+        "model_fallback" => "Treat model-routing changes as part of the failure; retry later or explicitly choose the model you need.".to_string(),
         "tool_failure_streak" => "Stop the loop, fix the failing command or tool precondition manually, then restart Claude with the result.".to_string(),
         "" | "none" => "No major degradation signal was found; continue unless the session behavior felt wrong.".to_string(),
         _ => "Review the evidence below, then restart with a shorter prompt if Claude was slow, costly, or repetitive.".to_string(),
@@ -2438,7 +2480,7 @@ fn build_postmortem_response_from_db(
         ) {
             if !model_matches(requested, actual) {
                 details.push(format!(
-                    "model fallback requested {requested}, got {actual}"
+                    "model routed differently: requested {requested}, got {actual}"
                 ));
             }
         }
@@ -2591,6 +2633,7 @@ fn query_historical_window_from_db(
 ) -> rusqlite::Result<metrics::HistoricalWindowMetrics> {
     let mut stmt = conn.prepare(
         "SELECT model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, \
+         COALESCE(cache_creation_5m_tokens, 0), COALESCE(cache_creation_1h_tokens, 0), \
          cost_dollars, cost_source, trusted_for_budget_enforcement, cache_event \
          FROM requests WHERE timestamp >= ?1",
     )?;
@@ -2601,10 +2644,12 @@ fn query_historical_window_from_db(
             row.get::<_, i64>(2)?,
             row.get::<_, i64>(3)?,
             row.get::<_, i64>(4)?,
-            row.get::<_, Option<f64>>(5)?,
-            row.get::<_, Option<String>>(6)?,
-            row.get::<_, Option<i64>>(7)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, Option<f64>>(7)?,
             row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<i64>>(9)?,
+            row.get::<_, Option<String>>(10)?,
         ))
     })?;
 
@@ -2621,21 +2666,29 @@ fn query_historical_window_from_db(
             output,
             cache_read,
             cache_create,
+            cache_create_5m_raw,
+            cache_create_1h_raw,
             stored_cost,
             stored_source,
             stored_trusted,
             cache_event,
         ) = row?;
+        let mut cache_create_5m = cache_create_5m_raw.max(0) as u64;
+        let cache_create_1h = cache_create_1h_raw.max(0) as u64;
+        if cache_create.max(0) > 0 && cache_create_5m == 0 && cache_create_1h == 0 {
+            cache_create_5m = cache_create.max(0) as u64;
+        }
         let row_cost = if let Some(cost) = stored_cost {
             cost_accumulator.record_persisted(cost, stored_source, stored_trusted.map(|n| n != 0));
             cost
         } else {
-            let estimated = pricing::estimate_cost_dollars(
+            let estimated = pricing::estimate_cost_dollars_with_cache_buckets(
                 &model,
                 input.max(0) as u64,
                 output.max(0) as u64,
                 cache_read.max(0) as u64,
-                cache_create.max(0) as u64,
+                cache_create_5m,
+                cache_create_1h,
             );
             let total_cost = estimated.total_cost_dollars;
             cost_accumulator.record(estimated);
@@ -2647,9 +2700,12 @@ fn query_historical_window_from_db(
             .and_then(metrics::historical_cache_event_label)
         {
             *cache_events.entry(cache_event_label).or_insert(0) += 1;
-            let waste =
-                pricing::estimate_cache_rebuild_waste_dollars(&model, cache_create.max(0) as u64)
-                    .total_cost_dollars;
+            let waste = pricing::estimate_cache_rebuild_waste_dollars_with_cache_buckets(
+                &model,
+                cache_create_5m,
+                cache_create_1h,
+            )
+            .total_cost_dollars;
             *estimated_cache_waste_dollars_by_model
                 .entry(model_label)
                 .or_insert(0.0) += waste.max(0.0);
@@ -2815,6 +2871,7 @@ fn query_historical_metrics(
 struct CacheTracker {
     consecutive_misses: u64,
     last_request_time: Option<Instant>,
+    last_ttl_secs: u64,
 }
 
 impl CacheTracker {
@@ -2822,6 +2879,7 @@ impl CacheTracker {
         Self {
             consecutive_misses: 0,
             last_request_time: None,
+            last_ttl_secs: CACHE_TTL_SECS,
         }
     }
 }
@@ -2831,51 +2889,77 @@ const CACHE_TTL_SECS: u64 = 300;
 const THRASH_THRESHOLD: u64 = 3;
 
 /// Returns cache event type: "hit", "partial", "cold_start", "miss_ttl",
-/// "miss_thrash", or "none".
-fn update_cache_intelligence(session_id: &str, cache_read: u64, cache_create: u64) -> &'static str {
+/// "miss_rebuild", "miss_thrash", or "none".
+fn update_cache_intelligence(
+    session_id: &str,
+    cache_read: u64,
+    cache_create: u64,
+    ttl_secs: u64,
+) -> &'static str {
     let mut t = CACHE_TRACKERS
         .entry(session_id.to_string())
         .or_insert_with(CacheTracker::new);
     let now = Instant::now();
+    classify_cache_event(&mut t, now, cache_read, cache_create, ttl_secs)
+}
 
+fn classify_cache_event(
+    tracker: &mut CacheTracker,
+    now: Instant,
+    cache_read: u64,
+    cache_create: u64,
+    ttl_secs: u64,
+) -> &'static str {
+    tracker.last_ttl_secs = ttl_secs;
     let is_full_miss = cache_create > 0 && cache_read == 0;
-    let is_first = t.last_request_time.is_none();
-    let gap = t
+    let is_first = tracker.last_request_time.is_none();
+    let gap = tracker
         .last_request_time
         .map(|p| now.duration_since(p).as_secs())
         .unwrap_or(0);
-    let is_ttl = is_full_miss && gap > CACHE_TTL_SECS;
+    let is_ttl = is_full_miss && gap > ttl_secs;
 
     let event = if cache_read == 0 && cache_create == 0 {
         "none"
     } else if is_full_miss {
         if is_first {
-            t.consecutive_misses = 0;
+            tracker.consecutive_misses = 0;
             "cold_start"
         } else if is_ttl {
-            t.consecutive_misses = 0;
+            tracker.consecutive_misses = 0;
             info!(gap, cache_create, "cache miss attributed to TTL expiry");
             "miss_ttl"
         } else {
-            t.consecutive_misses += 1;
-            if t.consecutive_misses >= THRASH_THRESHOLD {
+            tracker.consecutive_misses += 1;
+            if tracker.consecutive_misses >= THRASH_THRESHOLD {
                 warn!(
-                    session_id,
-                    consecutive_misses = t.consecutive_misses,
+                    consecutive_misses = tracker.consecutive_misses,
                     "cache thrashing detected within a single session"
                 );
+                "miss_thrash"
+            } else {
+                "miss_rebuild"
             }
-            "miss_thrash"
         }
     } else if cache_create > 0 {
-        t.consecutive_misses = 0;
+        tracker.consecutive_misses = 0;
         "partial"
     } else {
-        t.consecutive_misses = 0;
+        tracker.consecutive_misses = 0;
         "hit"
     };
-    t.last_request_time = Some(now);
+    tracker.last_request_time = Some(now);
     event
+}
+
+fn response_cache_ttl_secs(acc: &ResponseAccumulator, request_cache_ttl_secs: Option<u64>) -> u64 {
+    if acc.cache_creation_1h_tokens > 0 && acc.cache_creation_5m_tokens == 0 {
+        3600
+    } else if acc.cache_creation_5m_tokens > 0 {
+        300
+    } else {
+        request_cache_ttl_secs.unwrap_or(CACHE_TTL_SECS)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2929,16 +3013,21 @@ enum ContentBlockType {
 
 struct ResponseAccumulator {
     sse_buffer: Vec<u8>,
+    json_body: Vec<u8>,
     input_tokens: u64,
     output_tokens: u64,
     cache_read_tokens: u64,
     cache_creation_tokens: u64,
+    cache_creation_5m_tokens: u64,
+    cache_creation_1h_tokens: u64,
     tool_calls: Vec<String>,
     is_sse: bool,
+    is_json: bool,
     http_status: u32,
     error_body: Vec<u8>,
-    /// Model Anthropic reported in `message_start` — may differ from what the
-    /// client requested when a quota fallback silently routes the request.
+    /// Model Anthropic reported in `message_start` or non-streaming JSON. This
+    /// may differ from what the client requested when Anthropic routes the
+    /// request to a different model.
     response_model: Option<String>,
     /// Concatenated assistant text from this response, used for compact
     /// session-end recall summaries.
@@ -2959,12 +3048,16 @@ impl ResponseAccumulator {
     fn new() -> Self {
         Self {
             sse_buffer: Vec::with_capacity(4096),
+            json_body: Vec::with_capacity(4096),
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
             tool_calls: Vec::new(),
             is_sse: false,
+            is_json: false,
             http_status: 0,
             error_body: Vec::new(),
             response_model: None,
@@ -2980,7 +3073,10 @@ impl ResponseAccumulator {
     fn process_chunk(&mut self, chunk: &[u8]) {
         self.sse_buffer.extend_from_slice(chunk);
         while let Some(pos) = self.sse_buffer.iter().position(|&b| b == b'\n') {
-            let line = String::from_utf8_lossy(&self.sse_buffer[..pos]);
+            let Ok(line) = std::str::from_utf8(&self.sse_buffer[..pos]) else {
+                self.sse_buffer.drain(..=pos);
+                continue;
+            };
             let line = line.trim_end_matches('\r');
             if let Some(data) = line.strip_prefix("data: ") {
                 if data != "[DONE]" {
@@ -2993,22 +3089,146 @@ impl ResponseAccumulator {
         }
     }
 
+    fn drain_deferred_watch_events(&mut self) -> Vec<watch::WatchEvent> {
+        std::mem::take(&mut self.deferred_watch_events)
+    }
+
+    fn process_json_body(&mut self) {
+        if self.json_body.is_empty() {
+            return;
+        }
+        match serde_json::from_slice::<Value>(&self.json_body) {
+            Ok(value) => self.process_message_json(&value),
+            Err(err) => {
+                warn!(error = %err, bytes = self.json_body.len(), "failed to parse Claude JSON response");
+            }
+        }
+    }
+
+    fn process_message_json(&mut self, value: &Value) {
+        if let Some(usage) = value.get("usage") {
+            self.apply_usage(usage);
+        }
+        if let Some(model) = value.get("model").and_then(|model| model.as_str()) {
+            self.response_model = Some(model.to_string());
+        }
+        if let Some(content) = value.get("content").and_then(|content| content.as_array()) {
+            for block in content {
+                match block.get("type").and_then(|kind| kind.as_str()) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(|text| text.as_str()) {
+                            self.finish_text_block(text);
+                        }
+                    }
+                    Some("tool_use") => {
+                        let Some(tool_name) = block.get("name").and_then(|name| name.as_str())
+                        else {
+                            continue;
+                        };
+                        let input_json = block
+                            .get("input")
+                            .map(|input| serde_json::to_string(input).unwrap_or_default())
+                            .unwrap_or_default();
+                        self.finish_tool_block(tool_name, &input_json);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn apply_usage(&mut self, usage: &Value) {
+        if let Some(input) = usage.get("input_tokens").and_then(|value| value.as_u64()) {
+            self.input_tokens = input;
+        }
+        if let Some(output) = usage.get("output_tokens").and_then(|value| value.as_u64()) {
+            self.output_tokens = output;
+        }
+        if let Some(cache_read) = usage
+            .get("cache_read_input_tokens")
+            .and_then(|value| value.as_u64())
+        {
+            self.cache_read_tokens = cache_read;
+        }
+
+        let total_creation = usage
+            .get("cache_creation_input_tokens")
+            .and_then(|value| value.as_u64());
+        let creation_5m = usage
+            .pointer("/cache_creation/ephemeral_5m_input_tokens")
+            .and_then(|value| value.as_u64());
+        let creation_1h = usage
+            .pointer("/cache_creation/ephemeral_1h_input_tokens")
+            .and_then(|value| value.as_u64());
+
+        if total_creation.is_some() || creation_5m.is_some() || creation_1h.is_some() {
+            let mut five_minute = creation_5m.unwrap_or(0);
+            let one_hour = creation_1h.unwrap_or(0);
+            let total = total_creation.unwrap_or(five_minute + one_hour);
+            if creation_5m.is_none() && creation_1h.is_none() {
+                five_minute = total;
+            } else if total > five_minute + one_hour {
+                five_minute += total - five_minute - one_hour;
+            }
+            self.cache_creation_5m_tokens = five_minute;
+            self.cache_creation_1h_tokens = one_hour;
+            self.cache_creation_tokens = total.max(five_minute + one_hour);
+        }
+    }
+
+    fn finish_text_block(&mut self, text: &str) {
+        for pattern in FRUSTRATION_PATTERNS.iter() {
+            if pattern.regex.is_match(text) {
+                self.frustration_signal_count += 1;
+                self.deferred_watch_events
+                    .push(watch::WatchEvent::FrustrationSignal {
+                        session_id: String::new(),
+                        signal_type: pattern.signal_type.to_string(),
+                    });
+            }
+        }
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            if !self.response_text.is_empty() {
+                self.response_text.push('\n');
+            }
+            self.response_text.push_str(trimmed);
+        }
+    }
+
+    fn finish_tool_block(&mut self, tool_name: &str, input_json: &str) {
+        self.tool_calls.push(tool_name.to_string());
+        let summary = watch::extract_summary(tool_name, input_json);
+        self.deferred_watch_events.push(watch::WatchEvent::ToolUse {
+            session_id: String::new(),
+            timestamp: now_iso8601(),
+            tool_name: tool_name.to_string(),
+            summary,
+        });
+        if tool_name.eq_ignore_ascii_case("Skill") {
+            if let Some(skill_name) = skill_name_from_tool_input_json(input_json) {
+                self.deferred_watch_events
+                    .push(watch::WatchEvent::SkillEvent {
+                        session_id: String::new(),
+                        timestamp: now_iso8601(),
+                        skill_name,
+                        event_type: "fired".to_string(),
+                        source: "proxy".to_string(),
+                        confidence: 0.65,
+                        detail: Some("inferred from Skill tool_use".to_string()),
+                    });
+            }
+        }
+    }
+
     fn process_event(&mut self, v: &Value) {
         match v.get("type").and_then(|t| t.as_str()) {
             Some("message_start") => {
                 if let Some(u) = v.pointer("/message/usage") {
-                    self.input_tokens = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    self.cache_read_tokens = u
-                        .get("cache_read_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    self.cache_creation_tokens = u
-                        .get("cache_creation_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
+                    self.apply_usage(u);
                 }
                 // Capture the model Anthropic actually routed to. If it differs
-                // from what the user requested we surface a silent-fallback
+                // from what the user requested we surface a model-route mismatch
                 // alert in `finalize_response`.
                 if let Some(m) = v.pointer("/message/model").and_then(|m| m.as_str()) {
                     self.response_model = Some(m.to_string());
@@ -3058,32 +3278,15 @@ impl ResponseAccumulator {
             Some("content_block_stop") => {
                 match self.current_block_type {
                     ContentBlockType::Text => {
-                        // Run frustration detection on completed text block.
-                        for pattern in FRUSTRATION_PATTERNS.iter() {
-                            if pattern.regex.is_match(&self.text_buffer) {
-                                self.frustration_signal_count += 1;
-                                self.deferred_watch_events.push(
-                                    watch::WatchEvent::FrustrationSignal {
-                                        session_id: String::new(), // Filled in finalize_response.
-                                        signal_type: pattern.signal_type.to_string(),
-                                    },
-                                );
-                            }
-                        }
-                        let trimmed = self.text_buffer.trim();
-                        if !trimmed.is_empty() {
-                            if !self.response_text.is_empty() {
-                                self.response_text.push('\n');
-                            }
-                            self.response_text.push_str(trimmed);
-                        }
-                        self.text_buffer.clear();
+                        let text = std::mem::take(&mut self.text_buffer);
+                        self.finish_text_block(&text);
                     }
                     ContentBlockType::ToolUse => {
                         // Defer ToolUse event — broadcast after session start in finalize_response.
                         if let Some(tool_name) = self.tool_calls.last() {
-                            let summary =
-                                watch::extract_summary(tool_name, &self.tool_input_buffer);
+                            let tool_name = tool_name.clone();
+                            let input_json = std::mem::take(&mut self.tool_input_buffer);
+                            let summary = watch::extract_summary(&tool_name, &input_json);
                             self.deferred_watch_events.push(watch::WatchEvent::ToolUse {
                                 session_id: String::new(), // Filled in finalize_response.
                                 timestamp: now_iso8601(),
@@ -3092,7 +3295,7 @@ impl ResponseAccumulator {
                             });
                             if tool_name.eq_ignore_ascii_case("Skill") {
                                 if let Some(skill_name) =
-                                    skill_name_from_tool_input_json(&self.tool_input_buffer)
+                                    skill_name_from_tool_input_json(&input_json)
                                 {
                                     self.deferred_watch_events.push(
                                         watch::WatchEvent::SkillEvent {
@@ -3110,7 +3313,6 @@ impl ResponseAccumulator {
                                 }
                             }
                         }
-                        self.tool_input_buffer.clear();
                     }
                     ContentBlockType::Other => {}
                 }
@@ -3118,9 +3320,7 @@ impl ResponseAccumulator {
             }
             Some("message_delta") => {
                 if let Some(u) = v.get("usage") {
-                    if let Some(o) = u.get("output_tokens").and_then(|v| v.as_u64()) {
-                        self.output_tokens = o;
-                    }
+                    self.apply_usage(u);
                 }
             }
             _ => {}
@@ -3131,8 +3331,8 @@ impl ResponseAccumulator {
 // ---------------------------------------------------------------------------
 // Finalize: metrics + DB persistence
 // ---------------------------------------------------------------------------
-/// Claude Code can expose 1M context as a UI model suffix even though the
-/// Anthropic API expects a normal model id plus an anthropic-beta header.
+/// Claude Code can expose 1M context as a UI model suffix. Current native-1M
+/// models use the normal upstream model id; the suffix is compatibility input.
 fn strip_model_1m_alias(model: &str) -> Option<&str> {
     let lower = model.to_ascii_lowercase();
     lower
@@ -3187,9 +3387,158 @@ fn project_turns_to_compact(session_id: &str, current_fill_percent: f64) -> Opti
     project_turns_until_compaction(prev_fill, current_fill_percent)
 }
 
+fn ensure_session_state(
+    sys_prompt_hash: u64,
+    working_dir_str: &str,
+    model: &str,
+    user_prompt_excerpt: &str,
+) -> String {
+    if let Some(mut existing) = diagnosis::SESSIONS.get_mut(&sys_prompt_hash) {
+        existing.last_activity = Instant::now();
+        existing.cache_warning_sent = false;
+        existing.idle_postmortem_sent = false;
+        return existing.session_id.clone();
+    }
+
+    // Derive display name BEFORE inserting to avoid deadlock: the display-name
+    // helper iterates SESSIONS to check collisions.
+    let name = derive_display_name(working_dir_str, model, sys_prompt_hash);
+    let ts = now_epoch_secs();
+    let hash_suffix = &format!("{:x}", sys_prompt_hash)[..4];
+    let sid = format!("session_{ts}_{hash_suffix}");
+    diagnosis::SESSIONS.insert(
+        sys_prompt_hash,
+        diagnosis::SessionState {
+            session_id: sid.clone(),
+            display_name: name,
+            model: model.to_string(),
+            initial_prompt: if user_prompt_excerpt.is_empty() {
+                None
+            } else {
+                Some(user_prompt_excerpt.to_string())
+            },
+            created_at: Instant::now(),
+            last_activity: Instant::now(),
+            session_inserted: false,
+            cache_warning_sent: false,
+            idle_postmortem_sent: false,
+        },
+    );
+    sid
+}
+
+fn ensure_session_inserted(
+    sys_prompt_hash: u64,
+    session_id: &str,
+    model: &str,
+    user_prompt_excerpt: &str,
+) {
+    let insert_info = {
+        let mut entry = diagnosis::SESSIONS.get_mut(&sys_prompt_hash);
+        if let Some(ref mut e) = entry {
+            if !e.session_inserted {
+                e.session_inserted = true;
+                Some(e.display_name.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(display_name) = insert_info {
+        let initial_prompt = if user_prompt_excerpt.is_empty() {
+            None
+        } else {
+            Some(user_prompt_excerpt.to_string())
+        };
+        let _ = DB_TX.send(DbCommand::InsertSession {
+            session_id: session_id.to_string(),
+            started_at: now_iso8601(),
+            model: model.to_string(),
+            initial_prompt: initial_prompt.clone(),
+        });
+        watch::BROADCASTER.broadcast(watch::WatchEvent::SessionStart {
+            session_id: session_id.to_string(),
+            display_name,
+            model: model.to_string(),
+            initial_prompt,
+        });
+        metrics::increment_active_sessions();
+    }
+}
+
+fn flush_deferred_watch_events(session_id: &str, events: Vec<watch::WatchEvent>) {
+    for event in events {
+        let mut event = event;
+        match &mut event {
+            watch::WatchEvent::ToolUse {
+                session_id: sid, ..
+            }
+            | watch::WatchEvent::FrustrationSignal {
+                session_id: sid, ..
+            }
+            | watch::WatchEvent::SkillEvent {
+                session_id: sid, ..
+            }
+            | watch::WatchEvent::McpEvent {
+                session_id: sid, ..
+            } => {
+                *sid = session_id.to_string();
+            }
+            _ => {}
+        }
+        match event {
+            watch::WatchEvent::ToolUse { ref tool_name, .. } => {
+                metrics::record_tool_call(tool_name);
+                watch::BROADCASTER.broadcast(event);
+            }
+            watch::WatchEvent::SkillEvent {
+                session_id,
+                timestamp,
+                skill_name,
+                event_type,
+                source,
+                confidence,
+                detail,
+            } => {
+                emit_skill_event(SkillTelemetryEvent {
+                    session_id,
+                    timestamp,
+                    skill_name,
+                    event_type,
+                    source,
+                    confidence,
+                    detail,
+                });
+            }
+            watch::WatchEvent::McpEvent {
+                session_id,
+                timestamp,
+                server,
+                tool,
+                event_type,
+                source,
+                detail,
+            } => {
+                emit_mcp_event(McpTelemetryEvent {
+                    session_id,
+                    timestamp,
+                    server,
+                    tool,
+                    event_type,
+                    source,
+                    detail,
+                });
+            }
+            other => watch::BROADCASTER.broadcast(other),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_response(
-    acc: &ResponseAccumulator,
+    acc: &mut ResponseAccumulator,
     request_id: &str,
     model: &str,
     started_at: &Instant,
@@ -3198,60 +3547,33 @@ fn finalize_response(
     working_dir_str: &str,
     user_prompt_excerpt: &str,
     context_window_tokens: u64,
+    is_internal_request: bool,
+    request_cache_ttl_secs: Option<u64>,
 ) {
     let duration = started_at.elapsed();
     let duration_secs = duration.as_secs_f64();
     let duration_ms = duration.as_millis() as u64;
     let tool_failures = tool_results.iter().filter(|result| result.is_error).count() as u32;
 
-    // Look up or create the per-terminal session by system prompt hash.
-    // Use get_mut first (cheap read lock), then entry() only if truly new.
-    let session_id = if let Some(mut existing) = diagnosis::SESSIONS.get_mut(&sys_prompt_hash) {
-        existing.last_activity = Instant::now();
-        existing.cache_warning_sent = false;
-        existing.idle_postmortem_sent = false;
-        existing.session_id.clone()
-    } else {
-        // Derive display name BEFORE taking the entry lock to avoid deadlock
-        // (derive_display_name iterates SESSIONS to check for name collisions).
-        let name = derive_display_name(working_dir_str, model, sys_prompt_hash);
-        let ts = now_epoch_secs();
-        let hash_suffix = &format!("{:x}", sys_prompt_hash)[..4];
-        let sid = format!("session_{ts}_{hash_suffix}");
-        let sid_clone = sid.clone();
-        diagnosis::SESSIONS.insert(
-            sys_prompt_hash,
-            diagnosis::SessionState {
-                session_id: sid,
-                display_name: name,
-                model: model.to_string(),
-                initial_prompt: if user_prompt_excerpt.is_empty() {
-                    None
-                } else {
-                    Some(user_prompt_excerpt.to_string())
-                },
-                created_at: Instant::now(),
-                last_activity: Instant::now(),
-                session_inserted: false,
-                cache_warning_sent: false,
-                idle_postmortem_sent: false,
-            },
-        );
-        sid_clone
-    };
+    let session_id =
+        ensure_session_state(sys_prompt_hash, working_dir_str, model, user_prompt_excerpt);
 
-    let billing_model = acc.response_model.as_deref().unwrap_or(model);
-    let estimated_cost = pricing::estimate_cost_dollars(
-        billing_model,
+    let billing_model = acc
+        .response_model
+        .clone()
+        .unwrap_or_else(|| model.to_string());
+    let estimated_cost = pricing::estimate_cost_dollars_with_cache_buckets(
+        &billing_model,
         acc.input_tokens,
         acc.output_tokens,
         acc.cache_read_tokens,
-        acc.cache_creation_tokens,
+        acc.cache_creation_5m_tokens,
+        acc.cache_creation_1h_tokens,
     );
     let total_cost = estimated_cost.total_cost_dollars;
 
     metrics::record_request(
-        billing_model,
+        &billing_model,
         acc.input_tokens,
         acc.output_tokens,
         acc.cache_read_tokens,
@@ -3260,26 +3582,21 @@ fn finalize_response(
         duration_secs,
     );
 
-    // Skip requests that can't be attributed to a terminal:
-    // - Haiku title-generation requests
-    // - Any request with empty system prompt (e.g., Opus/Sonnet title-generation requests
-    //   which have system_prompt_length=0 and no working directory)
-    // These still get budget tracking, DB recording, and logging below.
-    let is_title_request = model.contains("haiku") || working_dir_str.is_empty();
-
-    let cache_event = if is_title_request {
+    let cache_ttl_secs = response_cache_ttl_secs(acc, request_cache_ttl_secs);
+    let cache_event = if is_internal_request {
         "none"
     } else {
         update_cache_intelligence(
             &session_id,
             acc.cache_read_tokens,
             acc.cache_creation_tokens,
+            cache_ttl_secs,
         )
     };
 
     // Phase 7: update budget state.
     {
-        let mut runtime = RUNTIME_STATE.lock().unwrap();
+        let mut runtime = lock_or_recover(&RUNTIME_STATE, "runtime_state");
         runtime.total_spend += total_cost;
         runtime.total_tokens += acc.input_tokens
             + acc.output_tokens
@@ -3290,8 +3607,12 @@ fn finalize_response(
 
     let estimated_cache_waste_dollars = if matches!(cache_event, "miss_ttl" | "miss_thrash") {
         Some(
-            pricing::estimate_cache_rebuild_waste_dollars(billing_model, acc.cache_creation_tokens)
-                .total_cost_dollars,
+            pricing::estimate_cache_rebuild_waste_dollars_with_cache_buckets(
+                &billing_model,
+                acc.cache_creation_5m_tokens,
+                acc.cache_creation_1h_tokens,
+            )
+            .total_cost_dollars,
         )
     } else {
         None
@@ -3309,44 +3630,8 @@ fn finalize_response(
         }
     }
 
-    if !is_title_request {
-        // Ensure session row exists (uses the primary model, not haiku).
-        let insert_info = {
-            let mut entry = diagnosis::SESSIONS.get_mut(&sys_prompt_hash);
-            if let Some(ref mut e) = entry {
-                if !e.session_inserted {
-                    e.session_inserted = true;
-                    Some(e.display_name.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        if let Some(display_name) = insert_info {
-            let _ = DB_TX.send(DbCommand::InsertSession {
-                session_id: session_id.clone(),
-                started_at: now_iso8601(),
-                model: model.to_string(),
-                initial_prompt: if user_prompt_excerpt.is_empty() {
-                    None
-                } else {
-                    Some(user_prompt_excerpt.to_string())
-                },
-            });
-            watch::BROADCASTER.broadcast(watch::WatchEvent::SessionStart {
-                session_id: session_id.clone(),
-                display_name,
-                model: model.to_string(),
-                initial_prompt: if user_prompt_excerpt.is_empty() {
-                    None
-                } else {
-                    Some(user_prompt_excerpt.to_string())
-                },
-            });
-            metrics::set_active_sessions(active_session_count());
-        }
+    if !is_internal_request {
+        ensure_session_inserted(sys_prompt_hash, &session_id, model, user_prompt_excerpt);
 
         for tool_result in tool_results {
             if tool_result.is_error {
@@ -3396,12 +3681,23 @@ fn finalize_response(
 
         // Broadcast all cache events except "none" — hits confirm the stream is alive.
         if cache_event != "none" {
-            let resolved = pricing::resolve_pricing(billing_model);
+            let resolved = pricing::resolve_pricing(&billing_model);
+            let exact_create_cost = token_cost(
+                acc.cache_creation_5m_tokens,
+                resolved.pricing.cache_write_5m,
+            ) + token_cost(
+                acc.cache_creation_1h_tokens,
+                resolved.pricing.cache_write_1h,
+            );
             let prompt_size_tokens =
                 acc.input_tokens + acc.cache_read_tokens + acc.cache_creation_tokens;
-            let rebuild_cost = token_cost(prompt_size_tokens, resolved.pricing.cache_create);
-            let expires_at = now_epoch_secs() + CACHE_TTL_SECS;
-            metrics::record_cache_event(billing_model, cache_event, estimated_cache_waste_dollars);
+            let rebuild_cost = if acc.cache_creation_tokens > 0 {
+                exact_create_cost
+            } else {
+                token_cost(prompt_size_tokens, resolved.pricing.cache_write_5m)
+            };
+            let expires_at = now_epoch_secs() + cache_ttl_secs;
+            metrics::record_cache_event(&billing_model, cache_event, estimated_cache_waste_dollars);
             watch::BROADCASTER.broadcast(watch::WatchEvent::CacheEvent {
                 session_id: session_id.clone(),
                 event_type: cache_event.to_string(),
@@ -3410,76 +3706,12 @@ fn finalize_response(
             });
         }
 
-        // Flush deferred watch events (tool use, frustration signals) — inject session_id.
-        for event in &acc.deferred_watch_events {
-            let mut event = event.clone();
-            match &mut event {
-                watch::WatchEvent::ToolUse {
-                    session_id: sid, ..
-                }
-                | watch::WatchEvent::FrustrationSignal {
-                    session_id: sid, ..
-                }
-                | watch::WatchEvent::SkillEvent {
-                    session_id: sid, ..
-                }
-                | watch::WatchEvent::McpEvent {
-                    session_id: sid, ..
-                } => {
-                    *sid = session_id.clone();
-                }
-                _ => {}
-            }
-            match event {
-                watch::WatchEvent::ToolUse { ref tool_name, .. } => {
-                    metrics::record_tool_call(tool_name);
-                    watch::BROADCASTER.broadcast(event);
-                }
-                watch::WatchEvent::SkillEvent {
-                    session_id,
-                    timestamp,
-                    skill_name,
-                    event_type,
-                    source,
-                    confidence,
-                    detail,
-                } => {
-                    emit_skill_event(SkillTelemetryEvent {
-                        session_id,
-                        timestamp,
-                        skill_name,
-                        event_type,
-                        source,
-                        confidence,
-                        detail,
-                    });
-                }
-                watch::WatchEvent::McpEvent {
-                    session_id,
-                    timestamp,
-                    server,
-                    tool,
-                    event_type,
-                    source,
-                    detail,
-                } => {
-                    emit_mcp_event(McpTelemetryEvent {
-                        session_id,
-                        timestamp,
-                        server,
-                        tool,
-                        event_type,
-                        source,
-                        detail,
-                    });
-                }
-                other => watch::BROADCASTER.broadcast(other),
-            }
-        }
+        // Flush any SSE events not already emitted during streaming, primarily
+        // events that arrived in the final chunk.
+        flush_deferred_watch_events(&session_id, acc.drain_deferred_watch_events());
 
-        // Silent-fallback detector: Anthropic sometimes routes a request to a
-        // different model than the client asked for (e.g. Opus→Sonnet when
-        // the Opus quota is drained). We emit a one-shot alert whenever the
+        // Model-route mismatch detector: Anthropic can route a request to a
+        // different model than the client asked for. We emit a one-shot alert whenever the
         // `message.model` we saw in the SSE doesn't match the requested model.
         // Matching is a contains-check so minor version suffix drift
         // (`claude-opus-4-7` vs `claude-opus-4-7-20260410`) doesn't misfire.
@@ -3640,11 +3872,13 @@ fn finalize_response(
         request_id: request_id.to_string(),
         session_id: session_id.clone(),
         timestamp: ts,
-        model: billing_model.to_string(),
+        model: billing_model.clone(),
         input_tokens: acc.input_tokens,
         output_tokens: acc.output_tokens,
         cache_read_tokens: acc.cache_read_tokens,
         cache_creation_tokens: acc.cache_creation_tokens,
+        cache_creation_5m_tokens: acc.cache_creation_5m_tokens,
+        cache_creation_1h_tokens: acc.cache_creation_1h_tokens,
         cost_dollars: total_cost,
         cost_source: estimated_cost.cost_source.clone(),
         trusted_for_budget_enforcement: estimated_cost.trusted_for_budget_enforcement,
@@ -3682,7 +3916,7 @@ fn finalize_response(
             duration_s = format!("{:.2}", duration_secs),
             tools = acc.tool_calls.len(),
             cache_event,
-            billed_as = billing_model,
+            billed_as = %billing_model,
             "request complete"
         );
     }
@@ -4088,7 +4322,6 @@ fn extract_headers(h: &HttpHeaders, name: &str) -> Vec<String> {
 
 const STANDARD_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
 const EXTENDED_CONTEXT_WINDOW_TOKENS: u64 = 1_000_000;
-const CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
 const CONTEXT_1M_BETA_PREFIX: &str = "context-1m-";
 
 fn configured_context_window_tokens() -> Option<u64> {
@@ -4103,6 +4336,54 @@ fn configured_context_window_tokens() -> Option<u64> {
 
 fn model_requests_1m_context(model: &str) -> bool {
     model.to_ascii_lowercase().contains("[1m]")
+}
+
+fn model_family_version(model: &str, family: &str) -> Option<(u32, u32)> {
+    let lower = normalize_model_for_match(model).to_ascii_lowercase();
+    let tokens = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let family_index = tokens.iter().position(|token| *token == family)?;
+
+    let parse_version_part = |token: &str| -> Option<u32> {
+        let value = token.parse::<u32>().ok()?;
+        (value <= 99).then_some(value)
+    };
+
+    if let Some(major) = tokens
+        .get(family_index + 1)
+        .and_then(|token| parse_version_part(token))
+    {
+        let minor = tokens
+            .get(family_index + 2)
+            .and_then(|token| parse_version_part(token))
+            .unwrap_or(0);
+        return Some((major, minor));
+    }
+
+    if let Some(minor) = family_index
+        .checked_sub(1)
+        .and_then(|idx| tokens.get(idx))
+        .and_then(|token| parse_version_part(token))
+    {
+        let major = family_index
+            .checked_sub(2)
+            .and_then(|idx| tokens.get(idx))
+            .and_then(|token| parse_version_part(token))?;
+        return Some((major, minor));
+    }
+
+    None
+}
+
+fn model_has_native_1m_context(model: &str) -> bool {
+    let lower = normalize_model_for_match(model).to_ascii_lowercase();
+    lower.contains("mythos")
+        || model_family_version(&lower, "opus")
+            .is_some_and(|(major, minor)| major > 4 || (major == 4 && minor >= 6))
+        || model_family_version(&lower, "sonnet")
+            .is_some_and(|(major, minor)| major > 4 || (major == 4 && minor >= 6))
 }
 
 fn beta_values_use_1m_context(values: &[String]) -> bool {
@@ -4121,14 +4402,22 @@ fn request_uses_1m_context(headers: &HttpHeaders) -> bool {
 struct UpstreamRequestAdjustment {
     body: Option<Vec<u8>>,
     anthropic_beta: Option<String>,
+    remove_anthropic_beta: bool,
 }
 
-fn anthropic_beta_with_1m_context(beta_values: &[String]) -> String {
-    if beta_values.is_empty() {
-        CONTEXT_1M_BETA.to_string()
-    } else {
-        format!("{}, {}", beta_values.join(", "), CONTEXT_1M_BETA)
-    }
+fn anthropic_beta_without_1m_context(beta_values: &[String]) -> String {
+    beta_values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| {
+            !value
+                .to_ascii_lowercase()
+                .starts_with(CONTEXT_1M_BETA_PREFIX)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn upstream_request_adjustment_for_body(
@@ -4147,17 +4436,35 @@ fn upstream_request_adjustment_for_body(
     };
 
     value["model"] = Value::String(upstream_model.to_string());
+    let cleaned_beta = anthropic_beta_without_1m_context(beta_values);
+    let had_retired_context_beta = beta_values_use_1m_context(beta_values);
     UpstreamRequestAdjustment {
         body: serde_json::to_vec(&value).ok(),
-        anthropic_beta: (!beta_values_use_1m_context(beta_values))
-            .then(|| anthropic_beta_with_1m_context(beta_values)),
+        anthropic_beta: (had_retired_context_beta && !cleaned_beta.is_empty())
+            .then_some(cleaned_beta),
+        remove_anthropic_beta: had_retired_context_beta,
     }
 }
 
 fn resolve_context_window_tokens(header_hint: Option<u64>, model: &str) -> u64 {
-    configured_context_window_tokens()
+    resolve_context_window_tokens_with_config(
+        configured_context_window_tokens(),
+        header_hint,
+        model,
+    )
+}
+
+fn resolve_context_window_tokens_with_config(
+    configured: Option<u64>,
+    header_hint: Option<u64>,
+    model: &str,
+) -> u64 {
+    configured
         .or(header_hint)
-        .or_else(|| model_requests_1m_context(model).then_some(EXTENDED_CONTEXT_WINDOW_TOKENS))
+        .or_else(|| {
+            (model_has_native_1m_context(model) || model_requests_1m_context(model))
+                .then_some(EXTENDED_CONTEXT_WINDOW_TOKENS)
+        })
         .unwrap_or(STANDARD_CONTEXT_WINDOW_TOKENS)
 }
 
@@ -4173,7 +4480,7 @@ fn infer_context_window_tokens(
     }
 
     let model = actual_model.or(requested_model).unwrap_or("");
-    if model_requests_1m_context(model) {
+    if model_has_native_1m_context(model) || model_requests_1m_context(model) {
         return EXTENDED_CONTEXT_WINDOW_TOKENS;
     }
 
@@ -4340,7 +4647,7 @@ fn auto_weekly_budget_suggestion() -> Option<AutoWeeklyBudget> {
     let current_week_start = start_of_week_epoch_at(now_epoch_secs());
 
     {
-        let cache = AUTO_WEEKLY_BUDGET_CACHE.lock().unwrap();
+        let cache = lock_or_recover(&AUTO_WEEKLY_BUDGET_CACHE, "auto_weekly_budget_cache");
         let is_fresh = cache
             .refreshed_at
             .map(|t| now.duration_since(t) < Duration::from_secs(3600))
@@ -4353,14 +4660,88 @@ fn auto_weekly_budget_suggestion() -> Option<AutoWeeklyBudget> {
     let suggestion =
         tokio::task::block_in_place(|| query_auto_weekly_budget_suggestion(current_week_start));
 
-    let mut cache = AUTO_WEEKLY_BUDGET_CACHE.lock().unwrap();
+    let mut cache = lock_or_recover(&AUTO_WEEKLY_BUDGET_CACHE, "auto_weekly_budget_cache");
     cache.refreshed_at = Some(now);
     cache.week_start_epoch = Some(current_week_start);
     cache.suggestion = suggestion.clone();
     suggestion
 }
 
-type ParsedRequestBody = (String, usize, bool, usize, usize, u64, String, String);
+#[derive(Clone, Debug)]
+struct ParsedRequestBody {
+    model: String,
+    message_count: usize,
+    has_tools: bool,
+    system_prompt_length: usize,
+    estimated_input_tokens: usize,
+    sys_prompt_hash: u64,
+    working_dir: String,
+    user_prompt_excerpt: String,
+    is_internal_request: bool,
+    cache_ttl_secs: Option<u64>,
+}
+
+fn cache_control_ttl_secs(cache_control: &Value) -> Option<u64> {
+    if cache_control.get("type").and_then(|value| value.as_str()) != Some("ephemeral") {
+        return None;
+    }
+    match cache_control.get("ttl").and_then(|value| value.as_str()) {
+        Some("1h") => Some(3600),
+        Some("5m") | None => Some(300),
+        Some(_) => Some(300),
+    }
+}
+
+fn collect_cache_control_ttls(value: &Value, ttls: &mut Vec<u64>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(cache_control) = map.get("cache_control") {
+                if let Some(ttl) = cache_control_ttl_secs(cache_control) {
+                    ttls.push(ttl);
+                }
+            }
+            for child in map.values() {
+                collect_cache_control_ttls(child, ttls);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_cache_control_ttls(child, ttls);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn request_cache_ttl_secs(value: &Value) -> Option<u64> {
+    let mut ttls = Vec::new();
+    collect_cache_control_ttls(value, &mut ttls);
+    ttls.into_iter().min()
+}
+
+fn looks_like_title_request(prompt: &str, message_count: usize, has_tools: bool) -> bool {
+    if has_tools || message_count > 2 {
+        return false;
+    }
+    let normalized = normalize_search_text(prompt);
+    normalized.contains("generate a short title")
+        || normalized.contains("conversation title")
+        || normalized.contains("title for this conversation")
+        || normalized.contains("summarize this conversation in")
+}
+
+fn is_internal_request_shape(
+    working_dir: &str,
+    system_prompt_length: usize,
+    message_count: usize,
+    has_tools: bool,
+    user_prompt_excerpt: &str,
+) -> bool {
+    working_dir.trim().is_empty()
+        || (system_prompt_length == 0
+            && looks_like_title_request(user_prompt_excerpt, message_count, has_tools))
+        || looks_like_title_request(user_prompt_excerpt, message_count, has_tools)
+}
 
 /// Returns (model, message_count, has_tools, system_prompt_length, estimated_input_tokens, sys_prompt_hash, working_dir).
 /// sys_prompt_hash: stable per-terminal session key derived from working directory.
@@ -4447,17 +4828,22 @@ fn parse_request_body(body: &[u8]) -> Option<ParsedRequestBody> {
     };
 
     let user_prompt_excerpt = clean_user_prompt(&first_user_message);
+    let cache_ttl_secs = request_cache_ttl_secs(&v);
+    let is_internal_request =
+        is_internal_request_shape(&working_dir, sl, mc, ht, &user_prompt_excerpt);
 
-    Some((
+    Some(ParsedRequestBody {
         model,
-        mc,
-        ht,
-        sl,
-        body.len() / 4,
+        message_count: mc,
+        has_tools: ht,
+        system_prompt_length: sl,
+        estimated_input_tokens: body.len() / 4,
         sys_prompt_hash,
         working_dir,
         user_prompt_excerpt,
-    ))
+        is_internal_request,
+        cache_ttl_secs,
+    })
 }
 
 /// Strip Claude Code's injected preamble (`<system-reminder>...`,
@@ -4732,10 +5118,10 @@ fn skill_name_from_tool_input_json(raw: &str) -> Option<String> {
 }
 
 fn truncate_detail(raw: &str, max: usize) -> String {
-    if raw.len() <= max {
+    if raw.chars().count() <= max {
         raw.to_string()
     } else {
-        format!("{}...", &raw[..max.min(raw.len())])
+        format!("{}...", raw.chars().take(max).collect::<String>())
     }
 }
 
@@ -4763,7 +5149,7 @@ fn remember_skill_turn_event(event: &SkillTelemetryEvent) {
     if event.session_id.trim().is_empty() || event.session_id == "unknown" {
         return;
     }
-    let mut states = HOOK_SKILL_TURNS.lock().unwrap();
+    let mut states = lock_or_recover(&HOOK_SKILL_TURNS, "hook_skill_turns");
     let state = states.entry(event.session_id.clone()).or_default();
     match event.event_type.as_str() {
         "expected" => {
@@ -4946,7 +5332,7 @@ fn expected_skill_names_from_prompt(prompt: &str, cwd: Option<&str>) -> HashSet<
 
 fn finalize_hook_skill_turn(session_id: &str, timestamp: &str) {
     let state = {
-        let mut states = HOOK_SKILL_TURNS.lock().unwrap();
+        let mut states = lock_or_recover(&HOOK_SKILL_TURNS, "hook_skill_turns");
         states.remove(session_id).unwrap_or_default()
     };
 
@@ -5235,6 +5621,7 @@ fn body_continue() -> BodyResponse {
 }
 fn body_continue_with_upstream_adjustment(adjustment: UpstreamRequestAdjustment) -> BodyResponse {
     let mut set_headers = Vec::new();
+    let mut remove_headers = Vec::new();
     if let Some(value) = adjustment.anthropic_beta {
         set_headers.push(ProtoHeaderValueOption {
             header: Some(ProtoHeaderValue {
@@ -5245,6 +5632,9 @@ fn body_continue_with_upstream_adjustment(adjustment: UpstreamRequestAdjustment)
             append_action: HeaderAppendAction::OverwriteIfExistsOrAdd.into(),
             ..Default::default()
         });
+    }
+    if adjustment.remove_anthropic_beta {
+        remove_headers.push("anthropic-beta".to_string());
     }
     if let Some(body) = adjustment.body.as_ref() {
         set_headers.push(ProtoHeaderValueOption {
@@ -5261,10 +5651,12 @@ fn body_continue_with_upstream_adjustment(adjustment: UpstreamRequestAdjustment)
     BodyResponse {
         response: Some(CommonResponse {
             status: ResponseStatus::Continue.into(),
-            header_mutation: (!set_headers.is_empty()).then_some(HeaderMutation {
-                set_headers,
-                ..Default::default()
-            }),
+            header_mutation: (!set_headers.is_empty() || !remove_headers.is_empty()).then_some(
+                HeaderMutation {
+                    set_headers,
+                    remove_headers,
+                },
+            ),
             body_mutation: adjustment.body.map(|body| BodyMutation {
                 mutation: Some(body_mutation::Mutation::Body(body)),
             }),
@@ -5305,6 +5697,8 @@ impl ExternalProcessor for ClauditorProcessor {
             let mut sys_prompt_hash: u64 = 0;
             let mut working_dir_str = String::new();
             let mut user_prompt_excerpt_buf = String::new();
+            let mut is_internal_request = false;
+            let mut request_cache_ttl_secs: Option<u64> = None;
             let mut request_context_window_hint: Option<u64> = None;
             let mut request_anthropic_beta_values: Vec<String> = Vec::new();
             let mut context_window_tokens = STANDARD_CONTEXT_WINDOW_TOKENS;
@@ -5317,7 +5711,7 @@ impl ExternalProcessor for ClauditorProcessor {
                         // Stream closed — finalize if not already done via end_of_stream.
                         if !finalized && !model.is_empty() {
                             finalize_response(
-                                &resp_acc,
+                                &mut resp_acc,
                                 &request_id,
                                 &model,
                                 &started_at,
@@ -5326,6 +5720,8 @@ impl ExternalProcessor for ClauditorProcessor {
                                 &working_dir_str,
                                 &user_prompt_excerpt_buf,
                                 context_window_tokens,
+                                is_internal_request,
+                                request_cache_ttl_secs,
                             );
                             REQUEST_STATE.remove(&request_id);
                         }
@@ -5335,7 +5731,7 @@ impl ExternalProcessor for ClauditorProcessor {
                         warn!(error = %e, "ext_proc stream error");
                         if !finalized && !model.is_empty() {
                             finalize_response(
-                                &resp_acc,
+                                &mut resp_acc,
                                 &request_id,
                                 &model,
                                 &started_at,
@@ -5344,6 +5740,8 @@ impl ExternalProcessor for ClauditorProcessor {
                                 &working_dir_str,
                                 &user_prompt_excerpt_buf,
                                 context_window_tokens,
+                                is_internal_request,
+                                request_cache_ttl_secs,
                             );
                             REQUEST_STATE.remove(&request_id);
                         }
@@ -5355,7 +5753,8 @@ impl ExternalProcessor for ClauditorProcessor {
                     Some(ExtProcRequest::RequestHeaders(ref h)) => {
                         started_at = Instant::now();
                         request_id = extract_header(h, "x-request-id")
-                            .unwrap_or_else(|| format!("req_{}", started_at.elapsed().as_nanos()));
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or_else(fallback_request_id);
                         request_anthropic_beta_values = extract_headers(h, "anthropic-beta");
                         request_context_window_hint =
                             request_uses_1m_context(h).then_some(EXTENDED_CONTEXT_WINDOW_TOKENS);
@@ -5397,11 +5796,11 @@ impl ExternalProcessor for ClauditorProcessor {
 
                         let mut blocked = false;
                         match parse_request_body(&b.body) {
-                            Some((m, mc, ht, sl, et, hash, prefix, user_prompt_excerpt)) => {
-                                info!(phase="request_body", request_id=%request_id, model=%m, message_count=mc, has_tools=ht, system_prompt_length=sl, estimated_input_tokens=et, sys_prompt_hash=hash, "ext_proc");
+                            Some(parsed) => {
+                                info!(phase="request_body", request_id=%request_id, model=%parsed.model, message_count=parsed.message_count, has_tools=parsed.has_tools, system_prompt_length=parsed.system_prompt_length, estimated_input_tokens=parsed.estimated_input_tokens, sys_prompt_hash=parsed.sys_prompt_hash, "ext_proc");
                                 if let Some((err_type, msg)) = check_session_budget(
                                     diagnosis::SESSIONS
-                                        .get(&hash)
+                                        .get(&parsed.sys_prompt_hash)
                                         .as_deref()
                                         .map(|state| state.session_id.as_str()),
                                 ) {
@@ -5412,17 +5811,19 @@ impl ExternalProcessor for ClauditorProcessor {
                                     }
                                     blocked = true;
                                 }
-                                sys_prompt_hash = hash;
-                                working_dir_str = prefix;
+                                sys_prompt_hash = parsed.sys_prompt_hash;
+                                working_dir_str = parsed.working_dir;
                                 // Only first turn carries a meaningful "initial prompt"; for mc>1
                                 // messages[0] is still the original, but we only register the
                                 // session once (see SESSIONS.get_mut in finalize_response), so
                                 // passing the excerpt every time is harmless and first-write-wins.
-                                user_prompt_excerpt_buf = user_prompt_excerpt;
+                                user_prompt_excerpt_buf = parsed.user_prompt_excerpt;
+                                is_internal_request = parsed.is_internal_request;
+                                request_cache_ttl_secs = parsed.cache_ttl_secs;
                                 if !blocked {
                                     context_window_tokens = resolve_context_window_tokens(
                                         request_context_window_hint,
-                                        &m,
+                                        &parsed.model,
                                     );
                                     // Session ID resolved later in finalize_response.
                                     REQUEST_STATE.insert(
@@ -5430,15 +5831,15 @@ impl ExternalProcessor for ClauditorProcessor {
                                         RequestMeta {
                                             request_id: request_id.clone(),
                                             session_id: String::new(),
-                                            model: m.clone(),
-                                            message_count: mc,
-                                            has_tools: ht,
-                                            system_prompt_length: sl,
-                                            estimated_input_tokens: et,
+                                            model: parsed.model.clone(),
+                                            message_count: parsed.message_count,
+                                            has_tools: parsed.has_tools,
+                                            system_prompt_length: parsed.system_prompt_length,
+                                            estimated_input_tokens: parsed.estimated_input_tokens,
                                             started_at,
                                         },
                                     );
-                                    model = m;
+                                    model = parsed.model;
                                 }
                             }
                             None => {
@@ -5475,7 +5876,13 @@ impl ExternalProcessor for ClauditorProcessor {
                             .and_then(|s| s.parse::<u32>().ok())
                             .unwrap_or(0);
                         resp_acc.http_status = status;
-                        resp_acc.is_sse = status == 200;
+                        let content_type = extract_header(h, "content-type")
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
+                        resp_acc.is_sse =
+                            status == 200 && content_type.contains("text/event-stream");
+                        resp_acc.is_json =
+                            status == 200 && content_type.contains("application/json");
 
                         // NOTE: Anthropic does not return anthropic-ratelimit-*
                         // headers on Claude Code subscription (OAuth) traffic —
@@ -5487,7 +5894,7 @@ impl ExternalProcessor for ClauditorProcessor {
                         // Phase 7: circuit breaker — only track errors from real API requests
                         // (ones where we parsed a model). Ignores envoy DPE/protocol errors.
                         {
-                            let mut runtime = RUNTIME_STATE.lock().unwrap();
+                            let mut runtime = lock_or_recover(&RUNTIME_STATE, "runtime_state");
                             if status >= 400 && !model.is_empty() {
                                 runtime.consecutive_errors += 1;
                                 let threshold = env_u64("CLAUDITOR_CIRCUIT_BREAKER_THRESHOLD", 5);
@@ -5534,11 +5941,34 @@ impl ExternalProcessor for ClauditorProcessor {
                         if resp_acc.is_sse && !b.body.is_empty() {
                             let chunk_start = Instant::now();
                             resp_acc.process_chunk(&b.body);
+                            if !is_internal_request
+                                && !model.is_empty()
+                                && !resp_acc.deferred_watch_events.is_empty()
+                            {
+                                let session_id = ensure_session_state(
+                                    sys_prompt_hash,
+                                    &working_dir_str,
+                                    &model,
+                                    &user_prompt_excerpt_buf,
+                                );
+                                ensure_session_inserted(
+                                    sys_prompt_hash,
+                                    &session_id,
+                                    &model,
+                                    &user_prompt_excerpt_buf,
+                                );
+                                flush_deferred_watch_events(
+                                    &session_id,
+                                    resp_acc.drain_deferred_watch_events(),
+                                );
+                            }
                             let chunk_ms = chunk_start.elapsed().as_millis();
                             debug!(request_id=%request_id, chunk_ms, bytes=b.body.len(), "response_body chunk parse time");
                             if chunk_ms > 10 {
                                 warn!(request_id=%request_id, chunk_ms, bytes=b.body.len(), "response_body chunk parse exceeded 10ms");
                             }
+                        } else if resp_acc.is_json && !b.body.is_empty() {
+                            resp_acc.json_body.extend_from_slice(&b.body);
                         } else if !resp_acc.is_sse && !b.body.is_empty() {
                             // Capture error response body (capped at 1KB).
                             let remaining = 1024usize.saturating_sub(resp_acc.error_body.len());
@@ -5547,9 +5977,12 @@ impl ExternalProcessor for ClauditorProcessor {
                                 .extend_from_slice(&b.body[..b.body.len().min(remaining)]);
                         }
                         if b.end_of_stream {
+                            if resp_acc.is_json {
+                                resp_acc.process_json_body();
+                            }
                             if !model.is_empty() {
                                 finalize_response(
-                                    &resp_acc,
+                                    &mut resp_acc,
                                     &request_id,
                                     &model,
                                     &started_at,
@@ -5558,6 +5991,8 @@ impl ExternalProcessor for ClauditorProcessor {
                                     &working_dir_str,
                                     &user_prompt_excerpt_buf,
                                     context_window_tokens,
+                                    is_internal_request,
+                                    request_cache_ttl_secs,
                                 );
                             }
                             REQUEST_STATE.remove(&request_id);
@@ -5593,7 +6028,6 @@ async fn handle_health() -> &'static str {
 }
 
 async fn handle_metrics() -> impl IntoResponse {
-    metrics::set_active_sessions(active_session_count());
     match metrics::render() {
         Ok((content_type, body)) => {
             let mut headers = axum::http::HeaderMap::new();
@@ -6667,12 +7101,12 @@ async fn quota_burn_monitor() {
 
         // Snapshot the cumulative token counter.
         let total_tokens = {
-            let runtime = RUNTIME_STATE.lock().unwrap();
+            let runtime = lock_or_recover(&RUNTIME_STATE, "runtime_state");
             runtime.total_tokens
         };
 
         let per_sec = {
-            let mut t = BURN_TRACKER.lock().unwrap();
+            let mut t = lock_or_recover(&BURN_TRACKER, "burn_tracker");
             t.record(total_tokens);
             t.tokens_per_sec()
         };
@@ -6835,7 +7269,6 @@ async fn data_retention_cleanup() {
 // ---------------------------------------------------------------------------
 async fn cache_expiry_warning_monitor() {
     let warning_secs = env_u64("CLAUDITOR_CACHE_WARNING_SECS", 240);
-    let ttl_secs: u64 = 300; // Anthropic prompt cache TTL
     let check_interval = Duration::from_secs(30);
 
     loop {
@@ -6847,6 +7280,10 @@ async fn cache_expiry_warning_monitor() {
                 continue;
             }
             let idle = now.duration_since(entry.last_activity).as_secs();
+            let ttl_secs = CACHE_TRACKERS
+                .get(&entry.session_id)
+                .map(|tracker| tracker.last_ttl_secs)
+                .unwrap_or(CACHE_TTL_SECS);
             if idle >= warning_secs {
                 entry.cache_warning_sent = true;
                 let remaining = ttl_secs.saturating_sub(idle);
@@ -6954,7 +7391,9 @@ async fn session_inactivity_monitor() {
 
         for (hash, sid) in expired {
             if let Some((_, state)) = diagnosis::SESSIONS.remove(&hash) {
-                metrics::set_active_sessions(active_session_count());
+                if state.session_inserted {
+                    metrics::decrement_active_sessions();
+                }
                 info!(session_id = %sid, timeout_mins, "session ended (inactivity timeout)");
                 end_session(
                     &sid,
@@ -7039,24 +7478,28 @@ mod tests {
     use super::{
         build_diagnosis_response_json, build_postmortem_response_from_db,
         build_session_summary_json, build_sessions_response_json, build_summary_response_json,
-        canonical_telemetry_name, clean_user_prompt, compact_response_summary,
-        context_fill_percent, context_fill_ratio, db_writer_loop, derive_display_name, diagnosis,
-        ensure_session_columns, epoch_to_iso8601, extract_explicit_skill_refs, extract_header,
-        extract_headers, extract_working_dir, in_memory_postmortem_totals,
-        infer_context_window_tokens, load_degradation_view_from_db, looks_like_machine_recall_line,
-        metrics, model_requests_1m_context, normalize_search_text, now_epoch_secs,
-        parse_latest_tool_results, parse_request_body, persist_billing_reconciliation, pricing,
-        query_historical_metrics, query_summary, redact_operational_text,
-        repair_persisted_session_artifacts, repair_turn_snapshot_context_windows,
-        request_uses_1m_context, resolve_context_window_tokens, score_recall_doc,
-        seed_live_metric_labels_from_db, session_timeout_secs, should_broadcast_quota_snapshot,
-        skill_name_from_skill_file, skill_name_from_tool_input_json, strip_model_1m_alias,
-        summarize_hook_tool_input, tokenize_search_text, tool_recall_context,
+        canonical_telemetry_name, classify_cache_event, clean_user_prompt,
+        compact_response_summary, context_fill_percent, context_fill_ratio, db_writer_loop,
+        derive_display_name, diagnosis, ensure_session_columns, epoch_to_iso8601,
+        extract_explicit_skill_refs, extract_header, extract_headers, extract_working_dir,
+        fallback_request_id, in_memory_postmortem_totals, infer_context_window_tokens,
+        is_internal_request_shape, load_degradation_view_from_db, lock_or_recover,
+        looks_like_machine_recall_line, looks_like_title_request, metrics,
+        model_has_native_1m_context, model_requests_1m_context, normalize_search_text,
+        now_epoch_secs, parse_latest_tool_results, parse_request_body,
+        persist_billing_reconciliation, pricing, query_historical_metrics, query_summary,
+        redact_operational_text, repair_persisted_session_artifacts,
+        repair_turn_snapshot_context_windows, request_cache_ttl_secs, request_uses_1m_context,
+        resolve_context_window_tokens, resolve_context_window_tokens_with_config,
+        response_cache_ttl_secs, score_recall_doc, seed_live_metric_labels_from_db,
+        session_timeout_secs, should_broadcast_quota_snapshot, skill_name_from_skill_file,
+        skill_name_from_tool_input_json, strip_model_1m_alias, summarize_hook_tool_input,
+        tokenize_search_text, tool_recall_context, truncate_detail,
         upstream_request_adjustment_for_body, BillingReconciliationInput,
-        BillingReconciliationWriteError, DbCommand, HttpHeaders, ParsedToolResult, PostmortemError,
-        ProtoHeaderValue, SummaryWindowData, CONTEXT_1M_BETA, ESTIMATED_COST_SOURCE,
-        EXTENDED_CONTEXT_WINDOW_TOKENS, QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA,
-        STANDARD_CONTEXT_WINDOW_TOKENS,
+        BillingReconciliationWriteError, CacheTracker, DbCommand, HttpHeaders, ParsedToolResult,
+        PostmortemError, ProtoHeaderValue, ResponseAccumulator, SummaryWindowData,
+        ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS, QUOTA_WATCH_BROADCAST_INTERVAL,
+        SCHEMA, STANDARD_CONTEXT_WINDOW_TOKENS,
     };
 
     static METRICS_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -7080,6 +7523,8 @@ mod tests {
                 output_tokens INTEGER,
                 cache_read_tokens INTEGER DEFAULT 0,
                 cache_creation_tokens INTEGER DEFAULT 0,
+                cache_creation_5m_tokens INTEGER DEFAULT 0,
+                cache_creation_1h_tokens INTEGER DEFAULT 0,
                 cost_dollars REAL,
                 cost_source TEXT,
                 trusted_for_budget_enforcement INTEGER DEFAULT 0,
@@ -7155,6 +7600,11 @@ mod tests {
         })
     }
 
+    fn metric_scalar_line<'a>(body: &'a str, metric: &str) -> Option<&'a str> {
+        body.lines()
+            .find(|line| line.starts_with(metric) && line[metric.len()..].starts_with(' '))
+    }
+
     #[test]
     fn epoch_and_week_formatting_are_utc_stable() {
         assert_eq!(epoch_to_iso8601(0), "1970-01-01T00:00:00Z");
@@ -7187,25 +7637,17 @@ mod tests {
           ]
         }"#;
 
-        let (
-            model,
-            message_count,
-            has_tools,
-            system_len,
-            estimated_tokens,
-            hash,
-            working_dir,
-            prompt,
-        ) = parse_request_body(body).expect("parse body");
+        let parsed = parse_request_body(body).expect("parse body");
 
-        assert_eq!(model, "claude-sonnet-4-5[1m]");
-        assert_eq!(message_count, 2);
-        assert!(has_tools);
-        assert!(system_len > 0);
-        assert_eq!(estimated_tokens, body.len() / 4);
-        assert_ne!(hash, 0);
-        assert_eq!(working_dir, "/tmp/clauditor-demo");
-        assert_eq!(prompt, "Please inspect the auth cache.");
+        assert_eq!(parsed.model, "claude-sonnet-4-5[1m]");
+        assert_eq!(parsed.message_count, 2);
+        assert!(parsed.has_tools);
+        assert!(parsed.system_prompt_length > 0);
+        assert_eq!(parsed.estimated_input_tokens, body.len() / 4);
+        assert_ne!(parsed.sys_prompt_hash, 0);
+        assert_eq!(parsed.working_dir, "/tmp/clauditor-demo");
+        assert_eq!(parsed.user_prompt_excerpt, "Please inspect the auth cache.");
+        assert!(!parsed.is_internal_request);
         assert_eq!(
             extract_working_dir("Primary working directory: /tmp/demo").as_deref(),
             Some("/tmp/demo")
@@ -7213,7 +7655,252 @@ mod tests {
     }
 
     #[test]
-    fn upstream_adjustment_strips_1m_model_alias_and_adds_beta_header() {
+    fn request_body_parser_keeps_haiku_coding_sessions_but_excludes_title_requests() {
+        let coding = br#"{
+          "model": "claude-haiku-4-5-20251001",
+          "system": "Primary working directory: /tmp/clauditor-haiku",
+          "tools": [{ "name": "Read" }],
+          "messages": [
+            { "role": "user", "content": "Use Haiku to inspect the cache module." }
+          ]
+        }"#;
+        let parsed = parse_request_body(coding).expect("parse coding request");
+        assert_eq!(parsed.model, "claude-haiku-4-5-20251001");
+        assert_eq!(parsed.working_dir, "/tmp/clauditor-haiku");
+        assert!(!parsed.is_internal_request);
+
+        let title = br#"{
+          "model": "claude-haiku-4-5-20251001",
+          "system": "",
+          "messages": [
+            { "role": "user", "content": "Generate a short title for this conversation." }
+          ]
+        }"#;
+        let parsed = parse_request_body(title).expect("parse title request");
+        assert!(parsed.is_internal_request);
+        assert!(is_internal_request_shape(
+            "",
+            0,
+            1,
+            false,
+            &parsed.user_prompt_excerpt
+        ));
+
+        assert!(!looks_like_title_request(
+            "Use Haiku to generate code for this session",
+            1,
+            true
+        ));
+    }
+
+    #[test]
+    fn request_cache_ttl_tracks_5m_and_1h_cache_controls() {
+        let one_hour = serde_json::json!({
+            "system": [
+                {
+                    "type": "text",
+                    "text": "Primary working directory: /tmp/cache",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }
+            ],
+            "messages": []
+        });
+        assert_eq!(request_cache_ttl_secs(&one_hour), Some(3600));
+
+        let mixed = serde_json::json!({
+            "system": [
+                {
+                    "type": "text",
+                    "text": "Primary working directory: /tmp/cache",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }
+            ],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "short-lived",
+                            "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                        }
+                    ]
+                }
+            ]
+        });
+        assert_eq!(request_cache_ttl_secs(&mixed), Some(300));
+    }
+
+    #[test]
+    fn response_accumulator_parses_streaming_sse_usage_model_text_and_tools() {
+        let mut acc = ResponseAccumulator::new();
+        let events = vec![
+            serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "model": "claude-sonnet-4-6-20260217",
+                    "usage": {
+                        "input_tokens": 1200,
+                        "cache_read_input_tokens": 80,
+                        "cache_creation_input_tokens": 420,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 320,
+                            "ephemeral_1h_input_tokens": 100
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "type": "content_block_start",
+                "content_block": {"type": "tool_use", "name": "Read", "input": {}}
+            }),
+            serde_json::json!({
+                "type": "content_block_delta",
+                "delta": {"type": "input_json_delta", "partial_json": "{\"file_path\":\"src/lib.rs\"}"}
+            }),
+            serde_json::json!({"type": "content_block_stop"}),
+            serde_json::json!({
+                "type": "content_block_start",
+                "content_block": {"type": "text", "text": ""}
+            }),
+            serde_json::json!({
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "héllo"}
+            }),
+            serde_json::json!({"type": "content_block_stop"}),
+            serde_json::json!({
+                "type": "message_delta",
+                "usage": {"output_tokens": 90}
+            }),
+        ];
+        let sse = events
+            .into_iter()
+            .map(|event| format!("data: {}\n\n", serde_json::to_string(&event).unwrap()))
+            .collect::<String>();
+        let bytes = sse.as_bytes();
+        let split = bytes
+            .iter()
+            .position(|byte| *byte == 0xc3)
+            .expect("contains multibyte char")
+            + 1;
+
+        acc.process_chunk(&bytes[..split]);
+        acc.process_chunk(&bytes[split..]);
+
+        assert_eq!(
+            acc.response_model.as_deref(),
+            Some("claude-sonnet-4-6-20260217")
+        );
+        assert_eq!(acc.input_tokens, 1200);
+        assert_eq!(acc.output_tokens, 90);
+        assert_eq!(acc.cache_read_tokens, 80);
+        assert_eq!(acc.cache_creation_tokens, 420);
+        assert_eq!(acc.cache_creation_5m_tokens, 320);
+        assert_eq!(acc.cache_creation_1h_tokens, 100);
+        assert_eq!(acc.tool_calls, vec!["Read"]);
+        assert_eq!(acc.response_text, "héllo");
+        assert!(acc.deferred_watch_events.iter().any(|event| {
+            matches!(
+                event,
+                crate::watch::WatchEvent::ToolUse { tool_name, summary, .. }
+                    if tool_name == "Read" && summary == "src/lib.rs"
+            )
+        }));
+    }
+
+    #[test]
+    fn response_accumulator_parses_non_streaming_json_like_sse_contract() {
+        let mut acc = ResponseAccumulator::new();
+        acc.json_body = serde_json::to_vec(&serde_json::json!({
+            "id": "msg_fake",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-haiku-4-5-20251001",
+            "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Skill", "input": {"skill_name": "qa"}},
+                {"type": "text", "text": "Done without streaming."}
+            ],
+            "usage": {
+                "input_tokens": 100,
+                "cache_read_input_tokens": 20,
+                "cache_creation_input_tokens": 30,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 0,
+                    "ephemeral_1h_input_tokens": 30
+                },
+                "output_tokens": 40
+            }
+        }))
+        .expect("json body");
+
+        acc.process_json_body();
+
+        assert_eq!(
+            acc.response_model.as_deref(),
+            Some("claude-haiku-4-5-20251001")
+        );
+        assert_eq!(acc.input_tokens, 100);
+        assert_eq!(acc.output_tokens, 40);
+        assert_eq!(acc.cache_read_tokens, 20);
+        assert_eq!(acc.cache_creation_tokens, 30);
+        assert_eq!(acc.cache_creation_5m_tokens, 0);
+        assert_eq!(acc.cache_creation_1h_tokens, 30);
+        assert_eq!(acc.tool_calls, vec!["Skill"]);
+        assert_eq!(acc.response_text, "Done without streaming.");
+        assert_eq!(response_cache_ttl_secs(&acc, Some(300)), 3600);
+        assert!(acc.deferred_watch_events.iter().any(|event| {
+            matches!(
+                event,
+                crate::watch::WatchEvent::SkillEvent { skill_name, .. } if skill_name == "qa"
+            )
+        }));
+    }
+
+    #[test]
+    fn cache_classification_uses_ttl_and_thresholded_thrash() {
+        let now = Instant::now();
+
+        let mut tracker = CacheTracker::new();
+        assert_eq!(
+            classify_cache_event(&mut tracker, now, 0, 100, 300),
+            "cold_start"
+        );
+        assert_eq!(
+            classify_cache_event(&mut tracker, now + Duration::from_secs(20), 80, 0, 300),
+            "hit"
+        );
+
+        let mut tracker = CacheTracker::new();
+        assert_eq!(
+            classify_cache_event(&mut tracker, now, 0, 100, 300),
+            "cold_start"
+        );
+        assert_eq!(
+            classify_cache_event(&mut tracker, now + Duration::from_secs(10), 0, 100, 300),
+            "miss_rebuild"
+        );
+        assert_eq!(
+            classify_cache_event(&mut tracker, now + Duration::from_secs(20), 0, 100, 300),
+            "miss_rebuild"
+        );
+        assert_eq!(
+            classify_cache_event(&mut tracker, now + Duration::from_secs(30), 0, 100, 300),
+            "miss_thrash"
+        );
+
+        let mut tracker = CacheTracker::new();
+        assert_eq!(
+            classify_cache_event(&mut tracker, now, 0, 100, 300),
+            "cold_start"
+        );
+        assert_eq!(
+            classify_cache_event(&mut tracker, now + Duration::from_secs(301), 0, 100, 300),
+            "miss_ttl"
+        );
+    }
+
+    #[test]
+    fn upstream_adjustment_strips_1m_model_alias_without_adding_retired_beta_header() {
         let body = br#"{
           "model": "claude-opus-4-7[1m]",
           "max_tokens": 10,
@@ -7226,7 +7913,8 @@ mod tests {
                 .expect("valid rewritten json");
 
         assert_eq!(rewritten["model"], "claude-opus-4-7");
-        assert_eq!(adjustment.anthropic_beta.as_deref(), Some(CONTEXT_1M_BETA));
+        assert_eq!(adjustment.anthropic_beta, None);
+        assert!(!adjustment.remove_anthropic_beta);
         assert_eq!(
             strip_model_1m_alias("claude-opus-4-7[1M]"),
             Some("claude-opus-4-7")
@@ -7234,22 +7922,24 @@ mod tests {
     }
 
     #[test]
-    fn upstream_adjustment_preserves_existing_betas_without_duplicate_context_header() {
+    fn upstream_adjustment_removes_retired_context_beta_when_normalizing_alias() {
         let body = br#"{"model":"claude-sonnet-4-6[1m]","messages":[]}"#;
         let existing = vec!["prompt-tools-2025-04-02".to_string()];
 
         let adjustment = upstream_request_adjustment_for_body(&existing, body);
 
-        assert_eq!(
-            adjustment.anthropic_beta.as_deref(),
-            Some("prompt-tools-2025-04-02, context-1m-2025-08-07")
-        );
+        assert!(adjustment.anthropic_beta.is_none());
+        assert!(!adjustment.remove_anthropic_beta);
 
         let already_has_context =
             vec!["prompt-tools-2025-04-02, context-1m-2025-08-07".to_string()];
         let adjustment = upstream_request_adjustment_for_body(&already_has_context, body);
 
-        assert!(adjustment.anthropic_beta.is_none());
+        assert_eq!(
+            adjustment.anthropic_beta.as_deref(),
+            Some("prompt-tools-2025-04-02")
+        );
+        assert!(adjustment.remove_anthropic_beta);
         assert!(adjustment.body.is_some());
     }
 
@@ -7947,6 +8637,61 @@ mod tests {
     }
 
     #[test]
+    fn historical_metrics_prices_cache_waste_with_5m_and_1h_buckets() {
+        let conn = create_history_test_db();
+        let now = 1_776_700_000;
+        let one_hour_ago = epoch_to_iso8601(now - 3_600);
+        insert_session(
+            &conn,
+            "session-cache-buckets",
+            &one_hour_ago,
+            Some(&one_hour_ago),
+            "claude-sonnet-4-6",
+            None,
+        );
+        conn.execute(
+            "INSERT INTO requests (
+                request_id, session_id, timestamp, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, cache_creation_5m_tokens,
+                cache_creation_1h_tokens, cost_dollars, cost_source,
+                trusted_for_budget_enforcement, duration_ms, tool_calls, cache_event
+            ) VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 300000, 100000, 200000, NULL, NULL, NULL, 0, '[]', 'miss_thrash')",
+            rusqlite::params![
+                "req-cache-buckets",
+                "session-cache-buckets",
+                one_hour_ago,
+                "claude-sonnet-4-6",
+            ],
+        )
+        .expect("insert bucketed request");
+
+        let windows = query_historical_metrics(&conn, now).expect("query history");
+        let one_day = history_window(&windows, "1d");
+        let expected_spend = pricing::estimate_cost_dollars_with_cache_buckets(
+            "claude-sonnet-4-6",
+            0,
+            0,
+            0,
+            100_000,
+            200_000,
+        )
+        .total_cost_dollars;
+        let expected_waste = pricing::estimate_cache_rebuild_waste_dollars_with_cache_buckets(
+            "claude-sonnet-4-6",
+            100_000,
+            200_000,
+        )
+        .total_cost_dollars;
+
+        assert!((one_day.estimated_spend_dollars - expected_spend).abs() < 1e-9);
+        assert_eq!(one_day.cache_events.get("miss_thrash"), Some(&1));
+        assert_eq!(
+            one_day.estimated_cache_waste_dollars_by_model.get("sonnet"),
+            Some(&expected_waste)
+        );
+    }
+
+    #[test]
     fn historical_metrics_render_exposes_new_metrics() {
         let _guard = METRICS_TEST_LOCK.lock().unwrap();
         metrics::init();
@@ -8030,6 +8775,41 @@ mod tests {
             ],
             " 0"
         ));
+    }
+
+    #[test]
+    fn metrics_render_does_not_recompute_active_sessions_from_session_map() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        metrics::init();
+
+        let (_, before) = metrics::render().expect("render metrics before");
+        let before_line = metric_scalar_line(&before, "clauditor_active_sessions")
+            .expect("active sessions line before")
+            .to_string();
+
+        let hash = 0xfeed_beef_u64;
+        diagnosis::SESSIONS.insert(
+            hash,
+            diagnosis::SessionState {
+                session_id: "session_metrics_scan_guard".to_string(),
+                display_name: "metrics-scan-guard".to_string(),
+                model: "claude-sonnet-4-6".to_string(),
+                initial_prompt: None,
+                created_at: Instant::now(),
+                last_activity: Instant::now(),
+                session_inserted: true,
+                cache_warning_sent: false,
+                idle_postmortem_sent: false,
+            },
+        );
+
+        let (_, after) = metrics::render().expect("render metrics after");
+        let after_line = metric_scalar_line(&after, "clauditor_active_sessions")
+            .expect("active sessions line after")
+            .to_string();
+        let _ = diagnosis::SESSIONS.remove(&hash);
+
+        assert_eq!(before_line, after_line);
     }
 
     #[test]
@@ -8885,14 +9665,44 @@ mod tests {
     }
 
     #[test]
-    fn resolve_context_window_tokens_accepts_model_suffix() {
+    fn resolve_context_window_tokens_uses_capabilities_aliases_and_standard_models() {
+        assert!(model_has_native_1m_context("claude-sonnet-4-6"));
+        assert!(model_has_native_1m_context("claude-opus-4-7"));
+        assert!(model_has_native_1m_context("claude-4-6-sonnet-20260217"));
+        assert!(!model_has_native_1m_context("claude-sonnet-4-5"));
+        assert!(!model_has_native_1m_context("claude-3-7-sonnet-20250219"));
+        assert!(!model_has_native_1m_context("claude-sonnet-20250219"));
         assert_eq!(
             resolve_context_window_tokens(None, "claude-sonnet-4-6[1m]"),
             EXTENDED_CONTEXT_WINDOW_TOKENS
         );
         assert_eq!(
             resolve_context_window_tokens(None, "claude-sonnet-4-6"),
+            EXTENDED_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            resolve_context_window_tokens(None, "claude-opus-4-7"),
+            EXTENDED_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            resolve_context_window_tokens(None, "claude-sonnet-4-5"),
             STANDARD_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            resolve_context_window_tokens(None, "claude-haiku-4-5"),
+            STANDARD_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            resolve_context_window_tokens(Some(123_456), "claude-haiku-4-5"),
+            123_456
+        );
+        assert_eq!(
+            resolve_context_window_tokens_with_config(
+                Some(400_000),
+                Some(123_456),
+                "claude-haiku-4-5"
+            ),
+            400_000
         );
     }
 
@@ -9107,6 +9917,59 @@ mod tests {
             Some(0.24)
         );
         assert!(json.get("rebuild_cost_dollars").is_none());
+    }
+
+    #[test]
+    fn quota_burn_event_is_not_labeled_as_provider_rate_limit_state() {
+        let json = serde_json::to_value(crate::watch::WatchEvent::RateLimitStatus {
+            seconds_to_reset: Some(3600),
+            requests_remaining: None,
+            requests_limit: None,
+            input_tokens_remaining: None,
+            output_tokens_remaining: None,
+            tokens_used_this_week: Some(42),
+            tokens_limit: Some(100),
+            tokens_remaining: Some(58),
+            budget_source: Some("env".to_string()),
+            projected_exhaustion_secs: None,
+        })
+        .expect("serialize quota event");
+
+        assert_eq!(
+            json.get("type").and_then(|value| value.as_str()),
+            Some("quota_burn_status")
+        );
+        assert!(serde_json::to_string(&json)
+            .expect("serialize quota json")
+            .contains("tokens_used_this_week"));
+    }
+
+    #[test]
+    fn fallback_request_ids_are_unique() {
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..512 {
+            assert!(ids.insert(fallback_request_id()));
+        }
+    }
+
+    #[test]
+    fn lock_or_recover_returns_guard_after_poisoning() {
+        let mutex = std::sync::Arc::new(Mutex::new(41_u32));
+        let poisoned = mutex.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("lock before poison");
+            panic!("poison test mutex");
+        })
+        .join();
+
+        let mut guard = lock_or_recover(mutex.as_ref(), "poison_test");
+        *guard += 1;
+        assert_eq!(*guard, 42);
+    }
+
+    #[test]
+    fn truncation_helpers_are_utf8_safe() {
+        assert_eq!(truncate_detail("åβ中🙂done", 4), "åβ中🙂...");
     }
 
     #[tokio::test]

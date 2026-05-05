@@ -265,6 +265,7 @@ pub(crate) enum WatchEvent {
         #[serde(default)]
         turns_to_compact: Option<u32>,
     },
+    #[serde(rename = "quota_burn_status", alias = "rate_limit_status")]
     RateLimitStatus {
         #[serde(default)]
         seconds_to_reset: Option<u64>,
@@ -365,6 +366,8 @@ enum PortState {
 enum WatchHandle {
     Plain(Child),
     TmuxSession(String),
+    #[cfg(test)]
+    Test(std::sync::Arc<std::sync::Mutex<Vec<String>>>),
 }
 
 impl WatchHandle {
@@ -380,6 +383,13 @@ impl WatchHandle {
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
+            }
+            #[cfg(test)]
+            WatchHandle::Test(events) => {
+                events
+                    .lock()
+                    .expect("test watch events lock")
+                    .push("stop".to_string());
             }
         }
     }
@@ -1051,18 +1061,26 @@ fn tmux_session_name() -> String {
     format!("clauditor-watch-{}", std::process::id())
 }
 
-fn start_watcher() -> Result<WatchHandle, String> {
+fn watcher_args(core_url: String, tmux: bool, no_postmortem: bool) -> Vec<String> {
+    let mut args = vec!["watch".to_string()];
+    if tmux {
+        args.push("--tmux".to_string());
+    }
+    args.extend(["--url".to_string(), core_url]);
+    if no_postmortem {
+        args.push("--no-postmortem".to_string());
+    }
+    args
+}
+
+fn start_watcher(no_postmortem: bool) -> Result<WatchHandle, String> {
     let cli_path = current_cli_path();
     let core_url = clauditor_core_url();
     if command_exists("tmux") {
         let session = tmux_session_name();
-        let command = shell_join(&[
-            cli_path,
-            "watch".to_string(),
-            "--tmux".to_string(),
-            "--url".to_string(),
-            core_url.clone(),
-        ]);
+        let mut command_parts = vec![cli_path];
+        command_parts.extend(watcher_args(core_url.clone(), true, no_postmortem));
+        let command = shell_join(&command_parts);
         let status = Command::new("tmux")
             .args(["new-session", "-d", "-s", &session, &command])
             .stdin(Stdio::null())
@@ -1077,8 +1095,9 @@ fn start_watcher() -> Result<WatchHandle, String> {
         return Ok(WatchHandle::TmuxSession(session));
     }
 
+    let args = watcher_args(core_url, false, no_postmortem);
     let child = Command::new(cli_path)
-        .args(["watch", "--url", core_url.as_str()])
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -1114,20 +1133,35 @@ fn run_command_with_env(
     Ok(exit_code(status))
 }
 
-async fn run_child_command(watch_flag: bool, command: Vec<String>) -> i32 {
+async fn run_child_command_with_deps<Ensure, EnsureFut, Start, Run, Render, RenderFut>(
+    watch_flag: bool,
+    command: Vec<String>,
+    ensure_stack: Ensure,
+    start_watcher_fn: Start,
+    run_command_fn: Run,
+    render_final_postmortem: Render,
+) -> i32
+where
+    Ensure: FnOnce() -> EnsureFut,
+    EnsureFut: std::future::Future<Output = Result<(), String>>,
+    Start: FnOnce(bool) -> Result<WatchHandle, String>,
+    Run: FnOnce(&str, &[String], &[(&str, &str)]) -> Result<i32, String>,
+    Render: FnOnce(String) -> RenderFut,
+    RenderFut: std::future::Future<Output = ()>,
+{
     let (watch, child_command) = extract_run_watch(watch_flag, command);
     if child_command.is_empty() {
         eprintln!("Error: missing command after `clauditor run`");
         return 1;
     }
 
-    if let Err(err) = ensure_stack_running().await {
+    if let Err(err) = ensure_stack().await {
         eprintln!("Error: {err}");
         return 1;
     }
 
     let mut watcher = if watch {
-        match start_watcher() {
+        match start_watcher_fn(true) {
             Ok(handle) => Some(handle),
             Err(err) => {
                 eprintln!("Error: {err}");
@@ -1141,7 +1175,7 @@ async fn run_child_command(watch_flag: bool, command: Vec<String>) -> i32 {
     let command_name = &child_command[0];
     let command_args = &child_command[1..];
     let proxy_url = envoy_proxy_url();
-    let result = run_command_with_env(
+    let result = run_command_fn(
         command_name,
         command_args,
         &[("ANTHROPIC_BASE_URL", proxy_url.as_str())],
@@ -1151,6 +1185,10 @@ async fn run_child_command(watch_flag: bool, command: Vec<String>) -> i32 {
         handle.stop();
     }
 
+    if watch && result.is_ok() {
+        render_final_postmortem(clauditor_core_url()).await;
+    }
+
     match result {
         Ok(code) => code,
         Err(err) => {
@@ -1158,6 +1196,20 @@ async fn run_child_command(watch_flag: bool, command: Vec<String>) -> i32 {
             1
         }
     }
+}
+
+async fn run_child_command(watch_flag: bool, command: Vec<String>) -> i32 {
+    run_child_command_with_deps(
+        watch_flag,
+        command,
+        ensure_stack_running,
+        start_watcher,
+        run_command_with_env,
+        |base_url| async move {
+            render_run_final_postmortem(&base_url).await;
+        },
+    )
+    .await
 }
 
 fn parse_local_datetime(iso: &str) -> Option<DateTime<Local>> {
@@ -1232,7 +1284,7 @@ fn now_hms() -> String {
 }
 
 /// Extract session_id from any WatchEvent variant. Returns None for global
-/// events (Lagged, RateLimitStatus).
+/// events (Lagged, quota-burn status).
 pub(crate) fn event_session_id(event: &WatchEvent) -> Option<&str> {
     match event {
         WatchEvent::ToolUse { session_id, .. }
@@ -1477,11 +1529,7 @@ fn render_event(
         } => {
             let time = local_time_from_iso(timestamp);
             if let Some((server, tool)) = parse_mcp_tool_name(tool_name) {
-                let summary_display = if summary.len() > 80 {
-                    format!("{}...", &summary[..77])
-                } else {
-                    summary.clone()
-                };
+                let summary_display = truncate_for_box(summary, 80);
                 let line = if summary_display.is_empty() {
                     format!("{}  MCP     {}.{}", time, server, tool)
                 } else {
@@ -1491,11 +1539,7 @@ fn render_event(
                 return;
             }
             let label = format!("{:<6}", tool_name.to_uppercase());
-            let summary_display = if summary.len() > 80 {
-                format!("{}...", &summary[..77])
-            } else {
-                summary.clone()
-            };
+            let summary_display = truncate_for_box(summary, 80);
 
             let line = format!("{}  {}  {}", time, label, summary_display);
             let colored_line = match tool_name.as_str() {
@@ -1628,6 +1672,10 @@ fn render_event(
                     .cyan()
                     .dimmed()
                     .to_string(),
+                "miss_rebuild" => format!("{}  CACHE   \u{25cb} rebuild", time)
+                    .yellow()
+                    .dimmed()
+                    .to_string(),
                 "miss_ttl" => format!("{}  CACHE   \u{25cb} miss (TTL)", time)
                     .yellow()
                     .to_string(),
@@ -1669,7 +1717,7 @@ fn render_event(
             print_tagged(
                 &tag,
                 &format!(
-                    "{}  \u{26a0}  MODEL FALLBACK  requested {}, got {}",
+                    "{}  \u{26a0}  MODEL ROUTE  requested {}, got {}",
                     time, requested, actual
                 )
                 .yellow()
@@ -2282,9 +2330,20 @@ async fn run_claude_postmortem_analysis_with_command(
     }
 }
 
+async fn run_claude_postmortem_analysis_with_lookup<Lookup>(
+    report: &serde_json::Value,
+    lookup: Lookup,
+    timeout: Duration,
+) -> Result<String, String>
+where
+    Lookup: FnOnce(&str) -> Option<PathBuf>,
+{
+    let claude = lookup("claude").ok_or_else(|| "claude command not found".to_string())?;
+    run_claude_postmortem_analysis_with_command(&claude, report, timeout).await
+}
+
 async fn run_claude_postmortem_analysis(report: &serde_json::Value) -> Result<String, String> {
-    let claude = command_path("claude").ok_or_else(|| "claude command not found".to_string())?;
-    run_claude_postmortem_analysis_with_command(&claude, report, Duration::from_secs(120)).await
+    run_claude_postmortem_analysis_with_lookup(report, command_path, Duration::from_secs(120)).await
 }
 
 async fn render_postmortem_markdown_with_optional_analysis(
@@ -2323,6 +2382,41 @@ async fn render_postmortem_markdown_with_optional_analysis(
             markdown,
             Some(format!("Claude analysis unavailable: {err}")),
         ),
+    }
+}
+
+async fn fetch_run_final_postmortem_markdown(
+    base_url: &str,
+    analyze_with_claude: bool,
+) -> Result<(String, Option<String>), String> {
+    let report =
+        fetch_postmortem_json_with_retry(base_url, "last", true, 8, Duration::from_millis(500))
+            .await?;
+    Ok(render_postmortem_markdown_with_optional_analysis(
+        base_url,
+        "last",
+        &report,
+        analyze_with_claude,
+    )
+    .await)
+}
+
+async fn render_run_final_postmortem(base_url: &str) {
+    match fetch_run_final_postmortem_markdown(base_url, claude_analysis_enabled(false, false)).await
+    {
+        Ok((markdown, warning)) => {
+            if let Some(warning) = warning {
+                eprintln!("{}", warning.yellow());
+            }
+            println!();
+            print!("{markdown}");
+        }
+        Err(err) => {
+            eprintln!(
+                "{}",
+                format!("Final postmortem unavailable: {err}").yellow()
+            );
+        }
     }
 }
 
@@ -2841,19 +2935,20 @@ async fn connect_and_stream(
     let mut stream = resp.bytes_stream();
     use futures_util::StreamExt;
 
-    let mut line_buffer = String::new();
+    let mut line_buffer = Vec::new();
     let mut data_buffer = String::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        let text = String::from_utf8_lossy(&chunk);
-        line_buffer.push_str(&text);
+        line_buffer.extend_from_slice(&chunk);
 
-        while let Some(newline_pos) = line_buffer.find('\n') {
-            let line = line_buffer[..newline_pos]
-                .trim_end_matches('\r')
-                .to_string();
-            line_buffer = line_buffer[newline_pos + 1..].to_string();
+        while let Some(newline_pos) = line_buffer.iter().position(|byte| *byte == b'\n') {
+            let line_bytes = line_buffer[..newline_pos].to_vec();
+            line_buffer.drain(..=newline_pos);
+            let Ok(line) = std::str::from_utf8(&line_bytes) else {
+                continue;
+            };
+            let line = line.trim_end_matches('\r');
 
             if let Some(data) = line.strip_prefix("data: ") {
                 data_buffer.push_str(data);
@@ -2932,10 +3027,12 @@ mod tests {
     use super::{
         append_claude_analysis_section, auto_postmortem_target, build_claude_analysis_prompt,
         claude_analysis_enabled, compact_datetime_from_iso, event_session_id, extract_run_watch,
-        format_duration_coarse, format_tokens, local_time_from_iso, parse_mcp_tool_name,
-        push_unique, render_postmortem_markdown, run_claude_postmortem_analysis_with_command,
-        shell_join, shell_quote, truncate_for_box, yaml_quote, ActiveSessions, Cli, Commands,
-        WatchEvent, WatchPostmortemState,
+        fetch_run_final_postmortem_markdown, format_duration_coarse, format_tokens,
+        local_time_from_iso, parse_mcp_tool_name, push_unique, render_postmortem_markdown,
+        render_postmortem_markdown_with_optional_analysis, run_child_command_with_deps,
+        run_claude_postmortem_analysis_with_command, run_claude_postmortem_analysis_with_lookup,
+        shell_join, shell_quote, truncate_for_box, watcher_args, yaml_quote, ActiveSessions, Cli,
+        Commands, WatchEvent, WatchPostmortemState,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
@@ -2945,7 +3042,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -3064,6 +3161,74 @@ mod tests {
         (url, rx)
     }
 
+    fn serve_postmortem_last_once(body: &str) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind postmortem server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let body = body.to_string();
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept postmortem request");
+            let request = read_http_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write postmortem response");
+            tx.send(request).expect("send captured request");
+        });
+
+        (url, rx)
+    }
+
+    fn serve_postmortem_response_once(
+        status: &str,
+        body: &str,
+    ) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind postmortem server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let status = status.to_string();
+        let body = body.to_string();
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept postmortem request");
+            let request = read_http_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write postmortem response");
+            tx.send(request).expect("send captured request");
+        });
+
+        (url, rx)
+    }
+
+    fn fake_claude_script(
+        label: &str,
+        script_body: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = unique_test_dir(label);
+        let executable = dir.join("claude");
+        {
+            let mut file = fs::File::create(&executable).expect("create fake claude");
+            writeln!(file, "#!/bin/sh").expect("write fake claude");
+            write!(file, "{script_body}").expect("write fake claude");
+        }
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&executable).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&executable, permissions).expect("chmod fake claude");
+        }
+        (dir, executable)
+    }
+
     #[test]
     fn local_time_from_iso_converts_from_rfc3339() {
         let iso = "2026-04-21T13:04:39Z";
@@ -3122,6 +3287,22 @@ mod tests {
             "clauditor 'hello world'"
         );
         assert_eq!(yaml_quote(r#"a\b"c"#), r#""a\\b\"c""#);
+    }
+
+    #[test]
+    fn side_watcher_args_can_disable_auto_postmortem() {
+        assert_eq!(
+            watcher_args("http://core".to_string(), false, true),
+            vec!["watch", "--url", "http://core", "--no-postmortem"]
+        );
+        assert_eq!(
+            watcher_args("http://core".to_string(), true, true),
+            vec!["watch", "--tmux", "--url", "http://core", "--no-postmortem"]
+        );
+        assert_eq!(
+            watcher_args("http://core".to_string(), false, false),
+            vec!["watch", "--url", "http://core"]
+        );
     }
 
     #[test]
@@ -3220,6 +3401,59 @@ mod tests {
                 "--model",
                 "opus"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_watch_preserves_child_exit_code_and_renders_final_postmortem() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let exit_code = run_child_command_with_deps(
+            true,
+            vec!["fake-child".to_string(), "--flag".to_string()],
+            || async { Ok(()) },
+            {
+                let events = events.clone();
+                move |no_postmortem| {
+                    assert!(no_postmortem);
+                    events
+                        .lock()
+                        .expect("test events lock")
+                        .push("start".to_string());
+                    Ok(super::WatchHandle::Test(events.clone()))
+                }
+            },
+            {
+                let events = events.clone();
+                move |command, args, envs| {
+                    assert_eq!(command, "fake-child");
+                    assert_eq!(args, &[String::from("--flag")]);
+                    assert!(envs
+                        .iter()
+                        .any(|(key, value)| *key == "ANTHROPIC_BASE_URL" && !value.is_empty()));
+                    events
+                        .lock()
+                        .expect("test events lock")
+                        .push("run".to_string());
+                    Ok(23)
+                }
+            },
+            {
+                let events = events.clone();
+                move |_base_url| async move {
+                    events
+                        .lock()
+                        .expect("test events lock")
+                        .push("render".to_string());
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(exit_code, 23);
+        assert_eq!(
+            *events.lock().expect("test events lock"),
+            vec!["start", "run", "stop", "render"]
         );
     }
 
@@ -3519,25 +3753,16 @@ mod tests {
 
     #[tokio::test]
     async fn claude_analysis_runner_accepts_fake_claude_command() {
-        let dir = unique_test_dir("fake-claude");
-        let executable = dir.join("claude");
-        {
-            let mut file = fs::File::create(&executable).expect("create fake claude");
-            writeln!(file, "#!/bin/sh").expect("write fake claude");
-            writeln!(file, "cat >/dev/null").expect("write fake claude");
-            writeln!(file, "printf '%s\\n' '## Claude Analysis'").expect("write fake claude");
-            writeln!(file, "printf '%s\\n' '- Likely cause: cache rebuild'")
-                .expect("write fake claude");
-            writeln!(file, "printf '%s\\n' '## Restart Prompt'").expect("write fake claude");
-            writeln!(file, "printf '%s\\n' 'Start fresh with a summary.'")
-                .expect("write fake claude");
-        }
-        #[cfg(unix)]
-        {
-            let mut permissions = fs::metadata(&executable).expect("metadata").permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&executable, permissions).expect("chmod fake claude");
-        }
+        let (dir, executable) = fake_claude_script(
+            "fake-claude",
+            concat!(
+                "cat >/dev/null\n",
+                "printf '%s\\n' '## Claude Analysis'\n",
+                "printf '%s\\n' '- Likely cause: cache rebuild'\n",
+                "printf '%s\\n' '## Restart Prompt'\n",
+                "printf '%s\\n' 'Start fresh with a summary.'\n",
+            ),
+        );
 
         let report = serde_json::json!({
             "session_id": "session_target",
@@ -3555,6 +3780,116 @@ mod tests {
         assert!(analysis.contains("## Claude Analysis"));
         assert!(analysis.contains("cache rebuild"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn claude_analysis_reports_missing_claude_command() {
+        let report = serde_json::json!({
+            "session_id": "session_target",
+            "redacted": true
+        });
+        let err = run_claude_postmortem_analysis_with_lookup(
+            &report,
+            |_| None,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("missing claude should fail");
+
+        assert!(err.contains("claude command not found"));
+    }
+
+    #[tokio::test]
+    async fn claude_analysis_reports_nonzero_exit() {
+        let (dir, executable) = fake_claude_script(
+            "fake-claude-nonzero",
+            "cat >/dev/null\necho analysis failed >&2\nexit 42\n",
+        );
+        let report = serde_json::json!({
+            "session_id": "session_target",
+            "redacted": true
+        });
+
+        let err = run_claude_postmortem_analysis_with_command(
+            &executable,
+            &report,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("nonzero claude should fail");
+
+        assert!(err.contains("claude exited"));
+        assert!(err.contains("analysis failed"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn claude_analysis_reports_timeout() {
+        let (dir, executable) = fake_claude_script("fake-claude-timeout", "sleep 5\n");
+        let report = serde_json::json!({
+            "session_id": "session_target",
+            "redacted": true
+        });
+
+        let err = run_claude_postmortem_analysis_with_command(
+            &executable,
+            &report,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("timed out claude should fail");
+
+        assert!(err.contains("claude analysis timed out"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn claude_analysis_reports_empty_output() {
+        let (dir, executable) = fake_claude_script("fake-claude-empty", "cat >/dev/null\nexit 0\n");
+        let report = serde_json::json!({
+            "session_id": "session_target",
+            "redacted": true
+        });
+
+        let err = run_claude_postmortem_analysis_with_command(
+            &executable,
+            &report,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect_err("empty claude output should fail");
+
+        assert!(err.contains("claude returned empty analysis"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn optional_claude_analysis_warns_when_redacted_refetch_fails() {
+        let report = serde_json::json!({
+            "session_id": "session_unredacted",
+            "redacted": false,
+            "summary": {
+                "outcome": "Likely Completed"
+            }
+        });
+        let (url, request_rx) =
+            serve_postmortem_response_once("500 Internal Server Error", "broken");
+
+        let (markdown, warning) = render_postmortem_markdown_with_optional_analysis(
+            &url,
+            "session_unredacted",
+            &report,
+            true,
+        )
+        .await;
+
+        assert!(markdown.contains("session_unredacted"));
+        let warning = warning.expect("redacted refetch warning");
+        assert!(warning.contains("redacted evidence could not be fetched"));
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured redacted refetch");
+        assert!(request.starts_with("GET /api/postmortem/session_unredacted?redact=true "));
     }
 
     #[tokio::test]
@@ -3636,6 +3971,69 @@ mod tests {
             }),
             Some(("session_target".to_string(), "session_target:1".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn run_final_postmortem_fetches_last_without_watch_event() {
+        let body = serde_json::json!({
+            "session_id": "session_last",
+            "redacted": true,
+            "partial": false,
+            "summary": {
+                "started_at": "2026-01-01T00:00:00Z",
+                "ended_at": "2026-01-01T00:01:00Z",
+                "duration_secs": 60,
+                "model": "claude-sonnet",
+                "outcome": "Likely Completed",
+                "total_turns": 2,
+                "total_tokens": 3456
+            },
+            "diagnosis": {
+                "likely_cause": "none",
+                "detail": "No primary degradation cause was recorded.",
+                "confidence": "low",
+                "next_action": "Continue."
+            },
+            "impact": {
+                "input_tokens": 3000,
+                "output_tokens": 456,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+                "total_tokens": 3456,
+                "estimated_total_cost_dollars": 0.01,
+                "estimated_likely_wasted_tokens": 0,
+                "estimated_likely_wasted_cost_dollars": 0.0,
+                "cost_source": "builtin_model_family_pricing",
+                "cost_caveat": "Estimated costs are local calculations, not authoritative billing records."
+            },
+            "signals": {
+                "cache": { "cache_hit_ratio": 0.0 },
+                "context": {
+                    "latest_fill_percent": 2.0,
+                    "max_fill_percent": 2.0,
+                    "turns_to_compact": null,
+                    "context_window_tokens": 200000,
+                    "heuristic": true
+                }
+            },
+            "evidence": [],
+            "timeline": [],
+            "recommendations": ["Continue."],
+            "caveats": []
+        })
+        .to_string();
+        let (url, request_rx) = serve_postmortem_last_once(&body);
+
+        let (markdown, warning) = fetch_run_final_postmortem_markdown(&url, false)
+            .await
+            .expect("final run postmortem");
+
+        assert!(warning.is_none());
+        assert!(markdown.contains("session_last"));
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured final postmortem request");
+        assert!(request.starts_with("GET /api/postmortem/last?redact=true "));
     }
 
     #[tokio::test]
@@ -3777,6 +4175,60 @@ mod tests {
             None
         );
         assert_eq!(event_session_id(&WatchEvent::Lagged { missed: 3 }), None);
+    }
+
+    #[test]
+    fn watch_event_accepts_quota_burn_status_and_legacy_rate_limit_alias() {
+        let current: WatchEvent = serde_json::from_str(
+            r#"{"type":"quota_burn_status","tokens_used_this_week":10,"tokens_limit":100,"tokens_remaining":90}"#,
+        )
+        .expect("parse current quota event");
+        assert!(matches!(
+            current,
+            WatchEvent::RateLimitStatus {
+                tokens_used_this_week: Some(10),
+                tokens_limit: Some(100),
+                tokens_remaining: Some(90),
+                ..
+            }
+        ));
+
+        let legacy: WatchEvent =
+            serde_json::from_str(r#"{"type":"rate_limit_status","tokens_used_this_week":10}"#)
+                .expect("parse legacy quota event");
+        assert!(matches!(
+            legacy,
+            WatchEvent::RateLimitStatus {
+                tokens_used_this_week: Some(10),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn watch_event_schema_accepts_all_core_event_variants() {
+        let fixtures = [
+            r#"{"type":"tool_use","session_id":"s","timestamp":"2026-01-01T00:00:00Z","tool_name":"Read","summary":"src/main.rs"}"#,
+            r#"{"type":"tool_result","session_id":"s","tool_name":"Bash","outcome":"success","duration_ms":12}"#,
+            r#"{"type":"skill_event","session_id":"s","timestamp":"2026-01-01T00:00:00Z","skill_name":"tdd","event_type":"fired","source":"proxy","confidence":0.9,"detail":"ok"}"#,
+            r#"{"type":"mcp_event","session_id":"s","timestamp":"2026-01-01T00:00:00Z","server":"github","tool":"get_issue","event_type":"called","source":"hook","detail":"ok"}"#,
+            r#"{"type":"cache_event","session_id":"s","event_type":"miss_rebuild","cache_expires_at_epoch":1770000000,"estimated_rebuild_cost_dollars":0.24}"#,
+            r#"{"type":"session_start","session_id":"s","display_name":"demo","model":"claude-sonnet-4-6","initial_prompt":"ship it"}"#,
+            r#"{"type":"session_end","session_id":"s","outcome":"Completed","total_tokens":123,"total_turns":4}"#,
+            r#"{"type":"postmortem_ready","session_id":"s","idle_secs":90,"total_tokens":123,"total_turns":4}"#,
+            r#"{"type":"frustration_signal","session_id":"s","signal_type":"context_pressure"}"#,
+            r#"{"type":"compaction_loop","session_id":"s","consecutive":3,"wasted_tokens":12000}"#,
+            r#"{"type":"diagnosis","session_id":"s","report":{"outcome":"Completed","total_turns":4,"total_tokens":123,"cache_hit_ratio":0.5,"degraded":false,"degradation_turn":null,"causes":[],"advice":[]}}"#,
+            r#"{"type":"cache_warning","session_id":"s","idle_secs":240,"ttl_secs":300}"#,
+            r#"{"type":"model_fallback","session_id":"s","requested":"claude-opus-4-7","actual":"claude-sonnet-4-6"}"#,
+            r#"{"type":"context_status","session_id":"s","fill_percent":72.5,"context_window_tokens":1000000,"turns_to_compact":2}"#,
+            r#"{"type":"quota_burn_status","seconds_to_reset":3600,"tokens_used_this_week":10,"tokens_limit":100,"tokens_remaining":90,"budget_source":"env","projected_exhaustion_secs":1800}"#,
+            r#"{"type":"lagged","missed":2}"#,
+        ];
+
+        for fixture in fixtures {
+            serde_json::from_str::<WatchEvent>(fixture).expect(fixture);
+        }
     }
 
     #[test]

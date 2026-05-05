@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use prometheus::{
     gather, histogram_opts, opts, register_counter_vec, register_gauge_vec, register_histogram,
@@ -7,11 +7,18 @@ use prometheus::{
     register_int_gauge_vec, CounterVec, Encoder, GaugeVec, Histogram, HistogramVec, IntCounter,
     IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
 };
+use tracing::warn;
 
 pub const HISTORY_WINDOWS: [(&str, u64); 3] = [("1d", 1), ("7d", 7), ("30d", 30)];
 pub const HISTORY_MODELS: [&str; 4] = ["opus", "sonnet", "haiku", "other"];
 const LIVE_MODELS: [&str; 4] = ["opus", "sonnet", "haiku", "other"];
-const LIVE_CACHE_EVENT_TYPES: [&str; 4] = ["cold_start", "partial", "miss_ttl", "miss_thrash"];
+const LIVE_CACHE_EVENT_TYPES: [&str; 5] = [
+    "cold_start",
+    "partial",
+    "miss_rebuild",
+    "miss_ttl",
+    "miss_thrash",
+];
 const LIVE_SKILL_EVENT_TYPES: [&str; 5] = ["expected", "fired", "missed", "misfired", "failed"];
 const LIVE_SKILL_EVENT_SOURCES: [&str; 3] = ["hook", "proxy", "heuristic"];
 const LIVE_MCP_EVENT_TYPES: [&str; 4] = ["called", "succeeded", "failed", "denied"];
@@ -156,7 +163,7 @@ impl ClauditorMetrics {
             model_fallback_total: register_int_counter_vec!(
                 opts!(
                     "clauditor_model_fallback_total",
-                    "Silent model fallback events."
+                    "Requested/actual model route mismatch events."
                 ),
                 &["requested", "actual"]
             )
@@ -318,7 +325,7 @@ impl ClauditorMetrics {
             .expect("register clauditor_history_degraded_causes"),
             history_model_fallbacks: register_int_gauge_vec!(
                 "clauditor_history_model_fallbacks",
-                "Historical silent model fallback counts by rolling window.",
+                "Historical requested/actual model route mismatch counts by rolling window.",
                 &["window", "requested", "actual"]
             )
             .expect("register clauditor_history_model_fallbacks"),
@@ -364,6 +371,16 @@ impl ClauditorMetrics {
 static METRICS: LazyLock<ClauditorMetrics> = LazyLock::new(ClauditorMetrics::register);
 static HISTORY_TOOL_LABELS: LazyLock<Mutex<BTreeSet<String>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
+
+fn history_tool_labels() -> MutexGuard<'static, BTreeSet<String>> {
+    match HISTORY_TOOL_LABELS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("recovering poisoned metrics history-tool-label mutex");
+            poisoned.into_inner()
+        }
+    }
+}
 
 pub fn init() {
     let metrics = LazyLock::force(&METRICS);
@@ -635,6 +652,14 @@ pub fn set_active_sessions(count: usize) {
     METRICS.active_sessions.set(count as i64);
 }
 
+pub fn increment_active_sessions() {
+    METRICS.active_sessions.inc();
+}
+
+pub fn decrement_active_sessions() {
+    METRICS.active_sessions.dec();
+}
+
 pub fn update_weekly_budget_gauges(
     used_this_week: u64,
     remaining: Option<u64>,
@@ -715,7 +740,7 @@ pub fn update_historical_gauges(windows: &[HistoricalWindowMetrics], refreshed_a
         }
     }
 
-    let mut known_tools = HISTORY_TOOL_LABELS.lock().unwrap();
+    let mut known_tools = history_tool_labels();
     for window_metrics in windows {
         for tool in window_metrics.tool_failures_by_tool.keys() {
             known_tools.insert(tool.clone());
@@ -831,6 +856,7 @@ fn normalize_cache_event(event_type: &str) -> &'static str {
         "hit" => "hit",
         "partial" => "partial",
         "cold_start" => "cold_start",
+        "miss_rebuild" => "miss_rebuild",
         "miss_ttl" => "miss_ttl",
         "miss_thrash" => "miss_thrash",
         _ => "other",

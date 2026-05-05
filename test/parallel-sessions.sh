@@ -32,23 +32,30 @@ fi
 
 # Unique run marker so we only count hashes logged for requests from *this*
 # invocation. We inject it into the first user message.
-RUN_ID="run-$(date +%s)-$RANDOM"
+RUN_ID="parallel-$(date +%s)-$RANDOM"
 WORKDIR_TAG="/tmp/clauditor-parallel"
 
 # Fire N parallel requests with distinct first user messages.
 pids=()
 for i in $(seq 1 "$N"); do
     (
-        curl -sf http://localhost:10000/v1/messages \
+        code=$(curl -sS -o /dev/null -w "%{http_code}" http://localhost:10000/v1/messages \
             -H "x-api-key: test-parallel" \
             -H "anthropic-version: 2023-06-01" \
             -H "content-type: application/json" \
-            -d "{\"model\":\"claude-sonnet-4-6\",\"system\":\"Primary working directory: $WORKDIR_TAG\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"[$RUN_ID][req-$i] hello\"}]}" \
-            >/dev/null 2>&1 || true
+            -H "x-request-id: ${RUN_ID}-req-${i}" \
+            -d "{\"model\":\"claude-sonnet-4-6\",\"system\":\"Primary working directory: $WORKDIR_TAG\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"[$RUN_ID][req-$i] hello\"}]}") || exit 1
+        [ "$code" != "000" ]
     ) &
     pids+=($!)
 done
-wait "${pids[@]}" 2>/dev/null || true
+curl_failed=0
+for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+        curl_failed=1
+    fi
+done
+[ "$curl_failed" = "0" ] || fail "one or more parallel curl requests failed"
 
 # Give the ext_proc handler a beat to log.
 sleep 2
@@ -56,7 +63,9 @@ sleep 2
 # Count distinct sys_prompt_hash values in a tight recent window. We pull the
 # last 30s of logs and then keep only entries from requests adjacent to ours,
 # which is good enough in practice because the test runs in under 5s.
-hashes=$(docker compose logs --since 30s --no-color clauditor-core 2>/dev/null \
+logs=$(docker compose logs --since 30s --no-color clauditor-core 2>/dev/null \
+    | grep "$RUN_ID" || true)
+hashes=$(printf '%s\n' "$logs" \
     | grep -oE '"sys_prompt_hash":[-0-9]+' \
     | sort -u)
 distinct=$(printf '%s\n' "$hashes" | grep -c . || true)
@@ -64,8 +73,8 @@ distinct=$(printf '%s\n' "$hashes" | grep -c . || true)
 echo "Distinct hashes observed:"
 printf '  %s\n' $hashes
 
-if [ "$distinct" -ge "$N" ]; then
+if [ "$distinct" -eq "$N" ]; then
     pass "$distinct distinct sys_prompt_hash values for $N parallel requests"
 else
-    fail "expected >= $N distinct hashes, got $distinct — session-key collision regression"
+    fail "expected exactly $N run-scoped distinct hashes, got $distinct — session-key collision regression or setup failure"
 fi

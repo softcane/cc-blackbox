@@ -2,19 +2,47 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::LazyLock;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use tracing::{info, warn};
 
 pub const BUILTIN_COST_SOURCE: &str = "builtin_model_family_pricing";
 pub const MIXED_COST_SOURCE: &str = "mixed_pricing_sources";
 const PRICING_FILE_ENV: &str = "CLAUDITOR_PRICING_FILE";
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ModelPricing {
     pub input: f64,
     pub output: f64,
     pub cache_read: f64,
-    pub cache_create: f64,
+    pub cache_write_5m: f64,
+    pub cache_write_1h: f64,
+}
+
+impl<'de> Deserialize<'de> for ModelPricing {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawModelPricing {
+            input: f64,
+            output: f64,
+            cache_read: f64,
+            #[serde(default, alias = "cache_create")]
+            cache_write_5m: Option<f64>,
+            #[serde(default)]
+            cache_write_1h: Option<f64>,
+        }
+
+        let raw = RawModelPricing::deserialize(deserializer)?;
+        Ok(Self {
+            input: raw.input,
+            output: raw.output,
+            cache_read: raw.cache_read,
+            cache_write_5m: raw.cache_write_5m.unwrap_or(raw.input * 1.25),
+            cache_write_1h: raw.cache_write_1h.unwrap_or(raw.input * 2.0),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -220,11 +248,23 @@ pub fn estimate_cost_dollars(
     cache_read: u64,
     cache_create: u64,
 ) -> EstimatedCostBreakdown {
+    estimate_cost_dollars_with_cache_buckets(model, input, output, cache_read, cache_create, 0)
+}
+
+pub fn estimate_cost_dollars_with_cache_buckets(
+    model: &str,
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_create_5m: u64,
+    cache_create_1h: u64,
+) -> EstimatedCostBreakdown {
     let resolved = resolve_pricing(model);
     let total_cost_dollars = token_cost(input, resolved.pricing.input)
         + token_cost(output, resolved.pricing.output)
         + token_cost(cache_read, resolved.pricing.cache_read)
-        + token_cost(cache_create, resolved.pricing.cache_create);
+        + token_cost(cache_create_5m, resolved.pricing.cache_write_5m)
+        + token_cost(cache_create_1h, resolved.pricing.cache_write_1h);
 
     EstimatedCostBreakdown {
         total_cost_dollars,
@@ -237,17 +277,28 @@ pub fn estimate_cache_rebuild_waste_dollars(
     model: &str,
     cache_create: u64,
 ) -> EstimatedCostBreakdown {
+    estimate_cache_rebuild_waste_dollars_with_cache_buckets(model, cache_create, 0)
+}
+
+pub fn estimate_cache_rebuild_waste_dollars_with_cache_buckets(
+    model: &str,
+    cache_create_5m: u64,
+    cache_create_1h: u64,
+) -> EstimatedCostBreakdown {
     let resolved = resolve_pricing(model);
-    let rebuild_delta = (resolved.pricing.cache_create - resolved.pricing.cache_read).max(0.0);
+    let rebuild_delta_5m = (resolved.pricing.cache_write_5m - resolved.pricing.cache_read).max(0.0);
+    let rebuild_delta_1h = (resolved.pricing.cache_write_1h - resolved.pricing.cache_read).max(0.0);
 
     EstimatedCostBreakdown {
-        total_cost_dollars: token_cost(cache_create, rebuild_delta),
+        total_cost_dollars: token_cost(cache_create_5m, rebuild_delta_5m)
+            + token_cost(cache_create_1h, rebuild_delta_1h),
         cost_source: resolved.cost_source,
         trusted_for_budget_enforcement: resolved.trusted_for_budget_enforcement,
     }
 }
 
 fn family_for_model(model: &str) -> Option<&'static str> {
+    let model = model.to_ascii_lowercase();
     if model.contains("opus") {
         Some("opus")
     } else if model.contains("haiku") {
@@ -260,26 +311,52 @@ fn family_for_model(model: &str) -> Option<&'static str> {
 }
 
 fn builtin_pricing(model: &str) -> ModelPricing {
-    if model.contains("opus") {
+    let model = model.to_ascii_lowercase();
+    if model.contains("opus-4-7")
+        || model.contains("opus-4.7")
+        || model.contains("opus-4-6")
+        || model.contains("opus-4.6")
+        || model.contains("opus-4-5")
+        || model.contains("opus-4.5")
+    {
+        ModelPricing {
+            input: 5.0,
+            output: 25.0,
+            cache_read: 0.50,
+            cache_write_5m: 6.25,
+            cache_write_1h: 10.0,
+        }
+    } else if model.contains("opus") {
         ModelPricing {
             input: 15.0,
             output: 75.0,
             cache_read: 1.50,
-            cache_create: 18.75,
+            cache_write_5m: 18.75,
+            cache_write_1h: 30.0,
+        }
+    } else if model.contains("haiku-4-5") || model.contains("haiku-4.5") {
+        ModelPricing {
+            input: 1.0,
+            output: 5.0,
+            cache_read: 0.10,
+            cache_write_5m: 1.25,
+            cache_write_1h: 2.0,
         }
     } else if model.contains("haiku") {
         ModelPricing {
             input: 0.80,
             output: 4.0,
             cache_read: 0.08,
-            cache_create: 1.00,
+            cache_write_5m: 1.00,
+            cache_write_1h: 1.60,
         }
     } else {
         ModelPricing {
             input: 3.0,
             output: 15.0,
             cache_read: 0.30,
-            cache_create: 3.75,
+            cache_write_5m: 3.75,
+            cache_write_1h: 6.0,
         }
     }
 }
@@ -287,8 +364,9 @@ fn builtin_pricing(model: &str) -> ModelPricing {
 #[cfg(test)]
 mod tests {
     use super::{
-        estimate_cache_rebuild_waste_dollars, estimate_cost_dollars, PricingCatalog,
-        BUILTIN_COST_SOURCE,
+        estimate_cache_rebuild_waste_dollars,
+        estimate_cache_rebuild_waste_dollars_with_cache_buckets, estimate_cost_dollars,
+        estimate_cost_dollars_with_cache_buckets, PricingCatalog, BUILTIN_COST_SOURCE,
     };
 
     #[test]
@@ -301,7 +379,8 @@ trusted_for_budget_enforcement = true
 input = 2.10
 output = 10.50
 cache_read = 0.21
-cache_create = 2.63
+cache_write_5m = 2.63
+cache_write_1h = 4.20
 
 [model."claude-sonnet-4-5-20250929"]
 input = 1.95
@@ -317,16 +396,21 @@ cache_create = 2.45
         assert_eq!(exact.cost_source, "pricing_file:contract-2026q2");
         assert!(exact.trusted_for_budget_enforcement);
         assert_eq!(exact.pricing.input, 1.95);
+        assert_eq!(exact.pricing.cache_write_5m, 2.45);
+        assert_eq!(exact.pricing.cache_write_1h, 3.90);
 
         let family = catalog.resolve("claude-sonnet-4-6-20260101");
         assert_eq!(family.cost_source, "pricing_file:contract-2026q2");
         assert!(family.trusted_for_budget_enforcement);
         assert_eq!(family.pricing.output, 10.50);
+        assert_eq!(family.pricing.cache_write_1h, 4.20);
 
         let builtin = catalog.resolve("claude-haiku-4-5-20250929");
         assert_eq!(builtin.cost_source, BUILTIN_COST_SOURCE);
         assert!(!builtin.trusted_for_budget_enforcement);
-        assert_eq!(builtin.pricing.input, 0.80);
+        assert_eq!(builtin.pricing.input, 1.00);
+        assert_eq!(builtin.pricing.cache_write_5m, 1.25);
+        assert_eq!(builtin.pricing.cache_write_1h, 2.00);
     }
 
     #[test]
@@ -338,5 +422,49 @@ cache_create = 2.45
         let waste = estimate_cache_rebuild_waste_dollars("claude-sonnet-4-5", 1_000_000);
         assert_eq!(waste.cost_source, BUILTIN_COST_SOURCE);
         assert!((waste.total_cost_dollars - 3.45).abs() < 1e-9);
+    }
+
+    #[test]
+    fn builtin_pricing_covers_current_families_and_cache_buckets() {
+        let opus = PricingCatalog::builtin().resolve("claude-opus-4-7-20260410");
+        assert_eq!(opus.pricing.input, 5.0);
+        assert_eq!(opus.pricing.output, 25.0);
+        assert_eq!(opus.pricing.cache_read, 0.50);
+        assert_eq!(opus.pricing.cache_write_5m, 6.25);
+        assert_eq!(opus.pricing.cache_write_1h, 10.0);
+
+        let sonnet = PricingCatalog::builtin().resolve("claude-sonnet-4-6-20260217");
+        assert_eq!(sonnet.pricing.input, 3.0);
+        assert_eq!(sonnet.pricing.cache_write_5m, 3.75);
+        assert_eq!(sonnet.pricing.cache_write_1h, 6.0);
+
+        let haiku = PricingCatalog::builtin().resolve("claude-haiku-4-5-20251001");
+        assert_eq!(haiku.pricing.input, 1.0);
+        assert_eq!(haiku.pricing.output, 5.0);
+        assert_eq!(haiku.pricing.cache_read, 0.10);
+        assert_eq!(haiku.pricing.cache_write_5m, 1.25);
+        assert_eq!(haiku.pricing.cache_write_1h, 2.0);
+    }
+
+    #[test]
+    fn estimate_cost_uses_cache_read_5m_and_1h_write_prices() {
+        let cost = estimate_cost_dollars_with_cache_buckets(
+            "claude-sonnet-4-6",
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        );
+
+        assert_eq!(cost.cost_source, BUILTIN_COST_SOURCE);
+        assert!((cost.total_cost_dollars - 28.05).abs() < 1e-9);
+
+        let waste = estimate_cache_rebuild_waste_dollars_with_cache_buckets(
+            "claude-sonnet-4-6",
+            1_000_000,
+            1_000_000,
+        );
+        assert!((waste.total_cost_dollars - 9.15).abs() < 1e-9);
     }
 }

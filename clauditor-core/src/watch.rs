@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::broadcast;
+use tracing::warn;
 
 use crate::diagnosis::DiagnosisReport;
 
@@ -44,14 +45,15 @@ pub enum WatchEvent {
     },
     CacheEvent {
         session_id: String,
-        event_type: String, // "hit" | "partial" | "cold_start" | "miss_ttl" | "miss_thrash"
+        event_type: String, // "hit" | "partial" | "cold_start" | "miss_rebuild" | "miss_ttl" | "miss_thrash"
         /// Unix-epoch seconds at which the cache TTL expires if no further
         /// request refreshes it. The orchestrator counts down from here so
         /// users see how long they have to stay warm.
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_expires_at_epoch: Option<u64>,
         /// Estimated dollars it would cost to rebuild the cache from scratch
-        /// if the TTL elapses — `cache_create_price × current prompt size`.
+        /// if the TTL elapses. Uses exact cache-creation buckets when the
+        /// response exposes them, otherwise falls back to a local estimate.
         #[serde(skip_serializing_if = "Option::is_none")]
         estimated_rebuild_cost_dollars: Option<f64>,
     },
@@ -99,8 +101,8 @@ pub enum WatchEvent {
         ttl_secs: u64,
     },
     /// Anthropic routed the request to a different model than the user asked
-    /// for — typically a silent Opus→Sonnet quota fallback. Emitted once per
-    /// turn when a mismatch is detected.
+    /// for. This does not assert the cause unless separate quota evidence is
+    /// available. Emitted once per turn when a mismatch is detected.
     ModelFallback {
         session_id: String,
         requested: String,
@@ -117,12 +119,13 @@ pub enum WatchEvent {
         context_window_tokens: Option<u64>,
         turns_to_compact: Option<u32>,
     },
-    /// Latest quota snapshot for the orchestrator top strip. For Claude Code
+    /// Latest local quota/budget-burn snapshot for the orchestrator top strip. For Claude Code
     /// subscription traffic Anthropic does not return `anthropic-ratelimit-*`
     /// headers, so these fields are synthesized locally by the quota burn
     /// monitor from our own counters and SQLite history. Global (not
     /// session-scoped); last-writer-wins so the orchestrator can render a
     /// single top-strip meter.
+    #[serde(rename = "quota_burn_status")]
     RateLimitStatus {
         /// Seconds until the current locally tracked weekly window resets
         /// (Monday 00:00 UTC).
@@ -171,10 +174,20 @@ impl EventBroadcaster {
         }
     }
 
+    fn history_lock(&self) -> MutexGuard<'_, VecDeque<(Instant, WatchEvent)>> {
+        match self.history.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("recovering poisoned watch history mutex");
+                poisoned.into_inner()
+            }
+        }
+    }
+
     /// Non-blocking broadcast. Records in history so late subscribers can replay.
     pub fn broadcast(&self, event: WatchEvent) {
         {
-            let mut h = self.history.lock().unwrap();
+            let mut h = self.history_lock();
             if h.len() >= Self::HISTORY_CAP {
                 h.pop_front();
             }
@@ -188,7 +201,7 @@ impl EventBroadcaster {
     /// while calling `sender.subscribe()` ensures no events slip through the
     /// gap between snapshot and subscribe.
     pub fn subscribe_with_history(&self) -> (Vec<WatchEvent>, broadcast::Receiver<WatchEvent>) {
-        let h = self.history.lock().unwrap();
+        let h = self.history_lock();
         let rx = self.sender.subscribe();
         let cutoff = Instant::now().checked_sub(Self::REPLAY_WINDOW);
         let snap = h
@@ -244,10 +257,10 @@ pub fn extract_summary(tool_name: &str, tool_input_json: &str) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.min(s.len())])
+        format!("{}...", s.chars().take(max).collect::<String>())
     }
 }
 

@@ -107,15 +107,16 @@ proxy_payload() {
     local skill=$1
     local label=$2
     local model=${3:-claude-sonnet-4-6-20250514}
-    python3 - "$RUN_ID" "$skill" "$label" "$model" <<'PY'
+    local stream=${4:-true}
+    python3 - "$RUN_ID" "$skill" "$label" "$model" "$stream" <<'PY'
 import json
 import sys
 
-run_id, skill, label, model = sys.argv[1:]
+run_id, skill, label, model, stream = sys.argv[1:]
 payload = {
     "model": model,
     "max_tokens": 128,
-    "stream": True,
+    "stream": stream.lower() == "true",
     "system": f"Primary working directory: /tmp/clauditor-e2e/{run_id}. Read-only E2E.",
     "messages": [
         {
@@ -184,18 +185,89 @@ send_proxy_turn() {
     local label=$1
     local skill=$2
     local model=${3:-claude-sonnet-4-6-20250514}
+    local stream=${4:-true}
     local payload response
-    payload=$(proxy_payload "$skill" "$label" "$model")
+    payload=$(proxy_payload "$skill" "$label" "$model" "$stream")
     response=$(curl -fsS --max-time 30 -N \
         -H "x-api-key: test-e2e-fake" \
         -H "anthropic-version: 2023-06-01" \
         -H "content-type: application/json" \
+        -H "accept-encoding: gzip" \
         -d "$payload" \
         "$ENVOY_URL/v1/messages")
-    grep -q "message_stop" <<<"$response" \
-        || fail "fake upstream response did not contain message_stop: $response"
+    if [ "$stream" = "true" ]; then
+        grep -q "message_stop" <<<"$response" \
+            || fail "fake upstream response did not contain message_stop: $response"
+    else
+        if ! RESPONSE_JSON="$response" python3 - <<'PY'
+import json
+import os
+d = json.loads(os.environ["RESPONSE_JSON"])
+assert d["type"] == "message"
+assert d["usage"]["output_tokens"] == 90
+assert d["usage"]["cache_creation"]["ephemeral_1h_input_tokens"] == 100
+PY
+        then
+            fail "fake non-streaming response was not valid Claude JSON: $response"
+        fi
+    fi
     grep -q "$skill" <<<"$response" \
         || fail "fake upstream response did not contain $skill: $response"
+}
+
+send_delayed_proxy_turn_and_assert_live_watch() {
+    local payload watch_file response_file watch_pid proxy_pid response live_seen still_running
+    payload=$(proxy_payload "$SKILL_A" "proxy-delayed" "claude-sonnet-4-6-20250514" "true")
+    watch_file=$(mktemp)
+    response_file=$(mktemp)
+
+    curl -sS -N --max-time 12 -H "Accept: text/event-stream" "$CORE_URL/watch" >"$watch_file" 2>/dev/null &
+    watch_pid=$!
+    sleep 0.2
+
+    curl -fsS --max-time 30 -N \
+        -H "x-api-key: test-e2e-fake" \
+        -H "anthropic-version: 2023-06-01" \
+        -H "content-type: application/json" \
+        -H "accept-encoding: gzip" \
+        -d "$payload" \
+        "$ENVOY_URL/v1/messages" >"$response_file" &
+    proxy_pid=$!
+
+    live_seen=0
+    still_running=0
+    for _ in $(seq 1 30); do
+        sleep 0.2
+        if grep -q "proxy-delayed-live" "$watch_file"; then
+            live_seen=1
+            if kill -0 "$proxy_pid" 2>/dev/null; then
+                still_running=1
+            fi
+            break
+        fi
+        if ! kill -0 "$proxy_pid" 2>/dev/null; then
+            break
+        fi
+    done
+
+    if ! wait "$proxy_pid"; then
+        kill "$watch_pid" 2>/dev/null || true
+        wait "$watch_pid" 2>/dev/null || true
+        rm -f "$watch_file" "$response_file"
+        fail "delayed proxy curl failed"
+    fi
+    kill "$watch_pid" 2>/dev/null || true
+    wait "$watch_pid" 2>/dev/null || true
+
+    response=$(cat "$response_file")
+    rm -f "$watch_file" "$response_file"
+
+    grep -q "message_stop" <<<"$response" \
+        || fail "delayed fake upstream response did not contain message_stop: $response"
+    grep -q "$SKILL_A" <<<"$response" \
+        || fail "delayed fake upstream response did not contain $SKILL_A: $response"
+    [ "$live_seen" = "1" ] && [ "$still_running" = "1" ] \
+        || fail "watch did not receive delayed SSE tool event before upstream response completed"
 }
 
 send_hook_turn() {
@@ -305,7 +377,9 @@ info "Sending fake Anthropic streaming turns through Envoy..."
 send_proxy_turn "proxy-a" "$SKILL_A"
 send_proxy_turn "proxy-b" "$SKILL_B"
 send_proxy_turn "proxy-1m" "$SKILL_A" "claude-opus-4-7[1m]"
-pass "Envoy ext_proc observed fake streaming turns"
+send_delayed_proxy_turn_and_assert_live_watch
+send_proxy_turn "proxy-json" "$SKILL_B" "claude-haiku-4-5-20251001" "false"
+pass "Envoy ext_proc observed fake streaming, delayed streaming, and JSON turns"
 
 sleep 4
 
@@ -350,6 +424,8 @@ assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM sessions WHERE initial_prompt LIK
 assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM requests WHERE session_id IN (${PROXY_SESSION_FILTER});" 2 "SQLite captured run-scoped requests"
 assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM turn_snapshots WHERE session_id IN (${PROXY_SESSION_FILTER});" 2 "SQLite captured run-scoped turn snapshots"
 assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM tool_calls WHERE request_id IN (SELECT request_id FROM requests WHERE session_id IN (${PROXY_SESSION_FILTER})) AND lower(tool_name) = 'skill';" 2 "SQLite captured proxy Skill tool calls"
+assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM requests WHERE session_id IN (${PROXY_SESSION_FILTER}) AND cache_creation_1h_tokens > 0;" 2 "SQLite captured 1h cache creation bucket"
+assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM requests WHERE session_id IN (${PROXY_SESSION_FILTER}) AND model LIKE '%haiku-4-5%' AND input_tokens = 1200 AND output_tokens = 90 AND cache_read_tokens = 80 AND cache_creation_5m_tokens = 220 AND cache_creation_1h_tokens = 100 AND cost_dollars > 0;" 1 "SQLite captured parsed non-streaming Haiku JSON usage"
 assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM skill_events WHERE session_id IN ('$HOOK_A', '$HOOK_B') AND source = 'hook' AND event_type = 'fired';" 4 "SQLite captured hook skill fired events"
 assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM skill_events WHERE session_id IN (${PROXY_SESSION_FILTER}) AND source = 'proxy' AND event_type = 'fired';" 2 "SQLite captured proxy skill fired events"
 assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM mcp_events WHERE session_id IN ('$HOOK_A', '$HOOK_B') AND source = 'hook' AND event_type IN ('called', 'succeeded');" 4 "SQLite captured hook MCP lifecycle"

@@ -100,9 +100,13 @@ impl std::fmt::Display for TaskOutcome {
 #[derive(Clone, Debug, Serialize)]
 pub struct DegradationCause {
     pub turn_first_noticed: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_last_noticed: Option<u32>,
     pub cause_type: String,
     pub detail: String,
     pub estimated_cost: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_wasted_tokens: Option<u64>,
     pub is_heuristic: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_model: Option<String>,
@@ -201,12 +205,14 @@ fn api_error_cause(turn: &TurnSnapshot) -> Option<DegradationCause> {
         .unwrap_or("stream ended with an API error");
     Some(DegradationCause {
         turn_first_noticed: turn.turn_number,
+        turn_last_noticed: None,
         cause_type: "api_error".to_string(),
         detail: format!(
             "Claude API streaming error at turn {} ({}): {}",
             turn.turn_number, error_type, message
         ),
         estimated_cost: 0.0,
+        estimated_wasted_tokens: None,
         is_heuristic: false,
         requested_model: None,
         actual_model: None,
@@ -401,6 +407,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                 .unwrap_or("sonnet");
             causes.push(DegradationCause {
                 turn_first_noticed: turn.turn_number,
+                turn_last_noticed: None,
                 cause_type: "cache_miss_ttl".to_string(),
                 detail: format!(
                     "Inferred cache TTL miss at turn {}: {:.0}min gap exceeded observed TTL evidence ({}s). Turn duration jumped from {}ms to {}ms.",
@@ -411,6 +418,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                     turn.ttft_ms
                 ),
                 estimated_cost: estimate_cache_rebuild_waste_for_turn(ttl_model, turn),
+                estimated_wasted_tokens: None,
                 is_heuristic: true,
                 requested_model: None,
                 actual_model: None,
@@ -434,6 +442,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
             if !causes.iter().any(|c| c.cause_type == "context_bloat") {
                 causes.push(DegradationCause {
                     turn_first_noticed: turn.turn_number,
+                    turn_last_noticed: None,
                     cause_type: "context_bloat".to_string(),
                     detail: format!(
                         "Context hit ~{:.0}% full by turn {}. Large file reads likely \
@@ -441,6 +450,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                         turn.context_utilization * 100.0, turn.turn_number
                     ),
                     estimated_cost: 0.0,
+                    estimated_wasted_tokens: None,
                     is_heuristic: true,
                     requested_model: None,
                     actual_model: None,
@@ -457,13 +467,15 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                 if !crate::model_matches(requested, actual) {
                     causes.push(DegradationCause {
                         turn_first_noticed: turn.turn_number,
+                        turn_last_noticed: None,
                         cause_type: "model_fallback".to_string(),
                         detail: format!(
-                        "Anthropic routed this from {} to {} at turn {}. \
+                            "Requested model {}; response reported model {} at turn {}. \
                              This records a model-route mismatch; it does not prove why routing changed.",
                             requested, actual, turn.turn_number
                         ),
                         estimated_cost: 0.0,
+                        estimated_wasted_tokens: None,
                         is_heuristic: false,
                         requested_model: Some(requested.clone()),
                         actual_model: Some(actual.clone()),
@@ -488,12 +500,14 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                 };
                 causes.push(DegradationCause {
                     turn_first_noticed: turn.turn_number,
+                    turn_last_noticed: None,
                     cause_type: "near_compaction".to_string(),
                     detail: format!(
-                        "Context reached ~{:.0}% full by turn {} and was {}.",
+                        "Inferred context runway: context reached ~{:.0}% full by turn {} and was {}.",
                         fill_percent, turn.turn_number, runway
                     ),
                     estimated_cost: 0.0,
+                    estimated_wasted_tokens: None,
                     is_heuristic: true,
                     requested_model: None,
                     actual_model: None,
@@ -519,6 +533,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
             if total_signals >= 2 {
                 causes.push(DegradationCause {
                     turn_first_noticed: turn.turn_number,
+                    turn_last_noticed: None,
                     cause_type: "harness_pressure".to_string(),
                     detail: format!(
                         "{} early-stop or token-pressure signals detected in Claude's output. \
@@ -526,6 +541,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                         total_signals
                     ),
                     estimated_cost: 0.0,
+                    estimated_wasted_tokens: None,
                     is_heuristic: true,
                     requested_model: None,
                     actual_model: None,
@@ -576,6 +592,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                         .sum();
                     causes.push(DegradationCause {
                         turn_first_noticed: thrash_start,
+                        turn_last_noticed: Some(turn.turn_number),
                         cause_type: "cache_miss_thrash".to_string(),
                         detail: format!(
                             "Inferred cache thrash: {} consecutive cache rebuilds (turns {}\u{2013}{}) within observed TTL evidence. \
@@ -586,6 +603,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                             wasted / 1000
                         ),
                         estimated_cost,
+                        estimated_wasted_tokens: Some(wasted),
                         is_heuristic: true,
                         requested_model: None,
                         actual_model: None,
@@ -621,6 +639,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
             {
                 causes.push(DegradationCause {
                     turn_first_noticed: streak_start,
+                    turn_last_noticed: Some(turn.turn_number),
                     cause_type: "tool_failure_streak".to_string(),
                     detail: format!(
                         "Tool calls failed in {} consecutive turns ({}\u{2013}{}). \
@@ -628,6 +647,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                         consecutive_failures, streak_start, turn.turn_number
                     ),
                     estimated_cost: 0.0,
+                    estimated_wasted_tokens: None,
                     is_heuristic: false,
                     requested_model: None,
                     actual_model: None,
@@ -651,6 +671,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
         {
             causes.push(DegradationCause {
                 turn_first_noticed: signal.start_turn,
+                turn_last_noticed: Some(signal.end_turn),
                 cause_type: "compaction_suspected".to_string(),
                 detail: format!(
                     "Rapid-fire requests with stable token counts detected at turns \
@@ -659,6 +680,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                     signal.start_turn, signal.end_turn
                 ),
                 estimated_cost: 0.0,
+                estimated_wasted_tokens: Some(signal.wasted_tokens),
                 is_heuristic: true,
                 requested_model: None,
                 actual_model: None,
@@ -727,7 +749,7 @@ fn determine_outcome(turns: &[TurnSnapshot]) -> TaskOutcome {
 fn advice_for_cause(cause: &DegradationCause) -> String {
     match cause.cause_type.as_str() {
         "cache_miss_ttl" => "Cache likely expired after an idle gap beyond the observed TTL evidence. Send a message before the shown TTL countdown elapses to keep it warm.".to_string(),
-        "cache_miss_thrash" => "Full cache rebuilds within the observed TTL. Check whether prompts, tools, images, CLAUDE.md, hooks, or MCP config changed mid-session.".to_string(),
+        "cache_miss_thrash" => "Likely cache thrash: full cache rebuilds occurred within the observed TTL. Check whether prompts, tools, images, CLAUDE.md, hooks, or MCP config changed mid-session.".to_string(),
         "api_error" => "The API returned a streaming error. Treat this turn as failed and retry after fixing the reported provider-side error.".to_string(),
         "context_bloat" => "Point Claude at specific functions, not whole files.".to_string(),
         "model_fallback" => {
@@ -737,12 +759,12 @@ fn advice_for_cause(cause: &DegradationCause) -> String {
                 .map(friendly_model_name)
                 .unwrap_or_else(|| "a different model".to_string());
             format!(
-                "Anthropic routed this to {} at turn {}. Retry or explicitly choose a model if this routing changed the result.",
+                "Response reported {} at turn {} after a different model was requested. Retry or explicitly choose a model if this routing changed the result.",
                 actual,
                 cause.turn_first_noticed
             )
         }
-        "near_compaction" => "Context was close to auto-compaction. Start a fresh session or narrow the next turn to specific files or functions.".to_string(),
+        "near_compaction" => "Inferred context runway was close to auto-compaction. Start a fresh session or narrow the next turn to specific files or functions.".to_string(),
         "compaction_suspected" => "Kill and restart if Claude seems stuck. Ctrl+C, then start fresh.".to_string(),
         "tool_failure_streak" => "If tools fail 5 turns in a row, interrupt and redirect.".to_string(),
         "harness_pressure" => "Shorter, more focused tasks perform better than long open-ended ones.".to_string(),
@@ -873,11 +895,38 @@ mod tests {
         assert!(report
             .advice
             .iter()
-            .any(|advice| advice.contains("Anthropic routed this to")));
+            .any(|advice| advice.contains("Response reported")));
         assert!(!report
             .advice
             .iter()
             .any(|advice| advice.to_ascii_lowercase().contains("quota")));
+    }
+
+    #[test]
+    fn analyze_session_reports_model_version_prefix_overlap_as_route_mismatch() {
+        let mut turns = vec![
+            snapshot(1, 10_000, 500, 0.0, 0.20),
+            snapshot(2, 11_000, 600, 10.0, 0.22),
+            snapshot(3, 9_000, 400, 10.0, 0.18),
+        ];
+        turns[0].tool_calls = vec!["Edit".to_string()];
+        turns[1].tool_calls = vec!["Bash".to_string()];
+        turns[1].requested_model = Some("claude-opus-4".to_string());
+        turns[1].actual_model = Some("claude-opus-4-7".to_string());
+        turns[2].tool_calls = vec!["Bash".to_string()];
+
+        let report = analyze_session("session-model-version-mismatch", &turns);
+
+        let cause = report
+            .causes
+            .iter()
+            .find(|cause| cause.cause_type == "model_fallback")
+            .expect("model route mismatch cause");
+        assert!(!cause.is_heuristic);
+        assert!(cause.detail.contains("Requested model claude-opus-4"));
+        assert!(cause
+            .detail
+            .contains("response reported model claude-opus-4-7"));
     }
 
     #[test]

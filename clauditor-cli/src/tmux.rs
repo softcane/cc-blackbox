@@ -705,9 +705,9 @@ impl TmuxOrchestrator {
                 if let (Some(fill), _) = (pane.fill_percent, pane.turns_to_compact) {
                     if fill >= 60.0 && !pane.ended {
                         let tail = match pane.turns_to_compact {
-                            Some(0) => "AT THRESHOLD".to_string(),
-                            Some(n) => format!("~{} turns to auto-compact", n),
-                            None => "trajectory unknown".to_string(),
+                            Some(0) => "inferred at threshold".to_string(),
+                            Some(n) => format!("inferred ~{} turns to auto-compact", n),
+                            None => "inferred trajectory unknown".to_string(),
                         };
                         let msg = format!("{}context {:.0}% full · {}", name_indent, fill, tail);
                         let colored = if fill >= 80.0 {

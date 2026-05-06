@@ -14,6 +14,9 @@ use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
+const RUN_FINAL_POSTMORTEM_ATTEMPTS: usize = 30;
+const RUN_FINAL_POSTMORTEM_RETRY_DELAY_MS: u64 = 500;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "clauditor",
@@ -1790,9 +1793,9 @@ fn render_event(
             }
             let time = now_hms();
             let label = match turns_to_compact {
-                Some(n) if *n == 0 => "AT COMPACTION THRESHOLD".to_string(),
-                Some(n) => format!("~{} turns to auto-compact", n),
-                None => "trajectory unknown".to_string(),
+                Some(n) if *n == 0 => "inferred at auto-compaction threshold".to_string(),
+                Some(n) => format!("inferred ~{} turns to auto-compact", n),
+                None => "inferred trajectory unknown".to_string(),
             };
             let line = format!(
                 "{}  CONTEXT  {:.0}% full \u{00b7} {}",
@@ -2046,7 +2049,7 @@ fn render_diagnosis(report: &DiagnosisReport, tag: &str) {
     for cause in &report.causes {
         let icon = cause_icon(&cause.cause_type);
         let heuristic_suffix = if cause.is_heuristic {
-            format!("  {}", "(estimate)".dimmed())
+            format!("  {}", "[heuristic]".dimmed())
         } else {
             String::new()
         };
@@ -2132,6 +2135,12 @@ fn render_postmortem_markdown(report: &serde_json::Value) -> String {
     let turns = json_u64(report, "/summary/total_turns").unwrap_or(0);
     let tokens = json_u64(report, "/summary/total_tokens").unwrap_or(0);
     let likely_cause = json_str(report, "/diagnosis/likely_cause").unwrap_or("none");
+    let likely_cause_suffix =
+        if json_bool(report, "/diagnosis/likely_cause_is_heuristic").unwrap_or(false) {
+            " [heuristic]"
+        } else {
+            ""
+        };
     let cause_detail = json_str(report, "/diagnosis/detail").unwrap_or("No detail recorded.");
     let confidence = json_str(report, "/diagnosis/confidence").unwrap_or("low");
     let next_action = json_str(report, "/diagnosis/next_action").unwrap_or("No action recorded.");
@@ -2167,7 +2176,7 @@ fn render_postmortem_markdown(report: &serde_json::Value) -> String {
     out.push('\n');
 
     out.push_str("## Likely Cause\n");
-    out.push_str(&format!("- Cause: {likely_cause}\n"));
+    out.push_str(&format!("- Cause: {likely_cause}{likely_cause_suffix}\n"));
     out.push_str(&format!("- Detail: {cause_detail}\n"));
     out.push_str(&format!("- Confidence: {confidence}\n"));
     out.push_str(&format!("- Next action: {next_action}\n\n"));
@@ -2237,7 +2246,7 @@ fn render_postmortem_markdown(report: &serde_json::Value) -> String {
         format_percent(json_f64(report, "/signals/cache/total_input_cache_rate"))
     ));
     out.push_str(&format!(
-        "- Context max: {:.0}% full; turns to compact: {}\n",
+        "- Context max: {:.0}% full; inferred turns to compact: {}\n",
         json_f64(report, "/signals/context/max_fill_percent").unwrap_or(0.0),
         json_u64(report, "/signals/context/turns_to_compact")
             .map(|value| value.to_string())
@@ -2320,6 +2329,8 @@ fn build_claude_analysis_prompt(report: &serde_json::Value) -> String {
         "You are Clauditor's postmortem analyst.\n\
 Use only the redacted JSON evidence below. Do not invent facts, files, commands, or raw prompts.\n\
 Write concise GitHub-flavored Markdown. Keep it under 350 words.\n\
+Preserve direct versus heuristic evidence labels. Do not turn heuristic, inferred, likely, or suspected causes into direct facts.\n\
+When `is_heuristic` is true or evidence type is `heuristic`, mark causal wording with `[heuristic]`, likely, suspected, or inferred. Direct evidence can stay direct.\n\
 Include exactly these sections:\n\
 ## Claude Analysis\n\
 - Likely cause: ...\n\
@@ -2448,9 +2459,23 @@ async fn fetch_run_final_postmortem_markdown(
     base_url: &str,
     analyze_with_claude: bool,
 ) -> Result<(String, Option<String>), String> {
+    fetch_run_final_postmortem_markdown_with_retry(
+        base_url,
+        analyze_with_claude,
+        RUN_FINAL_POSTMORTEM_ATTEMPTS,
+        Duration::from_millis(RUN_FINAL_POSTMORTEM_RETRY_DELAY_MS),
+    )
+    .await
+}
+
+async fn fetch_run_final_postmortem_markdown_with_retry(
+    base_url: &str,
+    analyze_with_claude: bool,
+    attempts: usize,
+    retry_delay: Duration,
+) -> Result<(String, Option<String>), String> {
     let report =
-        fetch_postmortem_json_with_retry(base_url, "last", true, 8, Duration::from_millis(500))
-            .await?;
+        fetch_postmortem_json_with_retry(base_url, "last", true, attempts, retry_delay).await?;
     Ok(render_postmortem_markdown_with_optional_analysis(
         base_url,
         "last",
@@ -2473,7 +2498,12 @@ async fn render_run_final_postmortem(base_url: &str) {
         Err(err) => {
             eprintln!(
                 "{}",
-                format!("Final postmortem unavailable: {err}").yellow()
+                format!(
+                    "Final postmortem unavailable after waiting for clauditor-core: {err}\n\
+Try again with: clauditor postmortem last --redact\n\
+If this run made no proxied Claude API request, no postmortem was recorded."
+                )
+                .yellow()
             );
         }
     }
@@ -3067,16 +3097,17 @@ async fn connect_and_stream(
 
 fn auto_postmortem_target(event: &WatchEvent) -> Option<(String, String)> {
     match event {
-        WatchEvent::SessionEnd {
-            session_id,
-            total_turns,
-            ..
+        WatchEvent::SessionEnd { session_id, .. } => {
+            Some((session_id.clone(), format!("final:{session_id}")))
         }
-        | WatchEvent::PostmortemReady {
+        WatchEvent::PostmortemReady {
             session_id,
             total_turns,
             ..
-        } => Some((session_id.clone(), format!("{session_id}:{total_turns}"))),
+        } => Some((
+            session_id.clone(),
+            format!("idle:{session_id}:{total_turns}"),
+        )),
         _ => None,
     }
 }
@@ -3086,15 +3117,16 @@ mod tests {
     use super::{
         append_claude_analysis_section, auto_postmortem_target, build_claude_analysis_prompt,
         claude_analysis_enabled, compact_datetime_from_iso, event_session_id, extract_run_watch,
-        fetch_run_final_postmortem_markdown, format_duration_coarse, format_tokens,
-        local_time_from_iso, parse_mcp_tool_name, push_unique, render_postmortem_markdown,
-        render_postmortem_markdown_with_optional_analysis, run_child_command_with_deps,
-        run_claude_postmortem_analysis_with_command, run_claude_postmortem_analysis_with_lookup,
-        shell_join, shell_quote, truncate_for_box, watcher_args, yaml_quote, ActiveSessions, Cli,
-        Commands, WatchEvent, WatchPostmortemState,
+        fetch_run_final_postmortem_markdown, fetch_run_final_postmortem_markdown_with_retry,
+        format_duration_coarse, format_tokens, local_time_from_iso, parse_mcp_tool_name,
+        push_unique, render_postmortem_markdown, render_postmortem_markdown_with_optional_analysis,
+        run_child_command_with_deps, run_claude_postmortem_analysis_with_command,
+        run_claude_postmortem_analysis_with_lookup, shell_join, shell_quote, truncate_for_box,
+        watcher_args, yaml_quote, ActiveSessions, Cli, Commands, WatchEvent, WatchPostmortemState,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
+    use std::collections::HashSet;
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -3220,6 +3252,51 @@ mod tests {
         (url, rx)
     }
 
+    fn serve_watch_and_postmortems(
+        watch_chunks: Vec<String>,
+        postmortems: Vec<(String, String)>,
+    ) -> (String, mpsc::Receiver<Vec<String>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind watch server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let mut requests = Vec::new();
+
+            let (mut stream, _) = listener.accept().expect("accept watch request");
+            requests.push(read_http_request(&mut stream));
+            let content_len: usize = watch_chunks.iter().map(|chunk| chunk.len()).sum();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                content_len
+            )
+            .expect("write watch response headers");
+            for chunk in watch_chunks {
+                stream
+                    .write_all(chunk.as_bytes())
+                    .expect("write watch chunk");
+                stream.flush().expect("flush watch chunk");
+            }
+
+            for (status, body) in postmortems {
+                let (mut stream, _) = listener.accept().expect("accept postmortem request");
+                requests.push(read_http_request(&mut stream));
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write postmortem response");
+            }
+
+            tx.send(requests).expect("send captured requests");
+        });
+
+        (url, rx)
+    }
+
     fn serve_postmortem_last_once(body: &str) -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind postmortem server");
         let url = format!("http://{}", listener.local_addr().expect("local addr"));
@@ -3263,6 +3340,32 @@ mod tests {
             )
             .expect("write postmortem response");
             tx.send(request).expect("send captured request");
+        });
+
+        (url, rx)
+    }
+
+    fn serve_postmortem_responses(
+        responses: Vec<(String, String)>,
+    ) -> (String, mpsc::Receiver<Vec<String>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind postmortem server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept postmortem request");
+                requests.push(read_http_request(&mut stream));
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write postmortem response");
+            }
+            tx.send(requests).expect("send captured requests");
         });
 
         (url, rx)
@@ -3783,6 +3886,62 @@ mod tests {
     }
 
     #[test]
+    fn postmortem_markdown_marks_heuristic_output_but_keeps_direct_evidence_direct() {
+        let report = serde_json::json!({
+            "session_id": "session_heuristic",
+            "redacted": true,
+            "partial": false,
+            "summary": {
+                "started_at": "2026-01-01T00:00:00Z",
+                "ended_at": "2026-01-01T00:05:00Z",
+                "duration_secs": 300,
+                "model": "claude-sonnet",
+                "outcome": "Compaction Suspected",
+                "total_turns": 4,
+                "total_tokens": 123456
+            },
+            "diagnosis": {
+                "likely_cause": "near_compaction",
+                "likely_cause_is_heuristic": true,
+                "detail": "[heuristic] Context reached 84% full.",
+                "confidence": "medium",
+                "next_action": "Start fresh with a short state summary."
+            },
+            "impact": {
+                "input_tokens": 100000,
+                "output_tokens": 1000,
+                "cache_read_tokens": 20000,
+                "cache_creation_tokens": 2456,
+                "total_tokens": 123456,
+                "estimated_total_cost_dollars": 1.23,
+                "estimated_likely_wasted_tokens": 2456,
+                "estimated_likely_wasted_cost_dollars": 0.12,
+                "cost_source": "builtin_model_family_pricing"
+            },
+            "signals": {
+                "cache": { "cache_hit_ratio": 0.75 },
+                "context": { "max_fill_percent": 84.0, "turns_to_compact": 1, "heuristic": true }
+            },
+            "evidence": [
+                { "type": "heuristic", "label": "context", "detail": "inferred 1 turn to compact", "turn": 2 },
+                { "type": "direct", "label": "model", "detail": "requested opus, response reported sonnet", "turn": 3 }
+            ],
+            "timeline": [],
+            "recommendations": ["Start fresh with a short state summary."],
+            "caveats": []
+        });
+
+        let markdown = render_postmortem_markdown(&report);
+        assert!(markdown.contains("- Cause: near_compaction [heuristic]"));
+        assert!(markdown.contains("- Detail: [heuristic] Context reached 84% full."));
+        assert!(markdown.contains("- [heuristic] context: turn 2, inferred 1 turn to compact"));
+        assert!(
+            markdown.contains("- [direct] model: turn 3, requested opus, response reported sonnet")
+        );
+        assert!(markdown.contains("- Context max: 84% full; inferred turns to compact: 1"));
+    }
+
+    #[test]
     fn postmortem_markdown_appends_claude_analysis_section() {
         let mut markdown = "# Clauditor Session Postmortem\n".to_string();
         append_claude_analysis_section(
@@ -3804,6 +3963,8 @@ mod tests {
         });
         let prompt = build_claude_analysis_prompt(&report);
         assert!(prompt.contains("Use only the redacted JSON evidence"));
+        assert!(prompt.contains("Preserve direct versus heuristic evidence labels"));
+        assert!(prompt.contains("Do not turn heuristic"));
         assert!(prompt.contains("## Claude Analysis"));
         assert!(prompt.contains("## Restart Prompt"));
         assert!(prompt.contains("\"redacted\": true"));
@@ -4020,7 +4181,7 @@ mod tests {
             .expect("captured requests");
         assert_eq!(requests.len(), 2);
         assert!(requests[1].starts_with("GET /api/postmortem/session_target?redact=true "));
-        assert!(postmortem_state.rendered.contains("session_target:3"));
+        assert!(postmortem_state.rendered.contains("final:session_target"));
         assert_eq!(
             auto_postmortem_target(&WatchEvent::SessionEnd {
                 session_id: "session_target".to_string(),
@@ -4028,8 +4189,148 @@ mod tests {
                 total_tokens: 1,
                 total_turns: 1,
             }),
-            Some(("session_target".to_string(), "session_target:1".to_string()))
+            Some((
+                "session_target".to_string(),
+                "final:session_target".to_string()
+            ))
         );
+    }
+
+    #[test]
+    fn auto_postmortem_dedupe_separates_idle_and_final_reports() {
+        let idle = auto_postmortem_target(&WatchEvent::PostmortemReady {
+            session_id: "session_same_turns".to_string(),
+            idle_secs: 90,
+            total_tokens: 123,
+            total_turns: 4,
+        });
+        let final_report = auto_postmortem_target(&WatchEvent::SessionEnd {
+            session_id: "session_same_turns".to_string(),
+            outcome: "Likely Completed".to_string(),
+            total_tokens: 123,
+            total_turns: 4,
+        });
+
+        assert_eq!(
+            idle,
+            Some((
+                "session_same_turns".to_string(),
+                "idle:session_same_turns:4".to_string()
+            ))
+        );
+        assert_eq!(
+            final_report,
+            Some((
+                "session_same_turns".to_string(),
+                "final:session_same_turns".to_string()
+            ))
+        );
+
+        let mut rendered = HashSet::new();
+        assert!(rendered.insert(idle.expect("idle target").1));
+        assert!(rendered.insert(final_report.expect("final target").1));
+    }
+
+    #[tokio::test]
+    async fn watch_stream_renders_idle_then_final_postmortems_with_same_turn_count() {
+        let chunks = vec![
+            concat!(
+                "data: {\"type\":\"postmortem_ready\",\"session_id\":\"session_same_turns\",",
+                "\"idle_secs\":90,\"total_tokens\":1234,\"total_turns\":4}\n\n"
+            )
+            .to_string(),
+            concat!(
+                "data: {\"type\":\"session_end\",\"session_id\":\"session_same_turns\",",
+                "\"outcome\":\"Likely Completed\",\"total_tokens\":1234,\"total_turns\":4}\n\n"
+            )
+            .to_string(),
+        ];
+        let partial_body = serde_json::json!({
+            "session_id": "session_same_turns",
+            "redacted": true,
+            "partial": true,
+            "summary": {
+                "started_at": "2026-01-01T00:00:00Z",
+                "ended_at": null,
+                "duration_secs": 60,
+                "model": "claude-sonnet",
+                "outcome": "In Progress",
+                "total_turns": 4,
+                "total_tokens": 1234
+            },
+            "diagnosis": {
+                "likely_cause": "none",
+                "detail": "Session is still active.",
+                "confidence": "low",
+                "next_action": "Continue."
+            },
+            "impact": { "total_tokens": 1234 },
+            "signals": { "cache": {}, "context": {} },
+            "evidence": [],
+            "timeline": [],
+            "recommendations": ["Continue."],
+            "caveats": []
+        })
+        .to_string();
+        let final_body = serde_json::json!({
+            "session_id": "session_same_turns",
+            "redacted": true,
+            "partial": false,
+            "summary": {
+                "started_at": "2026-01-01T00:00:00Z",
+                "ended_at": "2026-01-01T00:01:00Z",
+                "duration_secs": 60,
+                "model": "claude-sonnet",
+                "outcome": "Likely Completed",
+                "total_turns": 4,
+                "total_tokens": 1234
+            },
+            "diagnosis": {
+                "likely_cause": "none",
+                "detail": "No primary degradation cause was recorded.",
+                "confidence": "low",
+                "next_action": "Continue."
+            },
+            "impact": { "total_tokens": 1234 },
+            "signals": { "cache": {}, "context": {} },
+            "evidence": [],
+            "timeline": [],
+            "recommendations": ["Continue."],
+            "caveats": []
+        })
+        .to_string();
+        let (url, request_rx) = serve_watch_and_postmortems(
+            chunks,
+            vec![
+                ("200 OK".to_string(), partial_body),
+                ("200 OK".to_string(), final_body),
+            ],
+        );
+        let mut active = ActiveSessions::new();
+        let filter = None;
+        let mut postmortem_state = WatchPostmortemState::new(true, &url, false);
+
+        super::connect_and_stream(
+            &url,
+            false,
+            false,
+            &filter,
+            &mut active,
+            &mut postmortem_state,
+        )
+        .await
+        .expect("watch stream closes cleanly");
+
+        let requests = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured requests");
+        assert_eq!(requests.len(), 3);
+        assert!(postmortem_state
+            .rendered
+            .contains("idle:session_same_turns:4"));
+        assert!(postmortem_state
+            .rendered
+            .contains("final:session_same_turns"));
     }
 
     #[tokio::test]
@@ -4093,6 +4394,79 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("captured final postmortem request");
         assert!(request.starts_with("GET /api/postmortem/last?redact=true "));
+    }
+
+    #[tokio::test]
+    async fn run_final_postmortem_retries_while_last_session_flushes() {
+        let body = serde_json::json!({
+            "session_id": "session_last_after_retry",
+            "redacted": true,
+            "partial": false,
+            "summary": {
+                "started_at": "2026-01-01T00:00:00Z",
+                "ended_at": "2026-01-01T00:01:00Z",
+                "duration_secs": 60,
+                "model": "claude-sonnet",
+                "outcome": "Likely Completed",
+                "total_turns": 2,
+                "total_tokens": 3456
+            },
+            "diagnosis": {
+                "likely_cause": "none",
+                "detail": "No primary degradation cause was recorded.",
+                "confidence": "low",
+                "next_action": "Continue."
+            },
+            "impact": {
+                "input_tokens": 3000,
+                "output_tokens": 456,
+                "cache_read_tokens": 0,
+                "cache_creation_tokens": 0,
+                "total_tokens": 3456,
+                "estimated_total_cost_dollars": 0.01,
+                "estimated_likely_wasted_tokens": 0,
+                "estimated_likely_wasted_cost_dollars": 0.0,
+                "cost_source": "builtin_model_family_pricing"
+            },
+            "signals": {
+                "cache": { "cache_hit_ratio": 0.0 },
+                "context": {
+                    "latest_fill_percent": 2.0,
+                    "max_fill_percent": 2.0,
+                    "turns_to_compact": null,
+                    "context_window_tokens": 200000,
+                    "heuristic": true
+                }
+            },
+            "evidence": [],
+            "timeline": [],
+            "recommendations": ["Continue."],
+            "caveats": []
+        })
+        .to_string();
+        let (url, request_rx) = serve_postmortem_responses(vec![
+            ("404 Not Found".to_string(), "no sessions found".to_string()),
+            ("200 OK".to_string(), body),
+        ]);
+
+        let (markdown, warning) = fetch_run_final_postmortem_markdown_with_retry(
+            &url,
+            false,
+            2,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("final run postmortem after retry");
+
+        assert!(warning.is_none());
+        assert!(markdown.contains("session_last_after_retry"));
+        let requests = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured final postmortem requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.starts_with("GET /api/postmortem/last?redact=true ")));
     }
 
     #[tokio::test]
@@ -4164,7 +4538,7 @@ mod tests {
             .expect("captured requests");
         assert_eq!(requests.len(), 2);
         assert!(requests[1].starts_with("GET /api/postmortem/session_target?redact=true "));
-        assert!(postmortem_state.rendered.contains("session_target:3"));
+        assert!(postmortem_state.rendered.contains("idle:session_target:3"));
         assert_eq!(
             auto_postmortem_target(&WatchEvent::PostmortemReady {
                 session_id: "session_target".to_string(),
@@ -4172,7 +4546,10 @@ mod tests {
                 total_tokens: 1,
                 total_turns: 1,
             }),
-            Some(("session_target".to_string(), "session_target:1".to_string()))
+            Some((
+                "session_target".to_string(),
+                "idle:session_target:1".to_string()
+            ))
         );
     }
 
@@ -4205,7 +4582,7 @@ mod tests {
             .expect("captured requests");
         assert_eq!(requests.len(), 2);
         assert!(requests[1].starts_with("GET /api/postmortem/session_target?redact=true "));
-        assert!(postmortem_state.rendered.contains("session_target:3"));
+        assert!(postmortem_state.rendered.contains("final:session_target"));
     }
 
     #[test]

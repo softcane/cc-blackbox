@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -217,6 +218,8 @@ impl RuntimeState {
 #[derive(Clone, Debug, Default)]
 struct SessionBudgetState {
     total_spend: f64,
+    trusted_spend: f64,
+    untrusted_spend: f64,
     total_tokens: u64,
     request_count: u64,
     estimated_cache_waste_dollars: f64,
@@ -273,14 +276,17 @@ fn check_session_budget(session_id: Option<&str>) -> Option<(&'static str, Strin
     let session_id = session_id?;
     let state = SESSION_BUDGETS.get(session_id)?;
 
-    // Estimated-dollar budget check. These dollars are only enforced when the
-    // active price catalog is explicitly marked trusted for enforcement.
+    // Estimated-dollar budget check. Only per-request spend marked trusted by
+    // pricing resolution is enforceable; untrusted estimates remain display-only.
     let budget = env_f64("CLAUDITOR_SESSION_BUDGET_DOLLARS", 0.0);
-    if budget > 0.0 && state.total_spend >= budget && pricing::trusted_for_budget_enforcement() {
+    if budget > 0.0 && state.trusted_spend >= budget {
         return Some(("budget_exceeded", format!(
-            "Clauditor: estimated session budget exceeded (${:.2}). Estimated spend: ${:.2} across {} requests. \
+            "Clauditor: trusted estimated session budget exceeded (${:.2}). Trusted spend: ${:.2}; \
+             untrusted display-only spend: ${:.2}; total estimated spend: ${:.2} across {} requests. \
              Estimated cache rebuild waste: ${:.2}. Reset with CLAUDITOR_SESSION_BUDGET_DOLLARS=0 or restart session.",
             budget,
+            state.trusted_spend,
+            state.untrusted_spend,
             state.total_spend,
             state.request_count,
             state.estimated_cache_waste_dollars
@@ -347,6 +353,7 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
     started_at TEXT NOT NULL,
+    last_activity_at TEXT,
     ended_at TEXT,
     total_input_tokens INTEGER DEFAULT 0,
     total_output_tokens INTEGER DEFAULT 0,
@@ -553,17 +560,12 @@ enum DbCommand {
         response_error_type: Option<String>,
         response_error_message: Option<String>,
     },
-    WriteDiagnosis {
+    FinalizeSession {
         session_id: String,
-        completed_at: String,
-        outcome: String,
-        total_turns: u32,
-        total_cost: f64,
-        cache_hit_ratio: f64,
-        degraded: bool,
-        degradation_turn: Option<u32>,
-        causes_json: String,
-        advice_json: String,
+        ended_at: String,
+        diagnosis: PersistedDiagnosis,
+        recall: Option<PersistedRecall>,
+        response_tx: std_mpsc::Sender<Result<(), String>>,
     },
     WriteToolOutcome {
         session_id: String,
@@ -592,11 +594,6 @@ enum DbCommand {
         source: String,
         detail: Option<String>,
     },
-    WriteRecall {
-        session_id: String,
-        initial_prompt: String,
-        final_response_summary: String,
-    },
     WriteBillingReconciliation {
         session_id: String,
         imported_at: String,
@@ -604,6 +601,25 @@ enum DbCommand {
         billed_cost_dollars: f64,
         response_tx: oneshot::Sender<Result<(), BillingReconciliationWriteError>>,
     },
+}
+
+#[derive(Clone, Debug)]
+struct PersistedDiagnosis {
+    completed_at: String,
+    outcome: String,
+    total_turns: u32,
+    total_cost: f64,
+    cache_hit_ratio: f64,
+    degraded: bool,
+    degradation_turn: Option<u32>,
+    causes_json: String,
+    advice_json: String,
+}
+
+#[derive(Clone, Debug)]
+struct PersistedRecall {
+    initial_prompt: String,
+    final_response_summary: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -695,11 +711,55 @@ fn ensure_session_columns(conn: &Connection) -> rusqlite::Result<()> {
     if !columns.contains("initial_prompt") {
         conn.execute("ALTER TABLE sessions ADD COLUMN initial_prompt TEXT", [])?;
     }
+    let added_last_activity_at = !columns.contains("last_activity_at");
+    if added_last_activity_at {
+        conn.execute("ALTER TABLE sessions ADD COLUMN last_activity_at TEXT", [])?;
+        conn.execute(
+            "UPDATE sessions SET last_activity_at = COALESCE(ended_at, started_at) \
+             WHERE last_activity_at IS NULL",
+            [],
+        )?;
+
+        let has_diagnosis_table = table_exists(conn, "session_diagnoses")?;
+        let has_recall_table = table_exists(conn, "session_recall")?;
+        if has_diagnosis_table {
+            let recall_clause = if has_recall_table {
+                " OR NOT EXISTS (
+                    SELECT 1 FROM session_recall r
+                    WHERE r.session_id = sessions.session_id
+                  )"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "UPDATE sessions \
+                 SET ended_at = NULL \
+                 WHERE ended_at IS NOT NULL \
+                   AND (
+                     NOT EXISTS (
+                       SELECT 1 FROM session_diagnoses d \
+                       WHERE d.session_id = sessions.session_id
+                     ){recall_clause}
+                   )",
+            );
+            conn.execute(&sql, [])?;
+        }
+    }
     if columns.contains("cache_hit_ratio") {
         conn.execute("ALTER TABLE sessions DROP COLUMN cache_hit_ratio", [])?;
     }
 
     Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+        rusqlite::params![table],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
 }
 
 fn ensure_request_cost_columns(conn: &Connection) -> rusqlite::Result<()> {
@@ -883,6 +943,62 @@ fn seed_live_metric_labels_from_db(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn persist_final_session_artifacts(
+    conn: &Connection,
+    session_id: &str,
+    ended_at: &str,
+    diagnosis: &PersistedDiagnosis,
+    recall: Option<&PersistedRecall>,
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+
+    let updated = tx.execute(
+        "UPDATE sessions SET ended_at = ?2 WHERE session_id = ?1",
+        rusqlite::params![session_id, ended_at],
+    )?;
+    if updated == 0 {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    }
+
+    if let Some(recall) = recall {
+        tx.execute(
+            "INSERT INTO session_recall (session_id, initial_prompt, final_response_summary) \
+             VALUES (?1,?2,?3) \
+             ON CONFLICT(session_id) DO UPDATE SET \
+                initial_prompt = excluded.initial_prompt, \
+                final_response_summary = excluded.final_response_summary",
+            rusqlite::params![
+                session_id,
+                &recall.initial_prompt,
+                &recall.final_response_summary
+            ],
+        )?;
+    }
+
+    tx.execute(
+        "INSERT OR REPLACE INTO session_diagnoses (session_id, completed_at, \
+         outcome, total_turns, total_cost, cache_hit_ratio, degraded, \
+         degradation_turn, causes_json, advice_json) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        rusqlite::params![
+            session_id,
+            &diagnosis.completed_at,
+            &diagnosis.outcome,
+            diagnosis.total_turns,
+            diagnosis.total_cost,
+            diagnosis.cache_hit_ratio,
+            diagnosis.degraded as i32,
+            diagnosis.degradation_turn,
+            &diagnosis.causes_json,
+            &diagnosis.advice_json,
+        ],
+    )?;
+
+    tx.commit()?;
+
+    Ok(())
+}
+
 fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
     let conn = match Connection::open(path) {
         Ok(c) => c,
@@ -930,7 +1046,9 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 initial_prompt,
             } => {
                 let _ = conn.execute(
-                    "INSERT OR IGNORE INTO sessions (session_id, started_at, model, initial_prompt) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT OR IGNORE INTO sessions \
+                     (session_id, started_at, last_activity_at, model, initial_prompt) \
+                     VALUES (?1, ?2, ?2, ?3, ?4)",
                     rusqlite::params![session_id, started_at, model, initial_prompt],
                 );
             }
@@ -1014,7 +1132,7 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                      total_cache_creation_tokens = total_cache_creation_tokens + ?5, \
                      total_cost_dollars = total_cost_dollars + ?6, \
                      request_count = request_count + 1, \
-                     ended_at = ?7 \
+                     last_activity_at = ?7 \
                      WHERE session_id = ?1",
                     rusqlite::params![
                         session_id,
@@ -1085,36 +1203,31 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                     ],
                 );
             }
-            DbCommand::WriteDiagnosis {
+            DbCommand::FinalizeSession {
                 session_id,
-                completed_at,
-                outcome,
-                total_turns,
-                total_cost,
-                cache_hit_ratio,
-                degraded,
-                degradation_turn,
-                causes_json,
-                advice_json,
+                ended_at,
+                diagnosis,
+                recall,
+                response_tx,
             } => {
-                let _ = conn.execute(
-                    "INSERT OR REPLACE INTO session_diagnoses (session_id, completed_at, \
-                     outcome, total_turns, total_cost, cache_hit_ratio, degraded, \
-                     degradation_turn, causes_json, advice_json) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                    rusqlite::params![
+                let result = persist_final_session_artifacts(
+                    &conn,
+                    &session_id,
+                    &ended_at,
+                    &diagnosis,
+                    recall.as_ref(),
+                )
+                .map_err(|err| err.to_string());
+
+                if let Err(err) = &result {
+                    warn!(
                         session_id,
-                        completed_at,
-                        outcome,
-                        total_turns,
-                        total_cost,
-                        cache_hit_ratio,
-                        degraded as i32,
-                        degradation_turn,
-                        causes_json,
-                        advice_json,
-                    ],
-                );
+                        error = %err,
+                        "failed to persist final session artifacts"
+                    );
+                }
+
+                let _ = response_tx.send(result);
             }
             DbCommand::WriteToolOutcome {
                 session_id,
@@ -1153,13 +1266,7 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                     "INSERT INTO skill_events (session_id, timestamp, skill_name, event_type, \
                      confidence, source, detail) VALUES (?1,?2,?3,?4,?5,?6,?7)",
                     rusqlite::params![
-                        session_id,
-                        timestamp,
-                        skill_name,
-                        event_type,
-                        confidence,
-                        source,
-                        detail,
+                        session_id, timestamp, skill_name, event_type, confidence, source, detail,
                     ],
                 );
             }
@@ -1179,32 +1286,6 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                         session_id, timestamp, server, tool, event_type, source, detail,
                     ],
                 );
-            }
-            DbCommand::WriteRecall {
-                session_id,
-                initial_prompt,
-                final_response_summary,
-            } => {
-                match conn.execute(
-                    "INSERT OR IGNORE INTO session_recall (session_id, initial_prompt, final_response_summary) \
-                     VALUES (?1,?2,?3)",
-                    rusqlite::params![&session_id, &initial_prompt, &final_response_summary],
-                ) {
-                    Ok(1) => {}
-                    Ok(_) => {
-                        warn!(
-                            session_id,
-                            "session recall row already existed; ignoring duplicate insert"
-                        );
-                    }
-                    Err(err) => {
-                        warn!(
-                            session_id,
-                            error = %err,
-                            "failed to persist session recall"
-                        );
-                    }
-                }
             }
             DbCommand::WriteBillingReconciliation {
                 session_id,
@@ -1628,6 +1709,7 @@ fn build_diagnosis_response_json(
     causes: Value,
     advice: Value,
 ) -> Value {
+    let causes = mark_heuristic_causes_json(causes);
     serde_json::json!({
         "session_id": session_id,
         "completed_at": completed_at,
@@ -1701,6 +1783,7 @@ fn build_sessions_response_json(sessions: Vec<Value>) -> Value {
 struct PostmortemSessionRow {
     session_id: String,
     started_at: String,
+    last_activity_at: Option<String>,
     ended_at: Option<String>,
     model: Option<String>,
     initial_prompt: Option<String>,
@@ -1858,7 +1941,7 @@ fn query_latest_postmortem_session_id(conn: &Connection) -> rusqlite::Result<Opt
         "SELECT s.session_id \
          FROM sessions s \
          LEFT JOIN session_diagnoses d ON d.session_id = s.session_id \
-         ORDER BY COALESCE(d.completed_at, s.ended_at, s.started_at) DESC \
+         ORDER BY COALESCE(d.completed_at, s.ended_at, s.last_activity_at, s.started_at) DESC \
          LIMIT 1",
         [],
         |row| row.get::<_, String>(0),
@@ -1871,11 +1954,13 @@ fn load_postmortem_session(
     session_id: &str,
 ) -> rusqlite::Result<Option<PostmortemSessionRow>> {
     conn.query_row(
-        "SELECT session_id, started_at, ended_at, model, initial_prompt, \
+        "SELECT session_id, started_at, last_activity_at, ended_at, model, initial_prompt, \
                 total_input_tokens, total_output_tokens, total_cache_read_tokens, \
                 total_cache_creation_tokens, request_count, \
                 CASE WHEN ended_at IS NOT NULL \
                      THEN CAST(strftime('%s', ended_at) AS INTEGER) - CAST(strftime('%s', started_at) AS INTEGER) \
+                     WHEN last_activity_at IS NOT NULL \
+                     THEN CAST(strftime('%s', last_activity_at) AS INTEGER) - CAST(strftime('%s', started_at) AS INTEGER) \
                 END \
          FROM sessions WHERE session_id = ?1",
         rusqlite::params![session_id],
@@ -1883,22 +1968,64 @@ fn load_postmortem_session(
             Ok(PostmortemSessionRow {
                 session_id: row.get(0)?,
                 started_at: row.get(1)?,
-                ended_at: row.get(2)?,
-                model: row.get(3)?,
-                initial_prompt: row.get(4)?,
-                total_input_tokens: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as u64,
-                total_output_tokens: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u64,
-                total_cache_read_tokens: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0) as u64,
-                total_cache_creation_tokens: row.get::<_, Option<i64>>(8)?.unwrap_or(0).max(0)
+                last_activity_at: row.get(2)?,
+                ended_at: row.get(3)?,
+                model: row.get(4)?,
+                initial_prompt: row.get(5)?,
+                total_input_tokens: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u64,
+                total_output_tokens: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0) as u64,
+                total_cache_read_tokens: row.get::<_, Option<i64>>(8)?.unwrap_or(0).max(0) as u64,
+                total_cache_creation_tokens: row.get::<_, Option<i64>>(9)?.unwrap_or(0).max(0)
                     as u64,
-                request_count: row.get::<_, Option<i64>>(9)?.unwrap_or(0).max(0) as u64,
+                request_count: row.get::<_, Option<i64>>(10)?.unwrap_or(0).max(0) as u64,
                 duration_secs: row
-                    .get::<_, Option<i64>>(10)?
+                    .get::<_, Option<i64>>(11)?
                     .map(|value| value.max(0) as u64),
             })
         },
     )
     .optional()
+}
+
+fn session_is_live(session_id: &str) -> bool {
+    diagnosis::SESSION_TURNS.get(session_id).is_some()
+        || diagnosis::SESSIONS
+            .iter()
+            .any(|entry| entry.session_id == session_id)
+}
+
+fn remove_session_state_by_id(session_id: &str) -> Option<diagnosis::SessionState> {
+    let hash = diagnosis::SESSIONS
+        .iter()
+        .find_map(|entry| (entry.session_id == session_id).then_some(*entry.key()))?;
+    diagnosis::SESSIONS.remove(&hash).map(|(_, state)| state)
+}
+
+#[derive(Clone, Debug)]
+struct ExpiredSessionState {
+    session_id: String,
+    session_inserted: bool,
+    model: String,
+    initial_prompt: Option<String>,
+}
+
+fn session_state_if_still_expired(
+    hash: u64,
+    timeout_secs: u64,
+    now: Instant,
+) -> Option<ExpiredSessionState> {
+    let state = diagnosis::SESSIONS.get(&hash)?;
+    let idle_secs = now.duration_since(state.last_activity).as_secs();
+    if idle_secs <= timeout_secs {
+        return None;
+    }
+
+    Some(ExpiredSessionState {
+        session_id: state.session_id.clone(),
+        session_inserted: state.session_inserted,
+        model: state.model.clone(),
+        initial_prompt: state.initial_prompt.clone(),
+    })
 }
 
 fn load_postmortem_token_totals(
@@ -2227,6 +2354,51 @@ fn cause_is_heuristic(cause: &Value) -> bool {
         .unwrap_or(false)
 }
 
+fn heuristic_detail_has_marker(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("[heuristic]")
+        || lower.contains("heuristic")
+        || lower.contains("inferred")
+        || lower.contains("likely")
+        || lower.contains("suspected")
+        || lower.contains("appears")
+        || lower.contains("suggests")
+        || lower.contains("may indicate")
+}
+
+fn mark_heuristic_detail(detail: String, is_heuristic: bool) -> String {
+    if is_heuristic && !heuristic_detail_has_marker(&detail) {
+        format!("[heuristic] {detail}")
+    } else {
+        detail
+    }
+}
+
+fn mark_heuristic_causes_json(causes: Value) -> Value {
+    let Some(items) = causes.as_array() else {
+        return causes;
+    };
+
+    Value::Array(
+        items
+            .iter()
+            .map(|cause| {
+                let mut cause = cause.clone();
+                let is_heuristic = cause_is_heuristic(&cause);
+                if is_heuristic {
+                    if let Some(detail) = cause.get("detail").and_then(|value| value.as_str()) {
+                        let marked = mark_heuristic_detail(detail.to_string(), true);
+                        if let Some(object) = cause.as_object_mut() {
+                            object.insert("detail".to_string(), Value::String(marked));
+                        }
+                    }
+                }
+                cause
+            })
+            .collect(),
+    )
+}
+
 fn sanitize_causes(causes: &Value, redact: bool) -> Vec<Value> {
     causes
         .as_array()
@@ -2235,15 +2407,19 @@ fn sanitize_causes(causes: &Value, redact: bool) -> Vec<Value> {
                 .iter()
                 .filter_map(|cause| {
                     let cause_type = cause_string(cause, "cause_type")?;
+                    let is_heuristic = cause_is_heuristic(cause);
                     let detail = cause_string(cause, "detail")
                         .map(|value| redact_operational_text(&value, redact))
+                        .map(|value| mark_heuristic_detail(value, is_heuristic))
                         .unwrap_or_else(|| cause_type.clone());
                     Some(serde_json::json!({
                         "cause_type": cause_type,
                         "detail": detail,
                         "turn_first_noticed": cause_u64(cause, "turn_first_noticed"),
+                        "turn_last_noticed": cause_u64(cause, "turn_last_noticed"),
                         "estimated_cost": cause_f64(cause, "estimated_cost").unwrap_or(0.0),
-                        "is_heuristic": cause_is_heuristic(cause),
+                        "estimated_wasted_tokens": cause_u64(cause, "estimated_wasted_tokens"),
+                        "is_heuristic": is_heuristic,
                         "requested_model": cause_string(cause, "requested_model"),
                         "actual_model": cause_string(cause, "actual_model"),
                     }))
@@ -2346,9 +2522,12 @@ fn build_postmortem_response_from_db(
         target.to_string()
     };
 
-    let session = load_postmortem_session(conn, &session_id)
+    let mut session = load_postmortem_session(conn, &session_id)
         .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?
         .ok_or_else(|| PostmortemError::UnknownSession(session_id.clone()))?;
+    if session_is_live(&session.session_id) {
+        session.ended_at = None;
+    }
     let diagnosis = load_postmortem_diagnosis(conn, &session)
         .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?;
     let token_totals = load_postmortem_token_totals(conn, &session)
@@ -2361,8 +2540,12 @@ fn build_postmortem_response_from_db(
         .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?;
     let mcp_events = load_grouped_event_summaries(conn, &session.session_id, "mcp_events")
         .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?;
-    let (recall_prompt, recall_summary) = load_postmortem_recall(conn, &session.session_id)
-        .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?;
+    let (recall_prompt, recall_summary) = if session.ended_at.is_some() {
+        load_postmortem_recall(conn, &session.session_id)
+            .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?
+    } else {
+        (None, None)
+    };
 
     let session_ids = vec![session.session_id.clone()];
     let estimated = compute_estimated_costs_for_sessions(conn, &session_ids)
@@ -2388,6 +2571,11 @@ fn build_postmortem_response_from_db(
         .and_then(|value| value.as_str())
         .unwrap_or("none")
         .to_string();
+    let primary_cause_is_heuristic = sanitized_causes
+        .first()
+        .and_then(|cause| cause.get("is_heuristic"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     let default_primary_detail = if partial {
         "Session is still active; inactivity alone is not a degradation signal."
     } else {
@@ -2421,11 +2609,6 @@ fn build_postmortem_response_from_db(
         .iter()
         .filter(|turn| turn.cache_creation_tokens > 0 && turn.cache_read_tokens == 0)
         .collect::<Vec<_>>();
-    let non_cold_cache_rebuild_tokens = cache_rebuild_turns
-        .iter()
-        .filter(|turn| turn.turn_number > 1)
-        .map(|turn| turn.cache_creation_tokens)
-        .sum::<u64>();
     let model_fallbacks = turns
         .iter()
         .filter_map(|turn| {
@@ -2450,28 +2633,49 @@ fn build_postmortem_response_from_db(
         .iter()
         .filter_map(|cause| cause.get("estimated_cost").and_then(|value| value.as_f64()))
         .sum::<f64>();
-    let estimated_wasted_tokens = non_cold_cache_rebuild_tokens
-        + sanitized_causes
+    let mut compaction_waste_ranges = Vec::new();
+    let mut has_unranged_compaction_waste = false;
+    let mut compaction_waste_tokens = 0u64;
+    for cause in sanitized_causes.iter().filter(|cause| {
+        cause.get("cause_type").and_then(|value| value.as_str()) == Some("compaction_suspected")
+    }) {
+        let Some(wasted_tokens) = cause
+            .get("estimated_wasted_tokens")
+            .and_then(|value| value.as_u64())
+        else {
+            continue;
+        };
+        compaction_waste_tokens += wasted_tokens;
+        if wasted_tokens == 0 {
+            continue;
+        }
+        match (
+            cause
+                .get("turn_first_noticed")
+                .and_then(|value| value.as_u64()),
+            cause
+                .get("turn_last_noticed")
+                .and_then(|value| value.as_u64()),
+        ) {
+            (Some(first), Some(last)) => compaction_waste_ranges.push((first, last.max(first))),
+            _ => has_unranged_compaction_waste = true,
+        }
+    }
+    let non_cold_cache_rebuild_tokens = if has_unranged_compaction_waste {
+        0
+    } else {
+        cache_rebuild_turns
             .iter()
-            .filter(|cause| {
-                cause.get("cause_type").and_then(|value| value.as_str())
-                    == Some("compaction_suspected")
+            .filter(|turn| turn.turn_number > 1)
+            .filter(|turn| {
+                !compaction_waste_ranges
+                    .iter()
+                    .any(|(first, last)| turn.turn_number > *first && turn.turn_number <= *last)
             })
-            .filter_map(|cause| {
-                cause
-                    .get("detail")
-                    .and_then(|value| value.as_str())
-                    .and_then(|detail| {
-                        detail.split_whitespace().find_map(|part| {
-                            let digits = part
-                                .chars()
-                                .filter(|ch| ch.is_ascii_digit())
-                                .collect::<String>();
-                            digits.parse::<u64>().ok()
-                        })
-                    })
-            })
-            .sum::<u64>();
+            .map(|turn| turn.cache_creation_tokens)
+            .sum::<u64>()
+    };
+    let estimated_wasted_tokens = non_cold_cache_rebuild_tokens + compaction_waste_tokens;
 
     let prompt_source = recall_prompt
         .as_deref()
@@ -2697,6 +2901,7 @@ fn build_postmortem_response_from_db(
         "partial": partial,
         "summary": {
             "started_at": session.started_at,
+            "last_activity_at": session.last_activity_at,
             "ended_at": session.ended_at,
             "duration_secs": session.duration_secs,
             "model": session.model,
@@ -2717,6 +2922,7 @@ fn build_postmortem_response_from_db(
             "degraded": diagnosis.as_ref().map(|diag| diag.degraded).unwrap_or(false),
             "degradation_turn": diagnosis.as_ref().and_then(|diag| diag.degradation_turn),
             "likely_cause": primary_cause,
+            "likely_cause_is_heuristic": primary_cause_is_heuristic,
             "detail": primary_detail,
             "confidence": confidence,
             "causes": sanitized_causes,
@@ -3645,24 +3851,46 @@ impl ResponseAccumulator {
 /// Claude Code can expose 1M context as a UI model suffix. Current native-1M
 /// models use the normal upstream model id; the suffix is compatibility input.
 fn strip_model_1m_alias(model: &str) -> Option<&str> {
+    let model = model.trim();
     let lower = model.to_ascii_lowercase();
     lower
         .ends_with("[1m]")
         .then(|| &model[..model.len().saturating_sub("[1m]".len())])
+        .map(str::trim)
         .filter(|model| !model.is_empty())
 }
 
-/// Relaxed model equivalence check: "claude-opus-4-7" and
-/// "claude-opus-4-7-20260410" should be considered the same model. We treat
-/// two strings as matching if either contains the other as a prefix.
-fn normalize_model_for_match(model: &str) -> &str {
-    strip_model_1m_alias(model).unwrap_or(model)
+fn canonical_known_model_alias(model: &str) -> Option<&'static str> {
+    match model.to_ascii_lowercase().as_str() {
+        "claude-opus-4-7" | "claude-opus-4-7-20260410" => Some("claude-opus-4-7"),
+        "claude-sonnet-4-6" | "claude-sonnet-4-6-20250514" | "claude-sonnet-4-6-20260217" => {
+            Some("claude-sonnet-4-6")
+        }
+        "claude-sonnet-4-5" | "claude-sonnet-4-5-20250929" => Some("claude-sonnet-4-5"),
+        "claude-haiku-4-5" | "claude-haiku-4-5-20250929" | "claude-haiku-4-5-20251001" => {
+            Some("claude-haiku-4-5")
+        }
+        "claude-3-7-sonnet" | "claude-3-7-sonnet-20250219" => Some("claude-3-7-sonnet"),
+        "claude-3-haiku" | "claude-3-haiku-20240307" => Some("claude-3-haiku"),
+        _ => None,
+    }
+}
+
+/// Explicit model equivalence for known-safe aliases only. Unknown model names
+/// intentionally fall back to exact string matching so arbitrary prefix overlap
+/// cannot hide a real requested/actual model route mismatch.
+fn normalize_model_for_match(model: &str) -> Cow<'_, str> {
+    let trimmed = model.trim();
+    let without_1m = strip_model_1m_alias(trimmed).unwrap_or(trimmed);
+    canonical_known_model_alias(without_1m)
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|| Cow::Borrowed(without_1m))
 }
 
 pub(crate) fn model_matches(requested: &str, actual: &str) -> bool {
     let requested = normalize_model_for_match(requested);
     let actual = normalize_model_for_match(actual);
-    requested == actual || requested.starts_with(actual) || actual.starts_with(requested)
+    requested == actual
 }
 
 /// Linear extrapolation: estimate how many turns remain before Claude Code
@@ -3939,6 +4167,11 @@ fn finalize_response(
     {
         let mut entry = SESSION_BUDGETS.entry(session_id.clone()).or_default();
         entry.total_spend += total_cost;
+        if estimated_cost.trusted_for_budget_enforcement {
+            entry.trusted_spend += total_cost;
+        } else {
+            entry.untrusted_spend += total_cost;
+        }
         entry.total_tokens += acc.input_tokens
             + acc.output_tokens
             + acc.cache_read_tokens
@@ -4036,8 +4269,8 @@ fn finalize_response(
         // Model-route mismatch detector: Anthropic can route a request to a
         // different model than the client asked for. We emit a one-shot alert whenever the
         // `message.model` we saw in the SSE doesn't match the requested model.
-        // Matching is a contains-check so minor version suffix drift
-        // (`claude-opus-4-7` vs `claude-opus-4-7-20260410`) doesn't misfire.
+        // Matching uses explicit known-safe aliases only; unknown model strings
+        // must match exactly so prefix overlap cannot suppress a real warning.
         if let Some(actual) = acc.response_model.as_ref() {
             if !model_matches(model, actual) {
                 metrics::record_model_fallback(model, actual);
@@ -4550,79 +4783,138 @@ fn repair_persisted_session_artifacts(conn: &Connection) -> rusqlite::Result<()>
     Ok(())
 }
 
-/// End a session: run diagnosis, broadcast SessionEnd, persist to DB, clean up.
-fn end_session(session_id: &str, session_model: Option<String>, initial_prompt: Option<String>) {
-    SESSION_BUDGETS.remove(session_id);
-    CACHE_TRACKERS.remove(session_id);
-    if let Some((_, turns)) = diagnosis::SESSION_TURNS.remove(session_id) {
-        if turns.is_empty() {
-            // No turns collected — still broadcast session end.
-            watch::BROADCASTER.broadcast(watch::WatchEvent::SessionEnd {
-                session_id: session_id.to_string(),
-                outcome: "timeout".to_string(),
-                total_tokens: 0,
-                total_turns: 0,
-            });
-            return;
+/// End a session: run diagnosis, persist final artifacts, broadcast SessionEnd, clean up.
+fn end_session(
+    session_id: &str,
+    session_model: Option<String>,
+    initial_prompt: Option<String>,
+) -> bool {
+    end_session_with_db_tx(session_id, session_model, initial_prompt, &DB_TX)
+}
+
+fn end_session_with_db_tx(
+    session_id: &str,
+    session_model: Option<String>,
+    initial_prompt: Option<String>,
+    db_tx: &std_mpsc::Sender<DbCommand>,
+) -> bool {
+    let Some(turns) = diagnosis::SESSION_TURNS
+        .get(session_id)
+        .map(|entry| entry.clone())
+    else {
+        let removed_state = remove_session_state_by_id(session_id);
+        if removed_state
+            .as_ref()
+            .is_some_and(|state| state.session_inserted)
+        {
+            metrics::decrement_active_sessions();
         }
-        let report = diagnosis::analyze_session(session_id, &turns);
+        SESSION_BUDGETS.remove(session_id);
+        CACHE_TRACKERS.remove(session_id);
+        return true;
+    };
 
-        watch::BROADCASTER.broadcast(watch::WatchEvent::SessionEnd {
-            session_id: session_id.to_string(),
-            outcome: report.outcome.clone(),
-            total_tokens: report.total_tokens,
-            total_turns: report.total_turns,
-        });
-        metrics::record_session_end(
-            &report.outcome,
-            session_model.as_deref(),
-            report.estimated_total_cost_dollars,
-            report.total_turns,
-        );
+    let report = diagnosis::analyze_session(session_id, &turns);
+    let recall_initial_prompt = initial_prompt.unwrap_or_default();
+    let recall_summary = last_session_response_summary(&turns);
+    let recall = PersistedRecall {
+        initial_prompt: recall_initial_prompt,
+        final_response_summary: recall_summary,
+    };
 
-        if report.degraded {
-            metrics::record_degraded_session();
-            for cause in &report.causes {
-                metrics::record_degraded_cause(&cause.cause_type);
-                if cause.cause_type == "compaction_suspected" {
-                    metrics::record_compaction_suspected();
-                }
-            }
-            watch::BROADCASTER.broadcast(watch::WatchEvent::Diagnosis {
-                session_id: session_id.to_string(),
-                report: report.clone(),
-            });
-        }
+    let ended_at = now_iso8601();
+    let diagnosis = PersistedDiagnosis {
+        completed_at: ended_at.clone(),
+        outcome: report.outcome.clone(),
+        total_turns: report.total_turns,
+        total_cost: report.estimated_total_cost_dollars,
+        cache_hit_ratio: report.cache_hit_ratio,
+        degraded: report.degraded,
+        degradation_turn: report.degradation_turn,
+        causes_json: serde_json::to_string(&report.causes).unwrap_or_default(),
+        advice_json: serde_json::to_string(&report.advice).unwrap_or_default(),
+    };
 
-        let recall_initial_prompt = initial_prompt.unwrap_or_default();
-        let recall_summary = last_session_response_summary(&turns);
-        if !recall_initial_prompt.is_empty() || !recall_summary.is_empty() {
-            if let Err(err) = DB_TX.send(DbCommand::WriteRecall {
-                session_id: session_id.to_string(),
-                initial_prompt: recall_initial_prompt,
-                final_response_summary: recall_summary,
-            }) {
+    let (response_tx, response_rx) = std_mpsc::channel();
+    let persisted_final_artifacts = match db_tx.send(DbCommand::FinalizeSession {
+        session_id: session_id.to_string(),
+        ended_at,
+        diagnosis,
+        recall: Some(recall),
+        response_tx,
+    }) {
+        Ok(()) => match response_rx.recv() {
+            Ok(Ok(())) => true,
+            Ok(Err(err)) => {
                 warn!(
                     session_id,
                     error = %err,
-                    "failed to queue session recall for persistence"
+                    "final session artifacts were not persisted before SessionEnd"
                 );
+                false
+            }
+            Err(err) => {
+                warn!(
+                    session_id,
+                    error = %err,
+                    "final session artifact persistence channel closed before SessionEnd"
+                );
+                false
+            }
+        },
+        Err(err) => {
+            warn!(
+                session_id,
+                error = %err,
+                "failed to queue final session artifact persistence"
+            );
+            false
+        }
+    };
+
+    if !persisted_final_artifacts {
+        return false;
+    }
+
+    let removed_state = remove_session_state_by_id(session_id);
+    if removed_state
+        .as_ref()
+        .is_some_and(|state| state.session_inserted)
+    {
+        metrics::decrement_active_sessions();
+    }
+    let _ = diagnosis::SESSION_TURNS.remove(session_id);
+    SESSION_BUDGETS.remove(session_id);
+    CACHE_TRACKERS.remove(session_id);
+
+    watch::BROADCASTER.broadcast(watch::WatchEvent::SessionEnd {
+        session_id: session_id.to_string(),
+        outcome: report.outcome.clone(),
+        total_tokens: report.total_tokens,
+        total_turns: report.total_turns,
+    });
+    metrics::record_session_end(
+        &report.outcome,
+        session_model.as_deref(),
+        report.estimated_total_cost_dollars,
+        report.total_turns,
+    );
+
+    if report.degraded {
+        metrics::record_degraded_session();
+        for cause in &report.causes {
+            metrics::record_degraded_cause(&cause.cause_type);
+            if cause.cause_type == "compaction_suspected" {
+                metrics::record_compaction_suspected();
             }
         }
-
-        let _ = DB_TX.send(DbCommand::WriteDiagnosis {
+        watch::BROADCASTER.broadcast(watch::WatchEvent::Diagnosis {
             session_id: session_id.to_string(),
-            completed_at: now_iso8601(),
-            outcome: report.outcome,
-            total_turns: report.total_turns,
-            total_cost: report.estimated_total_cost_dollars,
-            cache_hit_ratio: report.cache_hit_ratio,
-            degraded: report.degraded,
-            degradation_turn: report.degradation_turn,
-            causes_json: serde_json::to_string(&report.causes).unwrap_or_default(),
-            advice_json: serde_json::to_string(&report.advice).unwrap_or_default(),
+            report,
         });
     }
+
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -7830,30 +8122,30 @@ async fn session_inactivity_monitor() {
         let now = Instant::now();
 
         // Collect expired session hashes (can't remove while iterating).
-        let mut expired: Vec<(u64, String)> = Vec::new();
+        let mut expired: Vec<u64> = Vec::new();
         for entry in diagnosis::SESSIONS.iter() {
             let idle = now.duration_since(entry.last_activity).as_secs();
             if idle > timeout_secs {
-                expired.push((*entry.key(), entry.session_id.clone()));
+                expired.push(*entry.key());
             }
         }
 
-        for (hash, sid) in expired {
-            if let Some((_, state)) = diagnosis::SESSIONS.remove(&hash) {
+        for hash in expired {
+            let Some(state) = session_state_if_still_expired(hash, timeout_secs, Instant::now())
+            else {
+                continue;
+            };
+
+            info!(session_id = %state.session_id, timeout_mins, "session ended (inactivity timeout)");
+            let _ = end_session(
+                &state.session_id,
                 if state.session_inserted {
-                    metrics::decrement_active_sessions();
-                }
-                info!(session_id = %sid, timeout_mins, "session ended (inactivity timeout)");
-                end_session(
-                    &sid,
-                    if state.session_inserted {
-                        Some(state.model)
-                    } else {
-                        None
-                    },
-                    state.initial_prompt,
-                );
-            }
+                    Some(state.model)
+                } else {
+                    None
+                },
+                state.initial_prompt,
+            );
         }
     }
 }
@@ -7918,7 +8210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::{mpsc as std_mpsc, LazyLock, Mutex};
     use std::time::Duration;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -7928,31 +8220,64 @@ mod tests {
         build_cache_rebuilds_response_from_db, build_diagnosis_response_json,
         build_postmortem_response_from_db, build_session_summary_json,
         build_sessions_response_json, build_summary_response_json, canonical_telemetry_name,
-        classify_cache_event, clean_user_prompt, compact_response_summary, context_fill_percent,
-        context_fill_ratio, db_writer_loop, derive_display_name, diagnosis, ensure_session_columns,
-        epoch_to_iso8601, estimated_rebuild_cost_for_cache_event, extract_explicit_skill_refs,
-        extract_header, extract_headers, extract_working_dir, fallback_request_id,
-        in_memory_postmortem_totals, infer_context_window_tokens, is_internal_request_shape,
-        load_degradation_view_from_db, lock_or_recover, looks_like_machine_recall_line,
-        looks_like_title_request, metrics, model_has_native_1m_context, model_requests_1m_context,
-        normalize_search_text, now_epoch_secs, parse_latest_tool_results, parse_request_body,
-        persist_billing_reconciliation, pricing, query_historical_metrics, query_summary,
-        redact_operational_text, repair_persisted_session_artifacts,
-        repair_turn_snapshot_context_windows, request_cache_ttl_evidence, request_cache_ttl_secs,
+        check_session_budget, classify_cache_event, clean_user_prompt, compact_response_summary,
+        context_fill_percent, context_fill_ratio, db_writer_loop, derive_display_name, diagnosis,
+        end_session_with_db_tx, ensure_session_columns, epoch_to_iso8601,
+        estimated_rebuild_cost_for_cache_event, extract_explicit_skill_refs, extract_header,
+        extract_headers, extract_working_dir, fallback_request_id, in_memory_postmortem_totals,
+        infer_context_window_tokens, is_internal_request_shape, load_degradation_view_from_db,
+        lock_or_recover, looks_like_machine_recall_line, looks_like_title_request, metrics,
+        model_has_native_1m_context, model_requests_1m_context, normalize_search_text,
+        now_epoch_secs, parse_latest_tool_results, parse_request_body,
+        persist_billing_reconciliation, persist_final_session_artifacts, pricing,
+        query_historical_metrics, query_summary, redact_operational_text,
+        repair_persisted_session_artifacts, repair_turn_snapshot_context_windows,
+        request_cache_ttl_evidence, request_cache_ttl_secs,
         request_context_window_hint_from_headers, request_uses_1m_context,
         resolve_context_window_tokens, resolve_context_window_tokens_with_config,
         response_cache_ttl_secs, score_recall_doc, seed_live_metric_labels_from_db,
-        session_timeout_secs, should_broadcast_quota_snapshot, skill_name_from_skill_file,
-        skill_name_from_tool_input_json, strip_model_1m_alias, summarize_hook_tool_input,
-        tokenize_search_text, tool_recall_context, truncate_detail,
+        session_state_if_still_expired, session_timeout_secs, should_broadcast_quota_snapshot,
+        skill_name_from_skill_file, skill_name_from_tool_input_json, strip_model_1m_alias,
+        summarize_hook_tool_input, tokenize_search_text, tool_recall_context, truncate_detail,
         upstream_request_adjustment_for_body, BillingReconciliationInput,
         BillingReconciliationWriteError, CacheTracker, CacheTtlEvidence, DbCommand, HttpHeaders,
-        ParsedToolResult, PostmortemError, ProtoHeaderValue, ResponseAccumulator,
-        SummaryWindowData, ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS,
-        QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA, STANDARD_CONTEXT_WINDOW_TOKENS,
+        ParsedToolResult, PersistedDiagnosis, PersistedRecall, PostmortemError, ProtoHeaderValue,
+        ResponseAccumulator, SessionBudgetState, SummaryWindowData, ESTIMATED_COST_SOURCE,
+        EXTENDED_CONTEXT_WINDOW_TOKENS, QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA, SESSION_BUDGETS,
+        STANDARD_CONTEXT_WINDOW_TOKENS,
     };
 
     static METRICS_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    static ENV_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     fn create_history_test_db() -> Connection {
         let conn = Connection::open_in_memory().expect("open sqlite");
@@ -7960,6 +8285,7 @@ mod tests {
             "CREATE TABLE sessions (
                 session_id TEXT PRIMARY KEY,
                 started_at TEXT NOT NULL,
+                last_activity_at TEXT,
                 ended_at TEXT,
                 model TEXT,
                 initial_prompt TEXT
@@ -8744,7 +9070,57 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(columns.contains(&"initial_prompt".to_string()));
+        assert!(columns.contains(&"last_activity_at".to_string()));
         assert!(!columns.contains(&"cache_hit_ratio".to_string()));
+    }
+
+    #[test]
+    fn ensure_session_columns_migrates_legacy_activity_without_marking_active_final() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                model TEXT
+            );
+            CREATE TABLE session_diagnoses (
+                session_id TEXT PRIMARY KEY
+            );
+            CREATE TABLE session_recall (
+                session_id TEXT PRIMARY KEY
+            );
+            INSERT INTO sessions (session_id, started_at, ended_at, model)
+            VALUES
+                ('session-active-legacy', '2026-01-01T00:00:00Z', '2026-01-01T00:05:00Z', 'claude-sonnet'),
+                ('session-final-legacy', '2026-01-01T00:00:00Z', '2026-01-01T00:10:00Z', 'claude-sonnet');
+            INSERT INTO session_diagnoses (session_id)
+            VALUES ('session-active-legacy'), ('session-final-legacy');
+            INSERT INTO session_recall (session_id) VALUES ('session-final-legacy');",
+        )
+        .expect("create legacy lifecycle schema");
+
+        ensure_session_columns(&conn).expect("migrate sessions columns");
+
+        let active: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT last_activity_at, ended_at FROM sessions WHERE session_id = 'session-active-legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query active legacy row");
+        assert_eq!(active.0.as_deref(), Some("2026-01-01T00:05:00Z"));
+        assert_eq!(active.1, None);
+
+        let final_row: (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT last_activity_at, ended_at FROM sessions WHERE session_id = 'session-final-legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query final legacy row");
+        assert_eq!(final_row.0.as_deref(), Some("2026-01-01T00:10:00Z"));
+        assert_eq!(final_row.1.as_deref(), Some("2026-01-01T00:10:00Z"));
     }
 
     fn unique_test_db_path(label: &str) -> String {
@@ -8774,10 +9150,19 @@ mod tests {
         model: &str,
         initial_prompt: Option<&str>,
     ) {
+        let last_activity_at = ended_at.unwrap_or(started_at);
         conn.execute(
-            "INSERT INTO sessions (session_id, started_at, ended_at, model, initial_prompt) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![session_id, started_at, ended_at, model, initial_prompt],
+            "INSERT INTO sessions \
+             (session_id, started_at, last_activity_at, ended_at, model, initial_prompt) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                session_id,
+                started_at,
+                last_activity_at,
+                ended_at,
+                model,
+                initial_prompt
+            ],
         )
         .expect("insert session");
     }
@@ -8882,6 +9267,96 @@ mod tests {
             ],
         )
         .expect("insert turn snapshot");
+    }
+
+    fn test_record_request_command(
+        request_id: &str,
+        session_id: &str,
+        timestamp: &str,
+    ) -> DbCommand {
+        DbCommand::RecordRequest {
+            request_id: request_id.to_string(),
+            session_id: session_id.to_string(),
+            timestamp: timestamp.to_string(),
+            model: "claude-sonnet".to_string(),
+            input_tokens: 1_000,
+            output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
+            cache_ttl_min_secs: 300,
+            cache_ttl_max_secs: 300,
+            cache_ttl_source: "default_5m".to_string(),
+            outcome: "success".to_string(),
+            error_type: None,
+            error_message: None,
+            cost_dollars: 0.01,
+            cost_source: "pricing_file:test".to_string(),
+            trusted_for_budget_enforcement: true,
+            duration_ms: 10,
+            tool_calls_json: "[]".to_string(),
+            tool_calls_list: Vec::new(),
+            cache_event: "none".to_string(),
+        }
+    }
+
+    fn test_turn_snapshot_command(
+        session_id: &str,
+        turn_number: u32,
+        timestamp: &str,
+        response_summary: &str,
+    ) -> DbCommand {
+        DbCommand::WriteTurnSnapshot {
+            session_id: session_id.to_string(),
+            turn_number,
+            timestamp: timestamp.to_string(),
+            input_tokens: 1_000,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_ttl_min_secs: 300,
+            cache_ttl_max_secs: 300,
+            cache_ttl_source: "default_5m".to_string(),
+            output_tokens: 100,
+            ttft_ms: 10,
+            tool_calls_json: "[]".to_string(),
+            tool_failures: 0,
+            gap_from_prev_secs: 0.0,
+            context_utilization: 0.01,
+            context_window_tokens: STANDARD_CONTEXT_WINDOW_TOKENS,
+            frustration_signals: 0,
+            requested_model: Some("claude-sonnet".to_string()),
+            actual_model: Some("claude-sonnet".to_string()),
+            response_summary: Some(response_summary.to_string()),
+            response_error_type: None,
+            response_error_message: None,
+        }
+    }
+
+    fn test_live_turn(turn_number: u32, response_summary: Option<&str>) -> diagnosis::TurnSnapshot {
+        diagnosis::TurnSnapshot {
+            turn_number,
+            timestamp: Instant::now(),
+            input_tokens: 1_000,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_ttl_min_secs: 300,
+            cache_ttl_max_secs: 300,
+            cache_ttl_source: "default_5m".to_string(),
+            output_tokens: 100,
+            ttft_ms: 10,
+            tool_calls: Vec::new(),
+            tool_results_failed: 0,
+            gap_from_prev_secs: 0.0,
+            context_utilization: 0.01,
+            context_window_tokens: STANDARD_CONTEXT_WINDOW_TOKENS,
+            frustration_signals: 0,
+            requested_model: Some("claude-sonnet".to_string()),
+            actual_model: Some("claude-sonnet".to_string()),
+            response_summary: response_summary.map(str::to_string),
+            response_error_type: None,
+            response_error_message: None,
+        }
     }
 
     fn make_http_headers(entries: &[(&str, &str)]) -> HttpHeaders {
@@ -9739,6 +10214,51 @@ mod tests {
     }
 
     #[test]
+    fn diagnosis_response_marks_heuristic_cause_details() {
+        let json = build_diagnosis_response_json(
+            "session_heuristic".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+            "Compaction Suspected".to_string(),
+            4,
+            1.25,
+            "builtin_model_family_pricing".to_string(),
+            false,
+            None,
+            None,
+            None,
+            0.4,
+            true,
+            Some(2),
+            serde_json::json!([
+                {
+                    "turn_first_noticed": 2,
+                    "cause_type": "near_compaction",
+                    "detail": "Context reached 84% full.",
+                    "estimated_cost": 0.0,
+                    "is_heuristic": true
+                },
+                {
+                    "turn_first_noticed": 3,
+                    "cause_type": "model_fallback",
+                    "detail": "Requested opus; response reported sonnet.",
+                    "estimated_cost": 0.0,
+                    "is_heuristic": false
+                }
+            ]),
+            serde_json::json!([]),
+        );
+
+        assert_eq!(
+            json.pointer("/causes/0/detail").and_then(|v| v.as_str()),
+            Some("[heuristic] Context reached 84% full.")
+        );
+        assert_eq!(
+            json.pointer("/causes/1/detail").and_then(|v| v.as_str()),
+            Some("Requested opus; response reported sonnet.")
+        );
+    }
+
+    #[test]
     fn session_summary_uses_estimated_cost_fields_only() {
         let json = build_session_summary_json(
             "session_1".to_string(),
@@ -10020,6 +10540,705 @@ mod tests {
     }
 
     #[test]
+    fn request_persistence_updates_last_activity_without_ending_session() {
+        let path = unique_test_db_path("active-last-activity");
+        let (tx, rx) = std_mpsc::channel();
+        let writer_path = path.clone();
+        let handle = std::thread::spawn(move || db_writer_loop(&writer_path, rx));
+
+        tx.send(DbCommand::InsertSession {
+            session_id: "session-active-db".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            model: "claude-sonnet".to_string(),
+            initial_prompt: Some("Keep working".to_string()),
+        })
+        .expect("queue session insert");
+        tx.send(test_record_request_command(
+            "req-active-db",
+            "session-active-db",
+            "2026-01-01T00:02:00Z",
+        ))
+        .expect("queue request");
+        tx.send(test_turn_snapshot_command(
+            "session-active-db",
+            1,
+            "2026-01-01T00:02:00Z",
+            "Still active.",
+        ))
+        .expect("queue turn snapshot");
+        drop(tx);
+        handle.join().expect("db writer exits");
+
+        let conn = Connection::open(&path).expect("open test db");
+        let (last_activity_at, ended_at): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT last_activity_at, ended_at FROM sessions WHERE session_id = ?1",
+                rusqlite::params!["session-active-db"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query session lifecycle");
+        assert_eq!(last_activity_at.as_deref(), Some("2026-01-01T00:02:00Z"));
+        assert_eq!(ended_at, None);
+
+        let json = build_postmortem_response_from_db(&conn, "session-active-db", true)
+            .expect("postmortem");
+        assert_eq!(
+            json.get("partial").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert!(json
+            .pointer("/summary/ended_at")
+            .is_some_and(|value| value.is_null()));
+        assert_eq!(
+            json.pointer("/summary/last_activity_at")
+                .and_then(|value| value.as_str()),
+            Some("2026-01-01T00:02:00Z")
+        );
+
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn live_session_with_stale_final_artifacts_stays_partial() {
+        let conn = create_full_test_db();
+        let session_id = "session-live-stale-final";
+        let _ = diagnosis::SESSION_TURNS.remove(session_id);
+
+        insert_session(
+            &conn,
+            session_id,
+            "2026-01-01T00:00:00Z",
+            Some("2026-01-01T00:05:00Z"),
+            "claude-sonnet",
+            Some("Keep going"),
+        );
+        insert_request(
+            &conn,
+            "req-live-stale-final",
+            session_id,
+            "2026-01-01T00:04:00Z",
+            "claude-sonnet",
+            1_000,
+            100,
+            0,
+            0,
+        );
+        insert_turn_snapshot(
+            &conn,
+            session_id,
+            1,
+            "2026-01-01T00:04:00Z",
+            0,
+            0,
+            100,
+            0.0,
+            0.02,
+            Some("Live turn summary."),
+        );
+        insert_diagnosis(
+            &conn,
+            session_id,
+            "2026-01-01T00:05:00Z",
+            true,
+            r#"[{"turn_first_noticed":1,"cause_type":"stale_final","detail":"This old final diagnosis must not load.","estimated_cost":0.0,"is_heuristic":false}]"#,
+        );
+        conn.execute(
+            "INSERT INTO session_recall (session_id, initial_prompt, final_response_summary) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![session_id, "Keep going", "Stale final summary."],
+        )
+        .expect("insert stale recall");
+        diagnosis::SESSION_TURNS.insert(
+            session_id.to_string(),
+            vec![test_live_turn(1, Some("Live turn summary."))],
+        );
+
+        let json = build_postmortem_response_from_db(&conn, session_id, false).expect("postmortem");
+
+        assert_eq!(
+            json.get("partial").and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert!(json
+            .pointer("/summary/ended_at")
+            .is_some_and(|value| value.is_null()));
+        assert_eq!(
+            json.pointer("/summary/outcome")
+                .and_then(|value| value.as_str()),
+            Some("In Progress")
+        );
+        assert_eq!(
+            json.pointer("/diagnosis/likely_cause")
+                .and_then(|value| value.as_str()),
+            Some("none")
+        );
+        assert_eq!(
+            json.pointer("/summary/final_response_summary")
+                .and_then(|value| value.as_str()),
+            Some("Live turn summary.")
+        );
+
+        let _ = diagnosis::SESSION_TURNS.remove(session_id);
+    }
+
+    #[test]
+    fn finalized_session_postmortem_is_final_with_recall_and_diagnosis() {
+        let conn = create_full_test_db();
+        insert_session(
+            &conn,
+            "session-final",
+            "2026-01-01T00:00:00Z",
+            Some("2026-01-01T00:10:00Z"),
+            "claude-sonnet",
+            Some("Finish the feature"),
+        );
+        insert_request(
+            &conn,
+            "req-final",
+            "session-final",
+            "2026-01-01T00:05:00Z",
+            "claude-sonnet",
+            2_000,
+            300,
+            0,
+            0,
+        );
+        insert_turn_snapshot(
+            &conn,
+            "session-final",
+            1,
+            "2026-01-01T00:05:00Z",
+            0,
+            0,
+            100,
+            0.0,
+            0.02,
+            Some("Final answer shipped."),
+        );
+        conn.execute(
+            "INSERT INTO session_diagnoses (
+                session_id, completed_at, outcome, total_turns, total_cost, cache_hit_ratio,
+                degraded, degradation_turn, causes_json, advice_json
+            ) VALUES (?1, ?2, 'Likely Completed', 1, 0.01, 0.0, 0, NULL, '[]', ?3)",
+            rusqlite::params!["session-final", "2026-01-01T00:10:00Z", r#"["Done."]"#,],
+        )
+        .expect("insert diagnosis");
+        conn.execute(
+            "INSERT INTO session_recall (session_id, initial_prompt, final_response_summary) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "session-final",
+                "Finish the feature",
+                "Final answer shipped."
+            ],
+        )
+        .expect("insert recall");
+
+        let json =
+            build_postmortem_response_from_db(&conn, "session-final", false).expect("postmortem");
+        assert_eq!(
+            json.get("partial").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            json.pointer("/summary/ended_at")
+                .and_then(|value| value.as_str()),
+            Some("2026-01-01T00:10:00Z")
+        );
+        assert_eq!(
+            json.pointer("/summary/final_response_summary")
+                .and_then(|value| value.as_str()),
+            Some("Final answer shipped.")
+        );
+        assert_eq!(
+            json.pointer("/summary/outcome")
+                .and_then(|value| value.as_str()),
+            Some("Likely Completed")
+        );
+    }
+
+    #[test]
+    fn finalization_command_persists_artifacts_before_ack() {
+        let path = unique_test_db_path("finalization-ack");
+        let (tx, rx) = std_mpsc::channel();
+        let writer_path = path.clone();
+        let handle = std::thread::spawn(move || db_writer_loop(&writer_path, rx));
+
+        tx.send(DbCommand::InsertSession {
+            session_id: "session-ack".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            model: "claude-sonnet".to_string(),
+            initial_prompt: Some("Summarize final state".to_string()),
+        })
+        .expect("queue session insert");
+        tx.send(test_record_request_command(
+            "req-ack",
+            "session-ack",
+            "2026-01-01T00:03:00Z",
+        ))
+        .expect("queue request");
+        tx.send(test_turn_snapshot_command(
+            "session-ack",
+            1,
+            "2026-01-01T00:03:00Z",
+            "Final persisted summary.",
+        ))
+        .expect("queue turn snapshot");
+
+        let (response_tx, response_rx) = std_mpsc::channel();
+        tx.send(DbCommand::FinalizeSession {
+            session_id: "session-ack".to_string(),
+            ended_at: "2026-01-01T00:04:00Z".to_string(),
+            diagnosis: PersistedDiagnosis {
+                completed_at: "2026-01-01T00:04:00Z".to_string(),
+                outcome: "Likely Completed".to_string(),
+                total_turns: 1,
+                total_cost: 0.01,
+                cache_hit_ratio: 0.0,
+                degraded: false,
+                degradation_turn: None,
+                causes_json: "[]".to_string(),
+                advice_json: r#"["Done."]"#.to_string(),
+            },
+            recall: Some(PersistedRecall {
+                initial_prompt: "Summarize final state".to_string(),
+                final_response_summary: "Final persisted summary.".to_string(),
+            }),
+            response_tx,
+        })
+        .expect("queue finalization");
+        response_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("finalization ack")
+            .expect("finalization ok");
+        drop(tx);
+        handle.join().expect("db writer exits");
+
+        let conn = Connection::open(&path).expect("open test db");
+        let json =
+            build_postmortem_response_from_db(&conn, "session-ack", false).expect("postmortem");
+        assert_eq!(
+            json.get("partial").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            json.pointer("/summary/ended_at")
+                .and_then(|value| value.as_str()),
+            Some("2026-01-01T00:04:00Z")
+        );
+        assert_eq!(
+            json.pointer("/diagnosis/detail")
+                .and_then(|value| value.as_str()),
+            Some("No primary degradation cause was recorded.")
+        );
+        assert_eq!(
+            json.pointer("/summary/final_response_summary")
+                .and_then(|value| value.as_str()),
+            Some("Final persisted summary.")
+        );
+
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn failed_finalization_keeps_in_memory_turns_for_retry() {
+        let session_id = "session-finalization-retry";
+        let _ = diagnosis::SESSION_TURNS.remove(session_id);
+        diagnosis::SESSION_TURNS.insert(
+            session_id.to_string(),
+            vec![test_live_turn(1, Some("Retryable final summary."))],
+        );
+        let (tx, rx) = std_mpsc::channel::<DbCommand>();
+        drop(rx);
+
+        let finalized = end_session_with_db_tx(
+            session_id,
+            Some("claude-sonnet".to_string()),
+            Some("Retry finalization".to_string()),
+            &tx,
+        );
+
+        assert!(!finalized);
+        assert!(diagnosis::SESSION_TURNS.get(session_id).is_some());
+
+        let _ = diagnosis::SESSION_TURNS.remove(session_id);
+    }
+
+    #[test]
+    fn no_turn_timeout_finalization_clears_live_state() {
+        let session_id = "session-no-turn-timeout";
+        let hash = 0x7075_726e_u64;
+        let _ = diagnosis::SESSION_TURNS.remove(session_id);
+        let _ = diagnosis::SESSIONS.remove(&hash);
+        SESSION_BUDGETS.insert(
+            session_id.to_string(),
+            SessionBudgetState {
+                total_spend: 1.0,
+                trusted_spend: 1.0,
+                untrusted_spend: 0.0,
+                total_tokens: 100,
+                request_count: 1,
+                estimated_cache_waste_dollars: 0.0,
+            },
+        );
+        diagnosis::SESSIONS.insert(
+            hash,
+            diagnosis::SessionState {
+                session_id: session_id.to_string(),
+                display_name: "no-turn-timeout".to_string(),
+                model: "claude-sonnet".to_string(),
+                initial_prompt: Some("No turn yet".to_string()),
+                created_at: Instant::now(),
+                last_activity: Instant::now() - Duration::from_secs(3_600),
+                session_inserted: false,
+                cache_warning_sent: false,
+                idle_postmortem_sent: false,
+            },
+        );
+        let (tx, rx) = std_mpsc::channel::<DbCommand>();
+        drop(rx);
+
+        assert!(end_session_with_db_tx(
+            session_id,
+            Some("claude-sonnet".to_string()),
+            Some("No turn yet".to_string()),
+            &tx,
+        ));
+        assert!(diagnosis::SESSIONS.get(&hash).is_none());
+        assert!(SESSION_BUDGETS.get(session_id).is_none());
+    }
+
+    #[test]
+    fn timeout_expiration_rechecks_recent_activity_before_finalization() {
+        let hash = 0x41c7_1017_u64;
+        let session_id = "session-timeout-recheck";
+        let _ = diagnosis::SESSIONS.remove(&hash);
+        diagnosis::SESSIONS.insert(
+            hash,
+            diagnosis::SessionState {
+                session_id: session_id.to_string(),
+                display_name: "timeout-recheck".to_string(),
+                model: "claude-sonnet".to_string(),
+                initial_prompt: Some("Still active".to_string()),
+                created_at: Instant::now(),
+                last_activity: Instant::now() - Duration::from_secs(3_600),
+                session_inserted: true,
+                cache_warning_sent: false,
+                idle_postmortem_sent: false,
+            },
+        );
+        assert!(session_state_if_still_expired(hash, 60, Instant::now()).is_some());
+
+        {
+            let mut state = diagnosis::SESSIONS.get_mut(&hash).expect("session state");
+            state.last_activity = Instant::now();
+        }
+
+        assert!(session_state_if_still_expired(hash, 60, Instant::now()).is_none());
+
+        let _ = diagnosis::SESSIONS.remove(&hash);
+    }
+
+    #[test]
+    fn successful_finalization_clears_live_marker_before_final_fetch() {
+        let path = unique_test_db_path("finalization-live-marker");
+        let (tx, rx) = std_mpsc::channel();
+        let writer_path = path.clone();
+        let handle = std::thread::spawn(move || db_writer_loop(&writer_path, rx));
+        let session_id = "session-live-marker-final";
+        let hash = 0x5155_10ff_u64;
+        let _ = diagnosis::SESSION_TURNS.remove(session_id);
+        let _ = diagnosis::SESSIONS.remove(&hash);
+
+        tx.send(DbCommand::InsertSession {
+            session_id: session_id.to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            model: "claude-sonnet".to_string(),
+            initial_prompt: Some("Finish cleanly".to_string()),
+        })
+        .expect("queue session insert");
+        diagnosis::SESSIONS.insert(
+            hash,
+            diagnosis::SessionState {
+                session_id: session_id.to_string(),
+                display_name: "live-marker-final".to_string(),
+                model: "claude-sonnet".to_string(),
+                initial_prompt: Some("Finish cleanly".to_string()),
+                created_at: Instant::now(),
+                last_activity: Instant::now(),
+                session_inserted: false,
+                cache_warning_sent: false,
+                idle_postmortem_sent: false,
+            },
+        );
+        diagnosis::SESSION_TURNS.insert(
+            session_id.to_string(),
+            vec![test_live_turn(1, Some("Final summary ready."))],
+        );
+
+        assert!(end_session_with_db_tx(
+            session_id,
+            Some("claude-sonnet".to_string()),
+            Some("Finish cleanly".to_string()),
+            &tx,
+        ));
+        assert!(diagnosis::SESSIONS.get(&hash).is_none());
+        assert!(diagnosis::SESSION_TURNS.get(session_id).is_none());
+
+        let conn = Connection::open(&path).expect("open test db");
+        let json =
+            build_postmortem_response_from_db(&conn, session_id, false).expect("final postmortem");
+        assert_eq!(
+            json.get("partial").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert!(json
+            .pointer("/summary/ended_at")
+            .and_then(|value| value.as_str())
+            .is_some());
+        assert_eq!(
+            json.pointer("/summary/final_response_summary")
+                .and_then(|value| value.as_str()),
+            Some("Final summary ready.")
+        );
+
+        drop(tx);
+        handle.join().expect("db writer exits");
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn final_session_artifact_persistence_rolls_back_on_partial_failure() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                last_activity_at TEXT,
+                ended_at TEXT
+            );
+            CREATE TABLE session_recall (
+                session_id TEXT PRIMARY KEY,
+                initial_prompt TEXT,
+                final_response_summary TEXT
+            );
+            INSERT INTO sessions (session_id, started_at, last_activity_at, ended_at)
+            VALUES ('session-atomic', '2026-01-01T00:00:00Z', '2026-01-01T00:02:00Z', NULL);",
+        )
+        .expect("create partial schema");
+
+        let err = persist_final_session_artifacts(
+            &conn,
+            "session-atomic",
+            "2026-01-01T00:04:00Z",
+            &PersistedDiagnosis {
+                completed_at: "2026-01-01T00:04:00Z".to_string(),
+                outcome: "Likely Completed".to_string(),
+                total_turns: 1,
+                total_cost: 0.01,
+                cache_hit_ratio: 0.0,
+                degraded: false,
+                degradation_turn: None,
+                causes_json: "[]".to_string(),
+                advice_json: "[]".to_string(),
+            },
+            Some(&PersistedRecall {
+                initial_prompt: "Prompt".to_string(),
+                final_response_summary: "Summary".to_string(),
+            }),
+        )
+        .expect_err("missing diagnoses table should fail");
+        assert!(err.to_string().contains("session_diagnoses"));
+
+        let ended_at: Option<String> = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE session_id = 'session-atomic'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query ended_at");
+        assert_eq!(ended_at, None);
+
+        let recall_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_recall", [], |row| row.get(0))
+            .expect("count recall rows");
+        assert_eq!(recall_rows, 0);
+    }
+
+    #[test]
+    fn final_session_artifact_persistence_rejects_missing_session_row() {
+        let conn = create_full_test_db();
+
+        let err = persist_final_session_artifacts(
+            &conn,
+            "session-missing",
+            "2026-01-01T00:04:00Z",
+            &PersistedDiagnosis {
+                completed_at: "2026-01-01T00:04:00Z".to_string(),
+                outcome: "Likely Completed".to_string(),
+                total_turns: 1,
+                total_cost: 0.01,
+                cache_hit_ratio: 0.0,
+                degraded: false,
+                degradation_turn: None,
+                causes_json: "[]".to_string(),
+                advice_json: "[]".to_string(),
+            },
+            Some(&PersistedRecall {
+                initial_prompt: "Prompt".to_string(),
+                final_response_summary: "Summary".to_string(),
+            }),
+        )
+        .expect_err("missing session should fail");
+        assert!(matches!(err, rusqlite::Error::QueryReturnedNoRows));
+
+        let diagnosis_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_diagnoses", [], |row| {
+                row.get(0)
+            })
+            .expect("count diagnosis rows");
+        let recall_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_recall", [], |row| row.get(0))
+            .expect("count recall rows");
+        assert_eq!(diagnosis_rows, 0);
+        assert_eq!(recall_rows, 0);
+    }
+
+    #[test]
+    fn compaction_waste_uses_structured_cause_tokens_not_detail_digits() {
+        let conn = create_full_test_db();
+        insert_session(
+            &conn,
+            "session-compaction",
+            "2026-01-01T00:00:00Z",
+            Some("2026-01-01T00:05:00Z"),
+            "claude-sonnet",
+            Some("Investigate compaction"),
+        );
+        insert_request(
+            &conn,
+            "req-compaction",
+            "session-compaction",
+            "2026-01-01T00:01:00Z",
+            "claude-sonnet",
+            1_000,
+            100,
+            0,
+            0,
+        );
+        conn.execute(
+            "INSERT INTO session_diagnoses (
+                session_id, completed_at, outcome, total_turns, total_cost, cache_hit_ratio,
+                degraded, degradation_turn, causes_json, advice_json
+            ) VALUES (?1, ?2, 'Compaction Suspected', 6, 1.0, 0.5, 1, 4, ?3, '[]')",
+            rusqlite::params![
+                "session-compaction",
+                "2026-01-01T00:05:00Z",
+                r#"[{"turn_first_noticed":4,"cause_type":"compaction_suspected","detail":"Rapid-fire requests at turns 4-6; prose number 999 should not be parsed.","estimated_cost":0.0,"estimated_wasted_tokens":321000,"is_heuristic":true}]"#,
+            ],
+        )
+        .expect("insert compaction diagnosis");
+
+        let json = build_postmortem_response_from_db(&conn, "session-compaction", true)
+            .expect("postmortem");
+        assert_eq!(
+            json.pointer("/diagnosis/likely_cause_is_heuristic")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            json.pointer("/diagnosis/detail")
+                .and_then(|value| value.as_str()),
+            Some("[heuristic] Rapid-fire requests at turns 4-6; prose number 999 should not be parsed.")
+        );
+        assert_eq!(
+            json.pointer("/impact/estimated_likely_wasted_tokens")
+                .and_then(|value| value.as_u64()),
+            Some(321_000)
+        );
+    }
+
+    #[test]
+    fn compaction_waste_does_not_double_count_overlapping_cache_rebuild_tokens() {
+        let conn = create_full_test_db();
+        insert_session(
+            &conn,
+            "session-compaction-overlap",
+            "2026-01-01T00:00:00Z",
+            Some("2026-01-01T00:05:00Z"),
+            "claude-sonnet",
+            Some("Investigate compaction overlap"),
+        );
+        insert_request(
+            &conn,
+            "req-compaction-overlap",
+            "session-compaction-overlap",
+            "2026-01-01T00:01:00Z",
+            "claude-sonnet",
+            1_000,
+            100,
+            0,
+            350,
+        );
+        insert_turn_snapshot(
+            &conn,
+            "session-compaction-overlap",
+            2,
+            "2026-01-01T00:02:00Z",
+            0,
+            50,
+            100,
+            0.0,
+            0.70,
+            Some("Cache rebuild outside compaction loop."),
+        );
+        insert_turn_snapshot(
+            &conn,
+            "session-compaction-overlap",
+            5,
+            "2026-01-01T00:03:00Z",
+            0,
+            100,
+            100,
+            1.0,
+            0.80,
+            Some("Compaction loop repeated work."),
+        );
+        insert_turn_snapshot(
+            &conn,
+            "session-compaction-overlap",
+            6,
+            "2026-01-01T00:04:00Z",
+            0,
+            200,
+            100,
+            1.0,
+            0.81,
+            Some("Compaction loop repeated work again."),
+        );
+        conn.execute(
+            "INSERT INTO session_diagnoses (
+                session_id, completed_at, outcome, total_turns, total_cost, cache_hit_ratio,
+                degraded, degradation_turn, causes_json, advice_json
+            ) VALUES (?1, ?2, 'Compaction Suspected', 6, 1.0, 0.5, 1, 4, ?3, '[]')",
+            rusqlite::params![
+                "session-compaction-overlap",
+                "2026-01-01T00:05:00Z",
+                r#"[{"turn_first_noticed":4,"turn_last_noticed":6,"cause_type":"compaction_suspected","detail":"Rapid-fire requests at turns 4-6.","estimated_cost":0.0,"estimated_wasted_tokens":1000,"is_heuristic":true}]"#,
+            ],
+        )
+        .expect("insert compaction diagnosis");
+
+        let json = build_postmortem_response_from_db(&conn, "session-compaction-overlap", true)
+            .expect("postmortem");
+        assert_eq!(
+            json.pointer("/impact/estimated_likely_wasted_tokens")
+                .and_then(|value| value.as_u64()),
+            Some(1_050)
+        );
+    }
+
+    #[test]
     fn in_memory_postmortem_totals_summarize_active_turns() {
         let session_id = "session-idle-totals";
         let _ = diagnosis::SESSION_TURNS.remove(session_id);
@@ -10078,6 +11297,80 @@ mod tests {
         assert_eq!(in_memory_postmortem_totals(session_id), Some((510, 2)));
         let _ = diagnosis::SESSION_TURNS.remove(session_id);
         assert_eq!(in_memory_postmortem_totals(session_id), None);
+    }
+
+    #[test]
+    fn trusted_dollar_spend_can_block_session_budget() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let _dollar_budget = EnvVarGuard::set("CLAUDITOR_SESSION_BUDGET_DOLLARS", "10");
+        let _token_budget = EnvVarGuard::remove("CLAUDITOR_SESSION_BUDGET_TOKENS");
+        let session_id = "session-trusted-budget";
+        SESSION_BUDGETS.insert(
+            session_id.to_string(),
+            SessionBudgetState {
+                total_spend: 12.0,
+                trusted_spend: 12.0,
+                untrusted_spend: 0.0,
+                total_tokens: 1,
+                request_count: 2,
+                estimated_cache_waste_dollars: 0.25,
+            },
+        );
+
+        let blocked = check_session_budget(Some(session_id)).expect("budget blocks");
+        assert_eq!(blocked.0, "budget_exceeded");
+        assert!(blocked.1.contains("Trusted spend: $12.00"));
+        assert!(blocked.1.contains("untrusted display-only spend: $0.00"));
+
+        SESSION_BUDGETS.remove(session_id);
+    }
+
+    #[test]
+    fn untrusted_dollar_spend_cannot_hard_block_session_budget() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let _dollar_budget = EnvVarGuard::set("CLAUDITOR_SESSION_BUDGET_DOLLARS", "10");
+        let _token_budget = EnvVarGuard::remove("CLAUDITOR_SESSION_BUDGET_TOKENS");
+        let session_id = "session-untrusted-budget";
+        SESSION_BUDGETS.insert(
+            session_id.to_string(),
+            SessionBudgetState {
+                total_spend: 50.0,
+                trusted_spend: 0.0,
+                untrusted_spend: 50.0,
+                total_tokens: 1,
+                request_count: 3,
+                estimated_cache_waste_dollars: 1.0,
+            },
+        );
+
+        assert!(check_session_budget(Some(session_id)).is_none());
+
+        SESSION_BUDGETS.remove(session_id);
+    }
+
+    #[test]
+    fn token_budget_enforcement_still_blocks() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let _dollar_budget = EnvVarGuard::remove("CLAUDITOR_SESSION_BUDGET_DOLLARS");
+        let _token_budget = EnvVarGuard::set("CLAUDITOR_SESSION_BUDGET_TOKENS", "100");
+        let session_id = "session-token-budget";
+        SESSION_BUDGETS.insert(
+            session_id.to_string(),
+            SessionBudgetState {
+                total_spend: 0.0,
+                trusted_spend: 0.0,
+                untrusted_spend: 0.0,
+                total_tokens: 100,
+                request_count: 1,
+                estimated_cache_waste_dollars: 0.0,
+            },
+        );
+
+        let blocked = check_session_budget(Some(session_id)).expect("token budget blocks");
+        assert_eq!(blocked.0, "budget_exceeded");
+        assert!(blocked.1.contains("token budget exceeded (100)"));
+
+        SESSION_BUDGETS.remove(session_id);
     }
 
     #[test]
@@ -10310,6 +11603,47 @@ mod tests {
         assert!(super::model_matches(
             "claude-opus-4-7",
             "claude-opus-4-7[1m]"
+        ));
+    }
+
+    #[test]
+    fn model_matches_keeps_known_safe_date_aliases() {
+        assert!(super::model_matches(
+            "claude-opus-4-7",
+            "claude-opus-4-7-20260410"
+        ));
+        assert!(super::model_matches(
+            "claude-sonnet-4-6-20260217",
+            "claude-sonnet-4-6"
+        ));
+        assert!(super::model_matches(
+            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001"
+        ));
+    }
+
+    #[test]
+    fn model_matches_rejects_arbitrary_prefix_overlap() {
+        assert!(!super::model_matches(
+            "custom-model-alpha",
+            "custom-model-alpha-canary"
+        ));
+        assert!(!super::model_matches("claude-opus-4", "claude-opus-4-7"));
+        assert!(!super::model_matches(
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-6-20260101"
+        ));
+    }
+
+    #[test]
+    fn model_matches_rejects_real_family_and_version_differences() {
+        assert!(!super::model_matches(
+            "claude-opus-4-7",
+            "claude-sonnet-4-6"
+        ));
+        assert!(!super::model_matches(
+            "claude-sonnet-4-6-20260217",
+            "claude-sonnet-4-5-20250929"
         ));
     }
 

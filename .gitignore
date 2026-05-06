@@ -41,6 +41,7 @@ docs/prd-postmortem-command.md
 
 # Planning docs (not shipped per CLAUDE.md)
 internal_docs/
+doc_internal/
 wiki/*
 Agents.md
 CLAUDE.md

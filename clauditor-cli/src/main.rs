@@ -69,15 +69,20 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
 
-        /// Do not render a redacted session postmortem when a session ends
+        /// Render redacted postmortems automatically in watch output
+        #[arg(long, conflicts_with = "no_postmortem")]
+        postmortem: bool,
+
+        /// Deprecated: watch disables automatic postmortems by default
         #[arg(long)]
+        #[arg(hide = true)]
         no_postmortem: bool,
 
-        /// Ask Claude to synthesize the automatic postmortem (default)
+        /// Ask Claude to synthesize automatic postmortems when --postmortem is enabled
         #[arg(long, conflicts_with = "no_analyze_with_claude")]
         analyze_with_claude: bool,
 
-        /// Render deterministic local postmortems without asking Claude
+        /// Render automatic postmortems without asking Claude when --postmortem is enabled
         #[arg(long)]
         no_analyze_with_claude: bool,
 
@@ -114,9 +119,13 @@ enum Commands {
         /// Session id, or "last" for the latest completed session
         target: String,
 
-        /// Redact prompts, paths, query strings, tool payloads, and secret-like values
-        #[arg(long)]
+        /// Deprecated: postmortems redact by default
+        #[arg(long, hide = true, conflicts_with = "no_redact")]
         redact: bool,
+
+        /// Render local unredacted evidence
+        #[arg(long)]
+        no_redact: bool,
 
         /// Ask Claude to synthesize the postmortem (default)
         #[arg(long, conflicts_with = "no_analyze_with_claude")]
@@ -1075,25 +1084,25 @@ fn tmux_session_name() -> String {
     format!("clauditor-watch-{}", std::process::id())
 }
 
-fn watcher_args(core_url: String, tmux: bool, no_postmortem: bool) -> Vec<String> {
+fn watcher_args(core_url: String, tmux: bool, postmortem: bool) -> Vec<String> {
     let mut args = vec!["watch".to_string()];
     if tmux {
         args.push("--tmux".to_string());
     }
     args.extend(["--url".to_string(), core_url]);
-    if no_postmortem {
-        args.push("--no-postmortem".to_string());
+    if postmortem {
+        args.push("--postmortem".to_string());
     }
     args
 }
 
-fn start_watcher(no_postmortem: bool) -> Result<WatchHandle, String> {
+fn start_watcher(postmortem: bool) -> Result<WatchHandle, String> {
     let cli_path = current_cli_path();
     let core_url = clauditor_core_url();
     if command_exists("tmux") {
         let session = tmux_session_name();
         let mut command_parts = vec![cli_path];
-        command_parts.extend(watcher_args(core_url.clone(), true, no_postmortem));
+        command_parts.extend(watcher_args(core_url.clone(), true, postmortem));
         let command = shell_join(&command_parts);
         let status = Command::new("tmux")
             .args(["new-session", "-d", "-s", &session, &command])
@@ -1109,7 +1118,7 @@ fn start_watcher(no_postmortem: bool) -> Result<WatchHandle, String> {
         return Ok(WatchHandle::TmuxSession(session));
     }
 
-    let args = watcher_args(core_url, false, no_postmortem);
+    let args = watcher_args(core_url, false, postmortem);
     let child = Command::new(cli_path)
         .args(args)
         .stdin(Stdio::null())
@@ -1175,7 +1184,7 @@ where
     }
 
     let mut watcher = if watch {
-        match start_watcher_fn(true) {
+        match start_watcher_fn(false) {
             Ok(handle) => Some(handle),
             Err(err) => {
                 eprintln!("Error: {err}");
@@ -1387,6 +1396,21 @@ fn print_tagged(tag: &str, line: &str) {
     } else {
         println!("{}{}", tag.dimmed(), line);
     }
+}
+
+fn print_postmortem_progress(tag: &str, session_id: &str, analyze_with_claude: bool) {
+    let work = if analyze_with_claude {
+        "fetching redacted report + running Claude analysis"
+    } else {
+        "fetching redacted report"
+    };
+    print_tagged(
+        tag,
+        &format!("POSTMORTEM IN PROGRESS · {work} · {session_id}")
+            .cyan()
+            .bold()
+            .to_string(),
+    );
 }
 
 fn parse_mcp_tool_name(tool_name: &str) -> Option<(&str, &str)> {
@@ -2102,201 +2126,764 @@ fn format_percent(value: Option<f64>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn append_string_array_section(
-    out: &mut String,
-    title: &str,
-    values: Option<&Vec<serde_json::Value>>,
-) {
-    out.push_str(&format!("## {title}\n"));
-    match values {
-        Some(items) if !items.is_empty() => {
-            for item in items {
-                if let Some(text) = item.as_str() {
-                    out.push_str(&format!("- {text}\n"));
-                }
+fn pluralize(count: u64, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("{count} {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
+fn join_limited(items: &[String], limit: usize) -> String {
+    if items.is_empty() {
+        return "none".to_string();
+    }
+    let mut visible = items.iter().take(limit).cloned().collect::<Vec<_>>();
+    if items.len() > limit {
+        visible.push(format!("+{} more", items.len() - limit));
+    }
+    visible.join(", ")
+}
+
+fn is_no_cause(cause: &str) -> bool {
+    let cause = cause.trim();
+    cause.is_empty() || cause.eq_ignore_ascii_case("none")
+}
+
+fn human_cause(cause: &str, is_heuristic: bool) -> String {
+    let label = match cause {
+        cause if is_no_cause(cause) => return "No degradation detected".to_string(),
+        "api_error" => "API error".to_string(),
+        "cache_miss_ttl" => "Cache likely expired after idle time".to_string(),
+        "cache_miss_thrash" => "Repeated cache rebuilds".to_string(),
+        "compaction_suspected" => "Possible compaction loop".to_string(),
+        "context_bloat" => "Context is getting large".to_string(),
+        "harness_pressure" => "Harness pressure".to_string(),
+        "model_fallback" => "Model route changed".to_string(),
+        "near_compaction" => "Near auto-compaction".to_string(),
+        "tool_failure_streak" => "Tool failure loop".to_string(),
+        other => other.replace('_', " "),
+    };
+    if is_heuristic {
+        format!("{label} [heuristic]")
+    } else {
+        label
+    }
+}
+
+fn cache_status_label(ratio: Option<f64>) -> &'static str {
+    match ratio {
+        Some(value) if value >= 0.90 => "Healthy",
+        Some(value) if value >= 0.60 => "Mixed",
+        Some(_) => "Low",
+        None => "Unknown",
+    }
+}
+
+fn cache_signal(report: &serde_json::Value) -> String {
+    let reusable = json_f64(report, "/signals/cache/cache_reusable_prefix_ratio")
+        .or_else(|| json_f64(report, "/signals/cache/cache_hit_ratio"));
+    let input_cache = json_f64(report, "/signals/cache/total_input_cache_rate");
+    format!(
+        "{}: {} reusable prompt cache; {} of input from cache",
+        cache_status_label(reusable),
+        format_percent(reusable),
+        format_percent(input_cache)
+    )
+}
+
+fn runway_text(turns_to_compact: Option<u64>) -> String {
+    match turns_to_compact {
+        Some(0) => "auto-compaction may start now".to_string(),
+        Some(turns) => format!(
+            "about {} before auto-compaction",
+            pluralize(turns, "turn", "turns")
+        ),
+        None => "auto-compaction estimate unknown".to_string(),
+    }
+}
+
+fn context_signal(report: &serde_json::Value) -> String {
+    let fill = json_f64(report, "/signals/context/max_fill_percent").unwrap_or(0.0);
+    let status = if fill >= 80.0 {
+        "High"
+    } else if fill >= 60.0 {
+        "Growing"
+    } else {
+        "Plenty of room"
+    };
+    format!(
+        "{status}: {:.0}% full; {}",
+        fill,
+        runway_text(json_u64(report, "/signals/context/turns_to_compact"))
+    )
+}
+
+fn waste_signal(report: &serde_json::Value) -> String {
+    let wasted_tokens = json_u64(report, "/impact/estimated_likely_wasted_tokens").unwrap_or(0);
+    let wasted_cost = json_f64(report, "/impact/estimated_likely_wasted_cost_dollars");
+    if wasted_tokens == 0 && wasted_cost.unwrap_or(0.0) == 0.0 {
+        "No likely wasted tokens detected".to_string()
+    } else {
+        format!(
+            "Likely waste: {} tokens, {}",
+            format_tokens(wasted_tokens),
+            format_money(wasted_cost)
+        )
+    }
+}
+
+fn tool_signal(report: &serde_json::Value) -> String {
+    let Some(tools) = report
+        .pointer("/signals/tools")
+        .and_then(|value| value.as_array())
+    else {
+        return "No tool calls recorded".to_string();
+    };
+    if tools.is_empty() {
+        return "No tool calls recorded".to_string();
+    }
+
+    let total_calls = tools
+        .iter()
+        .filter_map(|tool| tool.get("calls").and_then(|value| value.as_u64()))
+        .sum::<u64>();
+    let total_failures = tools
+        .iter()
+        .filter_map(|tool| tool.get("failures").and_then(|value| value.as_u64()))
+        .sum::<u64>();
+    let failing = tools
+        .iter()
+        .filter_map(|tool| {
+            let failures = tool.get("failures").and_then(|value| value.as_u64())?;
+            if failures == 0 {
+                return None;
             }
+            let name = tool.get("tool_name").and_then(|value| value.as_str())?;
+            Some(format!("{name} ({failures})"))
+        })
+        .collect::<Vec<_>>();
+
+    if total_failures > 0 {
+        return format!(
+            "{}, {}; failing: {}",
+            pluralize(total_calls, "call", "calls"),
+            pluralize(total_failures, "failure", "failures"),
+            join_limited(&failing, 3)
+        );
+    }
+
+    let repeated = tools
+        .iter()
+        .filter_map(|tool| {
+            let calls = tool.get("calls").and_then(|value| value.as_u64())?;
+            (calls >= 3).then(|| {
+                tool.get("tool_name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            })
+        })
+        .collect::<Vec<_>>();
+    if repeated.is_empty() {
+        format!("{}, 0 failures", pluralize(total_calls, "call", "calls"))
+    } else {
+        format!(
+            "{}, 0 failures; repeated: {}",
+            pluralize(total_calls, "call", "calls"),
+            join_limited(&repeated, 3)
+        )
+    }
+}
+
+fn failed_event_type(event_type: &str) -> bool {
+    let lower = event_type.to_ascii_lowercase();
+    lower.contains("fail") || lower.contains("error")
+}
+
+fn grouped_event_count(events: &[serde_json::Value]) -> u64 {
+    events
+        .iter()
+        .filter_map(|event| event.get("count").and_then(|value| value.as_u64()))
+        .sum()
+}
+
+fn skill_signal(report: &serde_json::Value) -> String {
+    let Some(events) = report
+        .pointer("/signals/skills")
+        .and_then(|value| value.as_array())
+    else {
+        return "No failed skill events detected".to_string();
+    };
+    let failed = events
+        .iter()
+        .filter_map(|event| {
+            let event_type = event.get("event_type").and_then(|value| value.as_str())?;
+            if !failed_event_type(event_type) {
+                return None;
+            }
+            let count = event
+                .get("count")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(1);
+            let skill = event
+                .get("skill_name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            Some((count, format!("{skill} ({count})")))
+        })
+        .collect::<Vec<_>>();
+    let failed_count = failed.iter().map(|(count, _)| *count).sum::<u64>();
+    if failed_count > 0 {
+        let names = failed.into_iter().map(|(_, name)| name).collect::<Vec<_>>();
+        return format!(
+            "{}; failing: {}",
+            pluralize(failed_count, "failed skill event", "failed skill events"),
+            join_limited(&names, 3)
+        );
+    }
+
+    if events.is_empty() {
+        "No failed skill events detected".to_string()
+    } else {
+        format!(
+            "{}, 0 failures",
+            pluralize(grouped_event_count(events), "skill event", "skill events")
+        )
+    }
+}
+
+fn mcp_event_name(event: &serde_json::Value) -> String {
+    let server = event
+        .get("server")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let tool = event
+        .get("tool")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    format!("{server}.{tool}")
+}
+
+fn mcp_signal(report: &serde_json::Value) -> String {
+    let Some(events) = report
+        .pointer("/signals/mcp")
+        .and_then(|value| value.as_array())
+    else {
+        return "No failed MCP calls detected".to_string();
+    };
+    let failed = events
+        .iter()
+        .filter_map(|event| {
+            let event_type = event.get("event_type").and_then(|value| value.as_str())?;
+            if !failed_event_type(event_type) {
+                return None;
+            }
+            let count = event
+                .get("count")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(1);
+            Some((count, format!("{} ({count})", mcp_event_name(event))))
+        })
+        .collect::<Vec<_>>();
+    let failed_count = failed.iter().map(|(count, _)| *count).sum::<u64>();
+    if failed_count > 0 {
+        let names = failed.into_iter().map(|(_, name)| name).collect::<Vec<_>>();
+        return format!(
+            "{}; failing: {}",
+            pluralize(failed_count, "failed MCP call", "failed MCP calls"),
+            join_limited(&names, 3)
+        );
+    }
+
+    if events.is_empty() {
+        "No failed MCP calls detected".to_string()
+    } else {
+        format!(
+            "{}, 0 failures",
+            pluralize(grouped_event_count(events), "MCP call", "MCP calls")
+        )
+    }
+}
+
+fn table_cell(value: &str) -> String {
+    let single_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_for_box(&single_line, 140)
+}
+
+fn column_widths_for(headers: &[&str]) -> Vec<usize> {
+    match headers {
+        ["Type", "Signal", "Turn", "Detail"] => vec![10, 12, 5, 0],
+        ["Time", "Turn", "Event", "Detail"] => vec![20, 5, 18, 0],
+        _ => headers
+            .iter()
+            .enumerate()
+            .map(|(idx, header)| {
+                if idx + 1 == headers.len() {
+                    0
+                } else {
+                    header.len().max(8)
+                }
+            })
+            .collect(),
+    }
+}
+
+fn push_table_header(out: &mut String, headers: &[&str]) {
+    let widths = column_widths_for(headers);
+    out.push_str("  ");
+    for (idx, header) in headers.iter().enumerate() {
+        let width = widths.get(idx).copied().unwrap_or(0);
+        if width == 0 {
+            out.push_str(header);
+        } else {
+            out.push_str(&format!("{:<width$}", header, width = width));
+            out.push_str("  ");
         }
-        _ => out.push_str("- None recorded.\n"),
+    }
+    out.push('\n');
+    out.push_str("  ");
+    for (idx, header) in headers.iter().enumerate() {
+        let width = widths.get(idx).copied().unwrap_or(0);
+        let underline_width = if width == 0 {
+            header.len().max(6)
+        } else {
+            width
+        };
+        out.push_str(&"-".repeat(underline_width));
+        if width != 0 {
+            out.push_str("  ");
+        }
     }
     out.push('\n');
 }
 
+fn push_table_row(out: &mut String, cells: &[String]) {
+    let widths = match cells.len() {
+        4 => {
+            let first = cells.first().map(String::as_str).unwrap_or("");
+            if first.contains("T") || first == "-" || first.starts_with("202") {
+                vec![20, 5, 18, 0]
+            } else {
+                vec![10, 12, 5, 0]
+            }
+        }
+        2 => vec![3, 0],
+        _ => cells
+            .iter()
+            .enumerate()
+            .map(|(idx, cell)| {
+                if idx + 1 == cells.len() {
+                    0
+                } else {
+                    cell.len().max(8)
+                }
+            })
+            .collect(),
+    };
+    out.push_str("  ");
+    for (idx, cell) in cells.iter().enumerate() {
+        let width = widths.get(idx).copied().unwrap_or(0);
+        let value = table_cell(cell);
+        if width == 0 {
+            out.push_str(&value);
+        } else {
+            out.push_str(&format!("{:<width$}", value, width = width));
+            out.push_str("  ");
+        }
+    }
+    out.push('\n');
+}
+
+fn push_key_value_table(out: &mut String, rows: Vec<(&str, String)>) {
+    let label_width = rows
+        .iter()
+        .map(|(field, _)| field.len())
+        .max()
+        .unwrap_or(5)
+        .clamp(10, 22);
+    for (field, value) in rows {
+        out.push_str(&format!(
+            "  {:<label_width$}  {}\n",
+            field,
+            table_cell(&value),
+            label_width = label_width
+        ));
+    }
+    out.push('\n');
+}
+
+fn parse_percent_prefix(value: &str) -> Option<f64> {
+    value.split_whitespace().find_map(|part| {
+        part.trim_matches(|ch: char| !(ch.is_ascii_digit() || ch == '.' || ch == '%'))
+            .strip_suffix('%')
+            .and_then(|number| number.parse::<f64>().ok())
+    })
+}
+
+fn colorize_postmortem_value(label: &str, value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    match label {
+        "State" => {
+            if lower.contains("final") {
+                value.green().bold().to_string()
+            } else {
+                value.yellow().bold().to_string()
+            }
+        }
+        "Outcome" => {
+            if lower.contains("degraded") || lower.contains("failed") || lower.contains("error") {
+                value.red().bold().to_string()
+            } else if lower.contains("complete") {
+                value.green().bold().to_string()
+            } else if lower.contains("progress") {
+                value.yellow().bold().to_string()
+            } else {
+                value.to_string()
+            }
+        }
+        "Cause" => {
+            if lower == "none" || lower.contains("no degradation detected") {
+                value.green().bold().to_string()
+            } else {
+                value.yellow().bold().to_string()
+            }
+        }
+        "Cache" => value.green().to_string(),
+        "Context" => match parse_percent_prefix(value) {
+            Some(percent) if percent >= 80.0 => value.red().bold().to_string(),
+            Some(percent) if percent >= 60.0 => value.yellow().bold().to_string(),
+            Some(_) => value.green().to_string(),
+            None => value.to_string(),
+        },
+        "Waste" => {
+            if lower.starts_with("0 tokens") || lower.contains("no likely wasted tokens") {
+                value.green().to_string()
+            } else {
+                value.red().bold().to_string()
+            }
+        }
+        "Tools" | "Skills" | "MCP" => {
+            if lower.contains("fail")
+                && !lower.contains("0 failures")
+                && !lower.starts_with("no failed")
+            {
+                value.red().bold().to_string()
+            } else {
+                value.green().to_string()
+            }
+        }
+        "Cost" => value.magenta().to_string(),
+        "Risk" => {
+            if lower.contains("high") {
+                value.red().bold().to_string()
+            } else if lower.contains("medium") {
+                value.yellow().bold().to_string()
+            } else if lower.contains("low") {
+                value.green().bold().to_string()
+            } else {
+                value.to_string()
+            }
+        }
+        "Next" | "Next action" => value.bright_white().to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn colorize_aligned_key_value_line(line: &str) -> Option<String> {
+    let indent_len = line.len() - line.trim_start_matches(' ').len();
+    if indent_len == 0 {
+        return None;
+    }
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+    let split_at = rest.find("  ")?;
+    let label_area = &rest[..split_at];
+    let label = label_area.trim_end();
+    if label.is_empty() {
+        return None;
+    }
+    let value_area = &rest[split_at..];
+    let value = value_area.trim_start();
+    if value.is_empty() {
+        return None;
+    }
+
+    let padding_len = (label_area.len() - label.len()) + (value_area.len() - value.len());
+    Some(format!(
+        "{}{}{}{}",
+        indent,
+        label.bright_blue().bold(),
+        " ".repeat(padding_len),
+        colorize_postmortem_value(label, value)
+    ))
+}
+
+fn colorize_evidence_type(kind: &str) -> String {
+    match kind {
+        "direct" => kind.green().bold().to_string(),
+        "heuristic" => kind.yellow().bold().to_string(),
+        "derived" => kind.cyan().bold().to_string(),
+        "-" => kind.bright_black().to_string(),
+        _ => kind.bright_white().to_string(),
+    }
+}
+
+fn colorize_evidence_line(line: &str) -> Option<String> {
+    let indent_len = line.len() - line.trim_start_matches(' ').len();
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+    let kind_end = rest.find(char::is_whitespace)?;
+    let kind = &rest[..kind_end];
+    if !matches!(kind, "direct" | "heuristic" | "derived" | "-") {
+        return None;
+    }
+    Some(format!(
+        "{}{}{}",
+        indent,
+        colorize_evidence_type(kind),
+        &rest[kind_end..]
+    ))
+}
+
+fn colorize_postmortem_line(line: &str) -> String {
+    let trimmed = line.trim_start();
+    if line.starts_with("# ") {
+        return line.bright_cyan().bold().to_string();
+    }
+    if line.starts_with("## ") {
+        return line.cyan().bold().to_string();
+    }
+    if trimmed.starts_with("Type") && trimmed.contains("Signal") {
+        return line.bright_black().bold().to_string();
+    }
+    if !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|ch| ch == '-' || ch.is_ascii_whitespace())
+    {
+        return line.bright_black().to_string();
+    }
+    if let Some(colored) = colorize_evidence_line(line) {
+        return colored;
+    }
+    if let Some(colored) = colorize_aligned_key_value_line(line) {
+        return colored;
+    }
+    line.to_string()
+}
+
+fn colorize_postmortem_for_terminal(markdown: &str) -> String {
+    let mut colored = markdown
+        .lines()
+        .map(colorize_postmortem_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if markdown.ends_with('\n') {
+        colored.push('\n');
+    }
+    colored
+}
+
+#[cfg(unix)]
+fn terminal_width_from_stdout() -> Option<usize> {
+    #[repr(C)]
+    struct Winsize {
+        ws_row: u16,
+        ws_col: u16,
+        ws_xpixel: u16,
+        ws_ypixel: u16,
+    }
+
+    #[cfg(target_os = "linux")]
+    const TIOCGWINSZ: std::os::raw::c_ulong = 0x5413;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    const TIOCGWINSZ: std::os::raw::c_ulong = 0x40087468;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )))]
+    return None;
+
+    unsafe extern "C" {
+        fn ioctl(
+            fd: std::os::raw::c_int,
+            request: std::os::raw::c_ulong,
+            size: *mut Winsize,
+        ) -> std::os::raw::c_int;
+    }
+
+    let mut size = Winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe { ioctl(1, TIOCGWINSZ, &mut size) };
+    (rc == 0 && size.ws_col >= 20).then_some(size.ws_col as usize)
+}
+
+#[cfg(not(unix))]
+fn terminal_width_from_stdout() -> Option<usize> {
+    None
+}
+
+fn terminal_width_from_columns_env() -> Option<usize> {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|width| *width >= 20)
+}
+
+fn terminal_width() -> usize {
+    terminal_width_from_stdout()
+        .or_else(terminal_width_from_columns_env)
+        .unwrap_or(100)
+}
+
+fn postmortem_separator_line_for_width(width: usize) -> String {
+    "\u{2501}".repeat(width.max(20))
+}
+
+fn postmortem_separator_line() -> String {
+    postmortem_separator_line_for_width(terminal_width())
+}
+
+fn print_postmortem_terminal_block(markdown: &str) {
+    println!();
+    println!("{}", postmortem_separator_line().dimmed());
+    print!("{}", colorize_postmortem_for_terminal(markdown));
+    if !markdown.ends_with('\n') {
+        println!();
+    }
+    println!("{}", postmortem_separator_line().dimmed());
+}
+
 fn render_postmortem_markdown(report: &serde_json::Value) -> String {
+    render_watch_postmortem_markdown(report, None)
+}
+
+fn render_watch_postmortem_markdown(report: &serde_json::Value, analysis: Option<&str>) -> String {
     let session_id = json_str(report, "/session_id").unwrap_or("unknown");
-    let redacted = json_bool(report, "/redacted").unwrap_or(false);
     let partial = json_bool(report, "/partial").unwrap_or(false);
     let outcome = json_str(report, "/summary/outcome").unwrap_or("unknown");
     let model = json_str(report, "/summary/model").unwrap_or("unknown");
-    let started_at = json_str(report, "/summary/started_at").unwrap_or("unknown");
-    let ended_at = json_str(report, "/summary/ended_at").unwrap_or("not ended");
     let duration = json_u64(report, "/summary/duration_secs")
         .map(format_duration_coarse)
         .unwrap_or_else(|| "unknown".to_string());
     let turns = json_u64(report, "/summary/total_turns").unwrap_or(0);
     let tokens = json_u64(report, "/summary/total_tokens").unwrap_or(0);
-    let likely_cause = json_str(report, "/diagnosis/likely_cause").unwrap_or("none");
-    let likely_cause_suffix =
-        if json_bool(report, "/diagnosis/likely_cause_is_heuristic").unwrap_or(false) {
-            " [heuristic]"
-        } else {
-            ""
-        };
-    let cause_detail = json_str(report, "/diagnosis/detail").unwrap_or("No detail recorded.");
-    let confidence = json_str(report, "/diagnosis/confidence").unwrap_or("low");
+    let cause = json_str(report, "/diagnosis/likely_cause").unwrap_or("none");
+    let cause_is_heuristic =
+        json_bool(report, "/diagnosis/likely_cause_is_heuristic").unwrap_or(false);
     let next_action = json_str(report, "/diagnosis/next_action").unwrap_or("No action recorded.");
 
     let mut out = String::new();
-    out.push_str("# Clauditor Session Postmortem\n\n");
-    out.push_str("## Summary\n");
-    out.push_str(&format!("- Session: `{session_id}`\n"));
-    out.push_str(&format!(
-        "- Status: {}{}\n",
-        if redacted {
-            "redacted"
-        } else {
-            "local unredacted"
-        },
-        if partial { ", partial" } else { "" }
-    ));
-    out.push_str(&format!("- Outcome: {outcome}\n"));
-    out.push_str(&format!("- Model: {model}\n"));
-    out.push_str(&format!("- Started: {started_at}\n"));
-    out.push_str(&format!("- Ended: {ended_at}\n"));
-    out.push_str(&format!("- Duration: {duration}\n"));
-    out.push_str(&format!(
-        "- Turns: {turns}, tokens: {}\n",
-        format_tokens(tokens)
-    ));
-    if let Some(prompt) = json_str(report, "/summary/initial_prompt_summary") {
-        out.push_str(&format!("- Initial prompt: {prompt}\n"));
-    }
-    if let Some(summary) = json_str(report, "/summary/final_response_summary") {
-        out.push_str(&format!("- Final response: {summary}\n"));
-    }
-    out.push('\n');
+    out.push_str("# Clauditor Postmortem\n\n");
+    out.push_str("## Snapshot\n");
+    push_key_value_table(
+        &mut out,
+        vec![
+            ("Session", format!("`{session_id}`")),
+            (
+                "State",
+                if partial {
+                    "partial snapshot"
+                } else {
+                    "final postmortem"
+                }
+                .to_string(),
+            ),
+            ("Outcome", outcome.to_string()),
+            ("Model", model.to_string()),
+            ("Duration", duration),
+            (
+                "Turns/tokens",
+                format!("{turns} turns, {}", format_tokens(tokens)),
+            ),
+            (
+                "Cost",
+                format_money(json_f64(report, "/impact/estimated_total_cost_dollars")),
+            ),
+        ],
+    );
 
-    out.push_str("## Likely Cause\n");
-    out.push_str(&format!("- Cause: {likely_cause}{likely_cause_suffix}\n"));
-    out.push_str(&format!("- Detail: {cause_detail}\n"));
-    out.push_str(&format!("- Confidence: {confidence}\n"));
-    out.push_str(&format!("- Next action: {next_action}\n\n"));
+    out.push_str("## Signals\n");
+    push_key_value_table(
+        &mut out,
+        vec![
+            ("Cause", human_cause(cause, cause_is_heuristic)),
+            ("Cache", cache_signal(report)),
+            ("Context", context_signal(report)),
+            ("Waste", waste_signal(report)),
+            ("Tools", tool_signal(report)),
+            ("Skills", skill_signal(report)),
+            ("MCP", mcp_signal(report)),
+            ("Next", next_action.to_string()),
+        ],
+    );
 
     out.push_str("## Evidence\n");
-    match report.get("evidence").and_then(|value| value.as_array()) {
-        Some(items) if !items.is_empty() => {
-            for item in items {
-                let kind = item
-                    .get("type")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("evidence");
-                let label = item
-                    .get("label")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("signal");
-                let detail = item
-                    .get("detail")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let turn = item
-                    .get("turn")
-                    .and_then(|value| value.as_u64())
-                    .map(|turn| format!(" turn {turn},"))
-                    .unwrap_or_default();
-                out.push_str(&format!("- [{kind}] {label}:{turn} {detail}\n"));
-            }
+    push_table_header(&mut out, &["Type", "Signal", "Turn", "Detail"]);
+    let mut rendered = 0;
+    if let Some(items) = report.get("evidence").and_then(|value| value.as_array()) {
+        for item in items.iter().take(2) {
+            let kind = item
+                .get("type")
+                .and_then(|value| value.as_str())
+                .unwrap_or("evidence");
+            let label = item
+                .get("label")
+                .and_then(|value| value.as_str())
+                .unwrap_or("signal");
+            let detail = item
+                .get("detail")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let turn = item
+                .get("turn")
+                .and_then(|value| value.as_u64())
+                .map(|turn| turn.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            push_table_row(
+                &mut out,
+                &[
+                    kind.to_string(),
+                    label.to_string(),
+                    turn,
+                    detail.to_string(),
+                ],
+            );
+            rendered += 1;
         }
-        _ => out.push_str("- No evidence rows recorded.\n"),
+    }
+    if rendered == 0 {
+        push_table_row(
+            &mut out,
+            &[
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "No evidence rows recorded.".to_string(),
+            ],
+        );
     }
     out.push('\n');
 
-    out.push_str("## Token And Cost Impact\n");
-    out.push_str(&format!(
-        "- Total tokens: {} (input {}, cache read {}, cache create {}, output {})\n",
-        format_tokens(json_u64(report, "/impact/total_tokens").unwrap_or(0)),
-        format_tokens(json_u64(report, "/impact/input_tokens").unwrap_or(0)),
-        format_tokens(json_u64(report, "/impact/cache_read_tokens").unwrap_or(0)),
-        format_tokens(json_u64(report, "/impact/cache_creation_tokens").unwrap_or(0)),
-        format_tokens(json_u64(report, "/impact/output_tokens").unwrap_or(0))
-    ));
-    out.push_str(&format!(
-        "- Estimated total cost: {} ({})\n",
-        format_money(json_f64(report, "/impact/estimated_total_cost_dollars")),
-        json_str(report, "/impact/cost_source").unwrap_or("unknown source")
-    ));
-    out.push_str(&format!(
-        "- Estimated likely waste: {} tokens, {}\n",
-        format_tokens(json_u64(report, "/impact/estimated_likely_wasted_tokens").unwrap_or(0)),
-        format_money(json_f64(
-            report,
-            "/impact/estimated_likely_wasted_cost_dollars"
-        ))
-    ));
-    if let Some(billed) = json_f64(report, "/impact/billed_cost_dollars") {
-        out.push_str(&format!("- Billed reconciliation: ${billed:.2}\n"));
+    if let Some(analysis) = analysis {
+        append_claude_analysis_section(&mut out, analysis);
     }
-    out.push_str(&format!(
-        "- Cache reusable-prefix ratio: {}\n",
-        format_percent(
-            json_f64(report, "/signals/cache/cache_reusable_prefix_ratio")
-                .or_else(|| json_f64(report, "/signals/cache/cache_hit_ratio"))
-        )
-    ));
-    out.push_str(&format!(
-        "- Total input cache rate: {}\n",
-        format_percent(json_f64(report, "/signals/cache/total_input_cache_rate"))
-    ));
-    out.push_str(&format!(
-        "- Context max: {:.0}% full; inferred turns to compact: {}\n",
-        json_f64(report, "/signals/context/max_fill_percent").unwrap_or(0.0),
-        json_u64(report, "/signals/context/turns_to_compact")
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
-    ));
-    out.push_str(&format!(
-        "- Caveat: {}\n\n",
-        json_str(report, "/impact/cost_caveat").unwrap_or("Estimated costs are not billing truth.")
-    ));
 
-    out.push_str("## Timeline Highlights\n");
-    match report.get("timeline").and_then(|value| value.as_array()) {
-        Some(items) if !items.is_empty() => {
-            for item in items {
-                let timestamp = item
-                    .get("timestamp")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("unknown");
-                let label = item
-                    .get("label")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("event");
-                let detail = item
-                    .get("detail")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("");
-                let turn = item
-                    .get("turn")
-                    .and_then(|value| value.as_u64())
-                    .map(|turn| format!(" turn {turn},"))
-                    .unwrap_or_default();
-                out.push_str(&format!("- {timestamp}:{turn} {label}: {detail}\n"));
-            }
-        }
-        _ => out.push_str("- No timeline highlights recorded.\n"),
-    }
-    out.push('\n');
-
-    append_string_array_section(
-        &mut out,
-        "Recommendations",
-        report
-            .get("recommendations")
-            .and_then(|value| value.as_array()),
-    );
-    append_string_array_section(
-        &mut out,
-        "Caveats",
-        report.get("caveats").and_then(|value| value.as_array()),
-    );
     out
 }
 
@@ -2304,8 +2891,126 @@ fn claude_analysis_enabled(analyze_with_claude: bool, no_analyze_with_claude: bo
     analyze_with_claude || !no_analyze_with_claude
 }
 
+fn extract_labeled_value(line: &str, label: &str) -> Option<String> {
+    let mut cleaned = line.trim().trim_start_matches("- ").trim().to_string();
+    cleaned = cleaned.replace("**", "");
+    cleaned = cleaned.replace('`', "");
+    let cleaned = cleaned.trim();
+    if !cleaned
+        .to_ascii_lowercase()
+        .starts_with(&label.to_ascii_lowercase())
+    {
+        return None;
+    }
+    let value = cleaned[label.len()..]
+        .trim_start()
+        .trim_start_matches(':')
+        .trim_start_matches('-')
+        .trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn render_claude_analysis_section(analysis: &str) -> String {
+    let mut status = None;
+    let mut main_signal = None;
+    let mut risk = None;
+    let mut next_action = None;
+    let mut restart_lines = Vec::new();
+    let mut in_restart_prompt = false;
+    let mut fallback_lines = Vec::new();
+
+    for raw_line in analysis.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("```") {
+            continue;
+        }
+        if line.eq_ignore_ascii_case("## Claude Analysis") {
+            in_restart_prompt = false;
+            continue;
+        }
+        if line.eq_ignore_ascii_case("## Restart Prompt") {
+            in_restart_prompt = true;
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+
+        if in_restart_prompt {
+            restart_lines.push(line.trim_start_matches('>').trim().to_string());
+            continue;
+        }
+
+        if status.is_none() {
+            status = extract_labeled_value(line, "Status");
+        }
+        if main_signal.is_none() {
+            main_signal = extract_labeled_value(line, "Main signal");
+        }
+        if risk.is_none() {
+            risk = extract_labeled_value(line, "Risk");
+        }
+        if next_action.is_none() {
+            next_action = extract_labeled_value(line, "Next action")
+                .or_else(|| extract_labeled_value(line, "Next"));
+        }
+        if fallback_lines.len() < 2 {
+            fallback_lines.push(line.to_string());
+        }
+    }
+
+    let restart_prompt = if restart_lines
+        .iter()
+        .any(|line| line.eq_ignore_ascii_case("No restart needed."))
+    {
+        Some("No restart needed.".to_string())
+    } else if restart_lines.is_empty() {
+        None
+    } else {
+        Some(restart_lines.join(" "))
+    };
+
+    if next_action.is_none() {
+        next_action = restart_prompt.clone();
+    }
+
+    let mut rows = Vec::new();
+    if let Some(value) = status {
+        rows.push(("Status", value));
+    }
+    if let Some(value) = main_signal {
+        rows.push(("Main signal", value));
+    }
+    if let Some(value) = risk {
+        rows.push(("Risk", value));
+    }
+    if let Some(value) = next_action {
+        rows.push(("Next action", value));
+    }
+    if rows.is_empty() && !fallback_lines.is_empty() {
+        rows.push(("Summary", fallback_lines.join(" ")));
+    }
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    out.push_str("## Claude Analysis\n");
+    push_key_value_table(&mut out, rows);
+    out.push_str("## Restart Prompt\n");
+    out.push_str(&format!(
+        "  {}\n",
+        table_cell(&restart_prompt.unwrap_or_else(|| "No restart needed.".to_string()))
+    ));
+    out
+}
+
 fn append_claude_analysis_section(markdown: &mut String, analysis: &str) {
-    let trimmed = analysis.trim();
+    let trimmed = render_claude_analysis_section(analysis);
     if trimmed.is_empty() {
         return;
     }
@@ -2313,12 +3018,7 @@ fn append_claude_analysis_section(markdown: &mut String, analysis: &str) {
         markdown.push('\n');
     }
     markdown.push('\n');
-    if trimmed.starts_with("## Claude Analysis") {
-        markdown.push_str(trimmed);
-    } else {
-        markdown.push_str("## Claude Analysis\n");
-        markdown.push_str(trimmed);
-    }
+    markdown.push_str(trimmed.trim_end());
     markdown.push('\n');
 }
 
@@ -2328,18 +3028,19 @@ fn build_claude_analysis_prompt(report: &serde_json::Value) -> String {
     format!(
         "You are Clauditor's postmortem analyst.\n\
 Use only the redacted JSON evidence below. Do not invent facts, files, commands, or raw prompts.\n\
-Write concise GitHub-flavored Markdown. Keep it under 350 words.\n\
+Write compact GitHub-flavored Markdown for a tmux pane. Keep it under 160 words.\n\
+Use aligned key/value rows, not Markdown pipe tables. No code fences. No extra caveat block, no extra prose, no bullet lists.\n\
 Preserve direct versus heuristic evidence labels. Do not turn heuristic, inferred, likely, or suspected causes into direct facts.\n\
 When `is_heuristic` is true or evidence type is `heuristic`, mark causal wording with `[heuristic]`, likely, suspected, or inferred. Direct evidence can stay direct.\n\
 Include exactly these sections:\n\
 ## Claude Analysis\n\
-- Likely cause: ...\n\
-- Confidence: high|medium|low, with one short reason.\n\
-- What changed the user's decision: ...\n\
-- Next action: ...\n\
+Status       partial or final, in plain language\n\
+Main signal  the one signal that matters most\n\
+Risk         should the user care now?\n\
+Next action  the next concrete action\n\
 ## Restart Prompt\n\
 One short prompt the user can paste into a fresh Claude Code session, or \"No restart needed.\".\n\
-Preserve caveats: costs are estimates, context runway is heuristic, and redacted evidence may omit details.\n\n\
+Preserve caveats briefly inside the key/value rows only: costs are estimates, context runway is heuristic, and redacted evidence may omit details.\n\n\
 Redacted Clauditor postmortem JSON:\n```json\n{bundle}\n```"
     )
 }
@@ -2455,6 +3156,44 @@ async fn render_postmortem_markdown_with_optional_analysis(
     }
 }
 
+async fn render_watch_postmortem_markdown_with_optional_analysis(
+    base_url: &str,
+    target: &str,
+    report: &serde_json::Value,
+    analyze_with_claude: bool,
+) -> (String, Option<String>) {
+    if !analyze_with_claude {
+        return (render_watch_postmortem_markdown(report, None), None);
+    }
+
+    let redacted_report = if json_bool(report, "/redacted").unwrap_or(false) {
+        report.clone()
+    } else {
+        match fetch_postmortem_json(base_url, target, true).await {
+            Ok(value) => value,
+            Err(err) => {
+                return (
+                    render_watch_postmortem_markdown(report, None),
+                    Some(format!(
+                        "Claude analysis skipped because redacted evidence could not be fetched: {err}"
+                    )),
+                );
+            }
+        }
+    };
+
+    match run_claude_postmortem_analysis(&redacted_report).await {
+        Ok(analysis) => (
+            render_watch_postmortem_markdown(report, Some(&analysis)),
+            None,
+        ),
+        Err(err) => (
+            render_watch_postmortem_markdown(report, None),
+            Some(format!("Claude analysis unavailable: {err}")),
+        ),
+    }
+}
+
 async fn fetch_run_final_postmortem_markdown(
     base_url: &str,
     analyze_with_claude: bool,
@@ -2486,21 +3225,26 @@ async fn fetch_run_final_postmortem_markdown_with_retry(
 }
 
 async fn render_run_final_postmortem(base_url: &str) {
+    eprintln!(
+        "{}",
+        "Postmortem in progress: waiting for final report + running Claude analysis..."
+            .cyan()
+            .bold()
+    );
     match fetch_run_final_postmortem_markdown(base_url, claude_analysis_enabled(false, false)).await
     {
         Ok((markdown, warning)) => {
             if let Some(warning) = warning {
                 eprintln!("{}", warning.yellow());
             }
-            println!();
-            print!("{markdown}");
+            print_postmortem_terminal_block(&markdown);
         }
         Err(err) => {
             eprintln!(
                 "{}",
                 format!(
                     "Final postmortem unavailable after waiting for clauditor-core: {err}\n\
-Try again with: clauditor postmortem last --redact\n\
+Try again with: clauditor postmortem last\n\
 If this run made no proxied Claude API request, no postmortem was recorded."
                 )
                 .yellow()
@@ -2528,12 +3272,14 @@ async fn main() {
             no_cache,
             no_signals,
             session,
+            postmortem,
             no_postmortem,
             analyze_with_claude,
             no_analyze_with_claude,
             tmux,
             tmux_max_panes,
         } => {
+            let auto_postmortem = postmortem && !no_postmortem;
             let analyze_postmortems =
                 claude_analysis_enabled(analyze_with_claude, no_analyze_with_claude);
             if tmux {
@@ -2544,7 +3290,7 @@ async fn main() {
                     &url,
                     no_cache,
                     no_signals,
-                    no_postmortem,
+                    auto_postmortem,
                     !analyze_postmortems,
                     tmux_max_panes,
                 ) {
@@ -2555,7 +3301,7 @@ async fn main() {
                     url.clone(),
                     no_cache,
                     no_signals,
-                    no_postmortem,
+                    auto_postmortem,
                     !analyze_postmortems,
                     tmux_max_panes,
                 ) {
@@ -2583,7 +3329,7 @@ async fn main() {
                 println!("Connecting to {}...", watch_url);
                 let mut active = ActiveSessions::new();
                 let mut postmortem_state =
-                    WatchPostmortemState::new(!no_postmortem, &url, analyze_postmortems);
+                    WatchPostmortemState::new(auto_postmortem, &url, analyze_postmortems);
 
                 loop {
                     match connect_and_stream(
@@ -2614,10 +3360,12 @@ async fn main() {
             url,
             target,
             redact,
+            no_redact,
             analyze_with_claude,
             no_analyze_with_claude,
             output,
         } => {
+            let redact = redact || !no_redact;
             let analyze_postmortem =
                 claude_analysis_enabled(analyze_with_claude, no_analyze_with_claude);
             std::process::exit(
@@ -2746,8 +3494,25 @@ async fn run_postmortem(
     analyze_with_claude: bool,
     output: Option<&Path>,
 ) -> i32 {
+    eprintln!(
+        "{}",
+        format!(
+            "Postmortem in progress: fetching {} report for {target}...",
+            if redact { "redacted" } else { "local" }
+        )
+        .cyan()
+        .bold()
+    );
     match fetch_postmortem_json(base_url, target, redact).await {
         Ok(report) => {
+            if analyze_with_claude {
+                eprintln!(
+                    "{}",
+                    "Postmortem in progress: running Claude analysis..."
+                        .cyan()
+                        .bold()
+                );
+            }
             let (markdown, warning) = render_postmortem_markdown_with_optional_analysis(
                 base_url,
                 target,
@@ -2780,7 +3545,7 @@ async fn run_postmortem(
                 }
                 println!("Wrote postmortem to {}", path.display());
             } else {
-                print!("{markdown}");
+                print_postmortem_terminal_block(&markdown);
             }
             0
         }
@@ -3045,10 +3810,18 @@ async fn connect_and_stream(
                 continue;
             } else if line.is_empty() && !data_buffer.is_empty() {
                 if let Ok(event) = serde_json::from_str::<WatchEvent>(&data_buffer) {
+                    let postmortem_tag = event_session_id(&event)
+                        .map(|sid| active.tag_for(sid))
+                        .unwrap_or_default();
                     render_event(&event, no_cache, no_signals, session_filter, active);
                     if postmortem.enabled {
                         if let Some((session_id, dedupe_key)) = auto_postmortem_target(&event) {
                             if postmortem.rendered.insert(dedupe_key) {
+                                print_postmortem_progress(
+                                    &postmortem_tag,
+                                    &session_id,
+                                    postmortem.analyze_with_claude,
+                                );
                                 match fetch_postmortem_json_with_retry(
                                     &postmortem.base_url,
                                     &session_id,
@@ -3060,7 +3833,7 @@ async fn connect_and_stream(
                                 {
                                     Ok(report) => {
                                         let (markdown, warning) =
-                                            render_postmortem_markdown_with_optional_analysis(
+                                            render_watch_postmortem_markdown_with_optional_analysis(
                                                 &postmortem.base_url,
                                                 &session_id,
                                                 &report,
@@ -3070,8 +3843,7 @@ async fn connect_and_stream(
                                         if let Some(warning) = warning {
                                             eprintln!("{}", warning.yellow());
                                         }
-                                        println!();
-                                        print!("{markdown}");
+                                        print_postmortem_terminal_block(&markdown);
                                     }
                                     Err(err) => {
                                         eprintln!(
@@ -3116,10 +3888,11 @@ fn auto_postmortem_target(event: &WatchEvent) -> Option<(String, String)> {
 mod tests {
     use super::{
         append_claude_analysis_section, auto_postmortem_target, build_claude_analysis_prompt,
-        claude_analysis_enabled, compact_datetime_from_iso, event_session_id, extract_run_watch,
-        fetch_run_final_postmortem_markdown, fetch_run_final_postmortem_markdown_with_retry,
-        format_duration_coarse, format_tokens, local_time_from_iso, parse_mcp_tool_name,
-        push_unique, render_postmortem_markdown, render_postmortem_markdown_with_optional_analysis,
+        claude_analysis_enabled, colorize_postmortem_for_terminal, compact_datetime_from_iso,
+        event_session_id, extract_run_watch, fetch_run_final_postmortem_markdown,
+        fetch_run_final_postmortem_markdown_with_retry, format_duration_coarse, format_tokens,
+        local_time_from_iso, parse_mcp_tool_name, postmortem_separator_line_for_width, push_unique,
+        render_postmortem_markdown, render_postmortem_markdown_with_optional_analysis,
         run_child_command_with_deps, run_claude_postmortem_analysis_with_command,
         run_claude_postmortem_analysis_with_lookup, shell_join, shell_quote, truncate_for_box,
         watcher_args, yaml_quote, ActiveSessions, Cli, Commands, WatchEvent, WatchPostmortemState,
@@ -3452,18 +4225,18 @@ mod tests {
     }
 
     #[test]
-    fn side_watcher_args_can_disable_auto_postmortem() {
-        assert_eq!(
-            watcher_args("http://core".to_string(), false, true),
-            vec!["watch", "--url", "http://core", "--no-postmortem"]
-        );
-        assert_eq!(
-            watcher_args("http://core".to_string(), true, true),
-            vec!["watch", "--tmux", "--url", "http://core", "--no-postmortem"]
-        );
+    fn side_watcher_args_can_enable_auto_postmortem() {
         assert_eq!(
             watcher_args("http://core".to_string(), false, false),
             vec!["watch", "--url", "http://core"]
+        );
+        assert_eq!(
+            watcher_args("http://core".to_string(), false, true),
+            vec!["watch", "--url", "http://core", "--postmortem"]
+        );
+        assert_eq!(
+            watcher_args("http://core".to_string(), true, true),
+            vec!["watch", "--tmux", "--url", "http://core", "--postmortem"]
         );
     }
 
@@ -3576,8 +4349,8 @@ mod tests {
             || async { Ok(()) },
             {
                 let events = events.clone();
-                move |no_postmortem| {
-                    assert!(no_postmortem);
+                move |postmortem| {
+                    assert!(!postmortem);
                     events
                         .lock()
                         .expect("test events lock")
@@ -3627,6 +4400,7 @@ mod tests {
             no_cache,
             no_signals,
             session,
+            postmortem,
             no_postmortem,
             analyze_with_claude,
             no_analyze_with_claude,
@@ -3640,6 +4414,7 @@ mod tests {
         assert!(!no_cache);
         assert!(!no_signals);
         assert_eq!(session, None);
+        assert!(!postmortem);
         assert!(!no_postmortem);
         assert!(claude_analysis_enabled(
             analyze_with_claude,
@@ -3648,11 +4423,24 @@ mod tests {
         assert!(!tmux);
         assert_eq!(tmux_max_panes, 4);
 
-        let cli = Cli::try_parse_from(["clauditor", "watch", "--no-postmortem"])
-            .expect("watch no-postmortem parses");
-        let Commands::Watch { no_postmortem, .. } = cli.command else {
+        let cli = Cli::try_parse_from(["clauditor", "watch", "--postmortem"])
+            .expect("watch postmortem parses");
+        let Commands::Watch { postmortem, .. } = cli.command else {
             panic!("expected watch command");
         };
+        assert!(postmortem);
+
+        let cli = Cli::try_parse_from(["clauditor", "watch", "--no-postmortem"])
+            .expect("watch legacy no-postmortem parses");
+        let Commands::Watch {
+            postmortem,
+            no_postmortem,
+            ..
+        } = cli.command
+        else {
+            panic!("expected watch command");
+        };
+        assert!(!postmortem);
         assert!(no_postmortem);
 
         let cli = Cli::try_parse_from(["clauditor", "sessions"]).expect("sessions parses");
@@ -3678,12 +4466,13 @@ mod tests {
         assert_eq!(days, 30);
         assert_eq!(query, vec!["auth"]);
 
-        let cli = Cli::try_parse_from(["clauditor", "postmortem", "last", "--redact"])
+        let cli = Cli::try_parse_from(["clauditor", "postmortem", "last"])
             .expect("postmortem last parses");
         let Commands::Postmortem {
             url,
             target,
             redact,
+            no_redact,
             analyze_with_claude,
             no_analyze_with_claude,
             output,
@@ -3693,12 +4482,27 @@ mod tests {
         };
         assert_eq!(url, "http://localhost:9091");
         assert_eq!(target, "last");
-        assert!(redact);
+        assert!(!redact);
+        assert!(!no_redact);
         assert!(claude_analysis_enabled(
             analyze_with_claude,
             no_analyze_with_claude
         ));
         assert_eq!(output, None);
+
+        let cli = Cli::try_parse_from(["clauditor", "postmortem", "last", "--no-redact"])
+            .expect("postmortem no-redact parses");
+        let Commands::Postmortem { no_redact, .. } = cli.command else {
+            panic!("expected postmortem command");
+        };
+        assert!(no_redact);
+
+        let cli = Cli::try_parse_from(["clauditor", "postmortem", "last", "--redact"])
+            .expect("legacy postmortem redact parses");
+        let Commands::Postmortem { redact, .. } = cli.command else {
+            panic!("expected postmortem command");
+        };
+        assert!(redact);
 
         let cli = Cli::try_parse_from([
             "clauditor",
@@ -3724,7 +4528,6 @@ mod tests {
             "clauditor",
             "postmortem",
             "session_1234_abcd",
-            "--redact",
             "--output",
             "postmortem.md",
         ])
@@ -3732,6 +4535,7 @@ mod tests {
         let Commands::Postmortem {
             target,
             redact,
+            no_redact,
             output,
             ..
         } = cli.command
@@ -3739,7 +4543,8 @@ mod tests {
             panic!("expected postmortem command");
         };
         assert_eq!(target, "session_1234_abcd");
-        assert!(redact);
+        assert!(!redact);
+        assert!(!no_redact);
         assert_eq!(output, Some(std::path::PathBuf::from("postmortem.md")));
     }
 
@@ -3858,7 +4663,17 @@ mod tests {
             },
             "signals": {
                 "cache": { "cache_hit_ratio": 0.75 },
-                "context": { "max_fill_percent": 82.0, "turns_to_compact": 1 }
+                "context": { "max_fill_percent": 82.0, "turns_to_compact": 1 },
+                "tools": [
+                    { "tool_name": "Bash", "calls": 5, "failures": 3 },
+                    { "tool_name": "Read", "calls": 2, "failures": 0 }
+                ],
+                "skills": [
+                    { "skill_name": "qa", "event_type": "failed", "source": "hook", "count": 1 }
+                ],
+                "mcp": [
+                    { "server": "github", "tool": "get_issue", "event_type": "failed", "source": "hook", "count": 2 }
+                ]
             },
             "evidence": [
                 { "type": "direct", "label": "tools", "detail": "3 tool failures", "turn": 2 }
@@ -3872,17 +4687,24 @@ mod tests {
         });
 
         let markdown = render_postmortem_markdown(&report);
-        assert!(markdown.contains("# Clauditor Session Postmortem"));
-        assert!(markdown.contains("## Summary"));
-        assert!(markdown.contains("## Likely Cause"));
+        assert!(markdown.contains("# Clauditor Postmortem"));
+        assert!(markdown.contains("## Snapshot"));
+        assert!(markdown.contains("## Signals"));
         assert!(markdown.contains("## Evidence"));
-        assert!(markdown.contains("## Token And Cost Impact"));
-        assert!(markdown.contains("## Timeline Highlights"));
-        assert!(markdown.contains("## Recommendations"));
-        assert!(markdown.contains("## Caveats"));
-        assert!(markdown.contains("Session: `session_target`"));
-        assert!(markdown.contains("Initial prompt captured (redacted"));
-        assert!(markdown.contains("Estimated costs are local calculations"));
+        assert!(markdown.contains("Session"));
+        assert!(markdown.contains("`session_target`"));
+        assert!(markdown.contains("Tool failure loop"));
+        assert!(markdown.contains("Fix the failing command, then restart."));
+        assert!(markdown.contains("75% reusable prompt cache"));
+        assert!(markdown.contains("7 calls, 3 failures; failing: Bash (3)"));
+        assert!(markdown.contains("1 failed skill event; failing: qa (1)"));
+        assert!(markdown.contains("2 failed MCP calls; failing: github.get_issue (2)"));
+        assert!(markdown.contains("$1.23"));
+        assert!(!markdown.contains("|"));
+        assert!(!markdown.contains("Initial prompt captured (redacted"));
+        assert!(!markdown.contains("Estimated costs are local calculations"));
+        assert!(!markdown.contains("## Timeline Highlights"));
+        assert!(!markdown.contains("## Caveats"));
     }
 
     #[test]
@@ -3932,24 +4754,135 @@ mod tests {
         });
 
         let markdown = render_postmortem_markdown(&report);
-        assert!(markdown.contains("- Cause: near_compaction [heuristic]"));
-        assert!(markdown.contains("- Detail: [heuristic] Context reached 84% full."));
-        assert!(markdown.contains("- [heuristic] context: turn 2, inferred 1 turn to compact"));
+        assert!(markdown.contains("Cause"));
+        assert!(markdown.contains("Near auto-compaction [heuristic]"));
+        assert!(markdown.contains("heuristic"));
+        assert!(markdown.contains("context"));
+        assert!(markdown.contains("inferred 1 turn to compact"));
         assert!(
-            markdown.contains("- [direct] model: turn 3, requested opus, response reported sonnet")
+            markdown.contains("direct")
+                && markdown.contains("model")
+                && markdown.contains("requested opus, response reported sonnet")
         );
-        assert!(markdown.contains("- Context max: 84% full; inferred turns to compact: 1"));
+        assert!(markdown.contains("Context"));
+        assert!(markdown.contains("High: 84% full; about 1 turn before auto-compaction"));
+        assert!(markdown.contains("Start fresh with a short state summary."));
+        assert!(!markdown.contains("[heuristic] Context reached 84% full."));
+    }
+
+    #[test]
+    fn postmortem_markdown_simplifies_clean_partial_session() {
+        let report = serde_json::json!({
+            "session_id": "session_clean",
+            "redacted": true,
+            "partial": true,
+            "summary": {
+                "duration_secs": 630,
+                "model": "claude-sonnet-4-6",
+                "outcome": "In Progress",
+                "total_turns": 18,
+                "total_tokens": 1195867
+            },
+            "diagnosis": {
+                "likely_cause": "none",
+                "likely_cause_is_heuristic": false,
+                "next_action": "Session is still partial; use this as a progress snapshot, not a final diagnosis."
+            },
+            "impact": {
+                "estimated_total_cost_dollars": 0.47,
+                "estimated_likely_wasted_tokens": 0,
+                "estimated_likely_wasted_cost_dollars": 0.0
+            },
+            "signals": {
+                "cache": {
+                    "cache_reusable_prefix_ratio": 0.983,
+                    "total_input_cache_rate": 0.981
+                },
+                "context": {
+                    "max_fill_percent": 38.0,
+                    "turns_to_compact": 167
+                },
+                "tools": [
+                    { "tool_name": "Bash", "calls": 4, "failures": 0 },
+                    { "tool_name": "Read", "calls": 3, "failures": 0 }
+                ],
+                "skills": [],
+                "mcp": []
+            },
+            "evidence": []
+        });
+
+        let markdown = render_postmortem_markdown(&report);
+
+        assert!(markdown.contains("No degradation detected"));
+        assert!(markdown.contains("Healthy: 98% reusable prompt cache; 98% of input from cache"));
+        assert!(
+            markdown.contains("Plenty of room: 38% full; about 167 turns before auto-compaction")
+        );
+        assert!(markdown.contains("No likely wasted tokens detected"));
+        assert!(markdown.contains("7 calls, 0 failures; repeated: Bash, Read"));
+        assert!(markdown.contains("No failed skill events detected"));
+        assert!(markdown.contains("No failed MCP calls detected"));
+        assert!(!markdown.contains("compaction runway"));
     }
 
     #[test]
     fn postmortem_markdown_appends_claude_analysis_section() {
-        let mut markdown = "# Clauditor Session Postmortem\n".to_string();
+        let mut markdown = "# Clauditor Postmortem\n".to_string();
         append_claude_analysis_section(
             &mut markdown,
-            "- Likely cause: cache rebuild\n- Next action: restart",
+            "## Claude Analysis\n\
+```\n\
+Status       Partial - no degradation detected\n\
+Main signal  Cache hit ratio stayed high\n\
+Risk         Low — context runway is heuristic\n\
+Cost         $1.25 estimated\n\
+```\n\
+## Restart Prompt\n\
+```\n\
+No restart needed.\n\
+If failures recur, restart with a shorter prompt.\n\
+```",
         );
         assert!(markdown.contains("## Claude Analysis"));
-        assert!(markdown.contains("Likely cause: cache rebuild"));
+        assert!(markdown.contains("Status       Partial"));
+        assert!(markdown.contains("Main signal  Cache hit ratio stayed high"));
+        assert!(markdown.contains("Risk         Low"));
+        assert!(markdown.contains("Next action  No restart needed."));
+        assert!(markdown.contains("## Restart Prompt"));
+        assert!(markdown.contains("No restart needed."));
+        assert!(!markdown.contains("```"));
+        assert!(!markdown.contains("Cost         $1.25"));
+    }
+
+    #[test]
+    fn postmortem_terminal_colorization_adds_ansi_without_touching_markdown() {
+        let markdown = "# Clauditor Postmortem\n\
+\n\
+## Signals\n\
+  Cause   none\n\
+  Context 84% full; compaction runway 1\n\
+  Risk    High - restart is cheaper\n\
+\n\
+## Evidence\n\
+  Type        Signal        Turn   Detail\n\
+  ----------  ------------  -----  ------\n\
+  heuristic   context       2      inferred 1 turn to compact\n";
+
+        colored::control::set_override(true);
+        let terminal = colorize_postmortem_for_terminal(markdown);
+        colored::control::unset_override();
+
+        assert!(terminal.contains("\u{1b}["));
+        assert!(terminal.contains("Clauditor Postmortem"));
+        assert!(terminal.contains("heuristic"));
+        assert!(!markdown.contains("\u{1b}["));
+    }
+
+    #[test]
+    fn postmortem_separator_spans_terminal_width_with_minimum() {
+        assert_eq!(postmortem_separator_line_for_width(72).chars().count(), 72);
+        assert_eq!(postmortem_separator_line_for_width(8).chars().count(), 20);
     }
 
     #[test]
@@ -3965,6 +4898,11 @@ mod tests {
         assert!(prompt.contains("Use only the redacted JSON evidence"));
         assert!(prompt.contains("Preserve direct versus heuristic evidence labels"));
         assert!(prompt.contains("Do not turn heuristic"));
+        assert!(prompt.contains("Write compact GitHub-flavored Markdown for a tmux pane"));
+        assert!(prompt.contains("Use aligned key/value rows"));
+        assert!(prompt.contains("No code fences"));
+        assert!(prompt.contains("Status       partial or final"));
+        assert!(prompt.contains("Main signal  the one signal that matters most"));
         assert!(prompt.contains("## Claude Analysis"));
         assert!(prompt.contains("## Restart Prompt"));
         assert!(prompt.contains("\"redacted\": true"));

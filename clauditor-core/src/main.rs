@@ -827,22 +827,29 @@ fn ensure_request_cost_columns(conn: &Connection) -> rusqlite::Result<()> {
 fn repair_turn_snapshot_context_windows(conn: &Connection) -> rusqlite::Result<()> {
     let mut stmt = conn.prepare(
         "SELECT id, input_tokens, cache_read_tokens, cache_creation_tokens, \
-         requested_model, actual_model \
+         context_window_tokens, requested_model, actual_model \
          FROM turn_snapshots \
-         WHERE context_window_tokens IS NULL OR context_window_tokens <= 0",
+         WHERE context_window_tokens IS NULL \
+            OR context_window_tokens <= 0 \
+            OR context_window_tokens = ?1",
     )?;
 
     let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?.max(0) as u64,
-                row.get::<_, i64>(2)?.max(0) as u64,
-                row.get::<_, i64>(3)?.max(0) as u64,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })?
+        .query_map(
+            rusqlite::params![EXTENDED_CONTEXT_WINDOW_TOKENS as i64],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                    row.get::<_, i64>(3)?.max(0) as u64,
+                    row.get::<_, Option<i64>>(4)?
+                        .map(|value| value.max(0) as u64),
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )?
         .filter_map(|row| row.ok())
         .collect::<Vec<_>>();
 
@@ -851,10 +858,22 @@ fn repair_turn_snapshot_context_windows(conn: &Connection) -> rusqlite::Result<(
         input_tokens,
         cache_read_tokens,
         cache_creation_tokens,
+        existing_context_window_tokens,
         requested_model,
         actual_model,
     ) in rows
     {
+        if !turn_snapshot_context_window_needs_repair(
+            existing_context_window_tokens,
+            requested_model.as_deref(),
+            actual_model.as_deref(),
+            input_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+        ) {
+            continue;
+        }
+
         let context_window_tokens = infer_context_window_tokens(
             requested_model.as_deref(),
             actual_model.as_deref(),
@@ -1827,6 +1846,7 @@ struct PostmortemDiagnosisRow {
 struct PostmortemTurnRow {
     turn_number: u64,
     timestamp: String,
+    input_tokens: u64,
     cache_read_tokens: u64,
     cache_creation_tokens: u64,
     gap_from_prev_secs: f64,
@@ -2177,6 +2197,7 @@ fn load_postmortem_turns(
         Ok(PostmortemTurnRow {
             turn_number: row.get::<_, i64>(0)?.max(0) as u64,
             timestamp: row.get(1)?,
+            input_tokens,
             cache_read_tokens,
             cache_creation_tokens,
             gap_from_prev_secs: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0).max(0.0),
@@ -2593,13 +2614,23 @@ fn build_postmortem_response_from_db(
         .iter()
         .map(|turn| turn.context_fill_percent)
         .fold(0.0, f64::max);
-    let latest_context_fill_percent = turns
+    let context_turns = turns
+        .iter()
+        .filter(|turn| {
+            turn_has_context_usage(
+                turn.input_tokens,
+                turn.cache_read_tokens,
+                turn.cache_creation_tokens,
+            )
+        })
+        .collect::<Vec<_>>();
+    let latest_context_fill_percent = context_turns
         .last()
         .map(|turn| turn.context_fill_percent)
         .unwrap_or(0.0);
-    let turns_to_compact = if turns.len() >= 2 {
-        let prev = &turns[turns.len() - 2];
-        let current = &turns[turns.len() - 1];
+    let turns_to_compact = if context_turns.len() >= 2 {
+        let prev = context_turns[context_turns.len() - 2];
+        let current = context_turns[context_turns.len() - 1];
         project_turns_until_compaction(prev.context_fill_percent, current.context_fill_percent)
     } else {
         None
@@ -2966,7 +2997,11 @@ fn build_postmortem_response_from_db(
                 "latest_fill_percent": (latest_context_fill_percent * 10.0).round() / 10.0,
                 "max_fill_percent": (max_context_fill_percent * 10.0).round() / 10.0,
                 "turns_to_compact": turns_to_compact,
-                "context_window_tokens": turns.last().map(|turn| turn.context_window_tokens),
+                "context_window_tokens": context_turns
+                    .last()
+                    .copied()
+                    .or_else(|| turns.last())
+                    .map(|turn| turn.context_window_tokens),
                 "heuristic": true,
             },
             "model": {
@@ -3916,7 +3951,13 @@ pub(crate) fn project_turns_until_compaction(
 /// or the trajectory is flat / decreasing.
 fn project_turns_to_compact(session_id: &str, current_fill_percent: f64) -> Option<u32> {
     let turns = diagnosis::SESSION_TURNS.get(session_id)?;
-    let prev = turns.last()?;
+    let prev = turns.iter().rev().find(|turn| {
+        turn_has_context_usage(
+            turn.input_tokens as u64,
+            turn.cache_read_tokens as u64,
+            turn.cache_creation_tokens as u64,
+        )
+    })?;
     let prev_fill = context_fill_percent(
         prev.input_tokens as u64,
         prev.cache_read_tokens as u64,
@@ -5008,7 +5049,25 @@ fn model_requests_1m_context(model: &str) -> bool {
     model.to_ascii_lowercase().contains("[1m]")
 }
 
-fn model_family_version(model: &str, family: &str) -> Option<(u32, u32)> {
+fn any_model_requests_1m_context(
+    requested_model: Option<&str>,
+    actual_model: Option<&str>,
+) -> bool {
+    requested_model.is_some_and(model_requests_1m_context)
+        || actual_model.is_some_and(model_requests_1m_context)
+}
+
+fn observed_input_tokens(
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+) -> u64 {
+    input_tokens
+        .saturating_add(cache_read_tokens)
+        .saturating_add(cache_creation_tokens)
+}
+
+fn legacy_native_1m_model_match(model: &str, family: &str) -> Option<(u32, u32)> {
     let lower = normalize_model_for_match(model).to_ascii_lowercase();
     let tokens = lower
         .split(|ch: char| !ch.is_ascii_alphanumeric())
@@ -5047,13 +5106,46 @@ fn model_family_version(model: &str, family: &str) -> Option<(u32, u32)> {
     None
 }
 
-fn model_has_native_1m_context(model: &str) -> bool {
+// Older builds inferred 1M context from plain Sonnet/Opus/Mythos model ids.
+// Keep that matcher only to repair rows written by that retired assumption.
+fn model_matches_legacy_native_1m_rule(model: &str) -> bool {
     let lower = normalize_model_for_match(model).to_ascii_lowercase();
     lower.contains("mythos")
-        || model_family_version(&lower, "opus")
+        || legacy_native_1m_model_match(&lower, "opus")
             .is_some_and(|(major, minor)| major > 4 || (major == 4 && minor >= 6))
-        || model_family_version(&lower, "sonnet")
+        || legacy_native_1m_model_match(&lower, "sonnet")
             .is_some_and(|(major, minor)| major > 4 || (major == 4 && minor >= 6))
+}
+
+fn turn_snapshot_context_window_needs_repair(
+    existing_context_window_tokens: Option<u64>,
+    requested_model: Option<&str>,
+    actual_model: Option<&str>,
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+) -> bool {
+    let Some(existing_context_window_tokens) = existing_context_window_tokens else {
+        return true;
+    };
+    if existing_context_window_tokens == 0 {
+        return true;
+    }
+    if existing_context_window_tokens != EXTENDED_CONTEXT_WINDOW_TOKENS {
+        return false;
+    }
+    if configured_context_window_tokens().is_some()
+        || any_model_requests_1m_context(requested_model, actual_model)
+        || observed_input_tokens(input_tokens, cache_read_tokens, cache_creation_tokens)
+            > STANDARD_CONTEXT_WINDOW_TOKENS
+    {
+        return false;
+    }
+
+    requested_model
+        .into_iter()
+        .chain(actual_model)
+        .any(model_matches_legacy_native_1m_rule)
 }
 
 fn beta_values_use_1m_context(values: &[String]) -> bool {
@@ -5143,10 +5235,7 @@ fn resolve_context_window_tokens_with_config(
 ) -> u64 {
     configured
         .or(header_hint)
-        .or_else(|| {
-            (model_has_native_1m_context(model) || model_requests_1m_context(model))
-                .then_some(EXTENDED_CONTEXT_WINDOW_TOKENS)
-        })
+        .or_else(|| model_requests_1m_context(model).then_some(EXTENDED_CONTEXT_WINDOW_TOKENS))
         .unwrap_or(STANDARD_CONTEXT_WINDOW_TOKENS)
 }
 
@@ -5161,17 +5250,25 @@ fn infer_context_window_tokens(
         return configured;
     }
 
-    let model = actual_model.or(requested_model).unwrap_or("");
-    if model_has_native_1m_context(model) || model_requests_1m_context(model) {
+    if any_model_requests_1m_context(requested_model, actual_model) {
         return EXTENDED_CONTEXT_WINDOW_TOKENS;
     }
 
-    let total_input_tokens = input_tokens + cache_read_tokens + cache_creation_tokens;
+    let total_input_tokens =
+        observed_input_tokens(input_tokens, cache_read_tokens, cache_creation_tokens);
     if total_input_tokens > STANDARD_CONTEXT_WINDOW_TOKENS {
         return EXTENDED_CONTEXT_WINDOW_TOKENS;
     }
 
     STANDARD_CONTEXT_WINDOW_TOKENS
+}
+
+fn turn_has_context_usage(
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
+) -> bool {
+    observed_input_tokens(input_tokens, cache_read_tokens, cache_creation_tokens) > 0
 }
 
 fn context_fill_ratio(
@@ -8227,12 +8324,11 @@ mod tests {
         extract_headers, extract_working_dir, fallback_request_id, in_memory_postmortem_totals,
         infer_context_window_tokens, is_internal_request_shape, load_degradation_view_from_db,
         lock_or_recover, looks_like_machine_recall_line, looks_like_title_request, metrics,
-        model_has_native_1m_context, model_requests_1m_context, normalize_search_text,
-        now_epoch_secs, parse_latest_tool_results, parse_request_body,
-        persist_billing_reconciliation, persist_final_session_artifacts, pricing,
-        query_historical_metrics, query_summary, redact_operational_text,
-        repair_persisted_session_artifacts, repair_turn_snapshot_context_windows,
-        request_cache_ttl_evidence, request_cache_ttl_secs,
+        model_requests_1m_context, normalize_search_text, now_epoch_secs,
+        parse_latest_tool_results, parse_request_body, persist_billing_reconciliation,
+        persist_final_session_artifacts, pricing, query_historical_metrics, query_summary,
+        redact_operational_text, repair_persisted_session_artifacts,
+        repair_turn_snapshot_context_windows, request_cache_ttl_evidence, request_cache_ttl_secs,
         request_context_window_hint_from_headers, request_uses_1m_context,
         resolve_context_window_tokens, resolve_context_window_tokens_with_config,
         response_cache_ttl_secs, score_recall_doc, seed_live_metric_labels_from_db,
@@ -10540,6 +10636,61 @@ mod tests {
     }
 
     #[test]
+    fn postmortem_context_signal_ignores_empty_usage_rows() {
+        let conn = create_full_test_db();
+        insert_session(
+            &conn,
+            "session-context-zero",
+            "2026-05-07T09:22:03Z",
+            None,
+            "claude-sonnet-4-6",
+            Some("Keep working after empty usage rows"),
+        );
+        for (turn, input, cache_read, cache_create, fill) in [
+            (1, 3, 59_000, 997, 0.30),
+            (2, 1, 61_000, 999, 0.31),
+            (3, 0, 0, 0, 0.0),
+        ] {
+            conn.execute(
+                "INSERT INTO turn_snapshots (
+                    session_id, turn_number, timestamp, input_tokens, cache_read_tokens,
+                    cache_creation_tokens, output_tokens, ttft_ms, tool_calls, tool_failures,
+                    gap_from_prev_secs, context_utilization, context_window_tokens,
+                    frustration_signals, requested_model, actual_model
+                ) VALUES ('session-context-zero', ?1, '2026-05-07T09:22:12Z',
+                    ?2, ?3, ?4, 0, 1000, '[]', 0, 0.0, ?5, 200000, 0,
+                    'claude-sonnet-4-6', 'claude-sonnet-4-6')",
+                rusqlite::params![turn, input, cache_read, cache_create, fill],
+            )
+            .expect("insert turn snapshot");
+        }
+
+        let json = build_postmortem_response_from_db(&conn, "session-context-zero", true)
+            .expect("postmortem");
+
+        assert_eq!(
+            json.pointer("/signals/context/latest_fill_percent")
+                .and_then(|value| value.as_f64()),
+            Some(31.0)
+        );
+        assert_eq!(
+            json.pointer("/signals/context/max_fill_percent")
+                .and_then(|value| value.as_f64()),
+            Some(31.0)
+        );
+        assert_eq!(
+            json.pointer("/signals/context/turns_to_compact")
+                .and_then(|value| value.as_u64()),
+            Some(54)
+        );
+        assert_eq!(
+            json.pointer("/signals/context/context_window_tokens")
+                .and_then(|value| value.as_u64()),
+            Some(STANDARD_CONTEXT_WINDOW_TOKENS)
+        );
+    }
+
+    #[test]
     fn request_persistence_updates_last_activity_without_ending_session() {
         let path = unique_test_db_path("active-last-activity");
         let (tx, rx) = std_mpsc::channel();
@@ -11548,29 +11699,27 @@ mod tests {
         );
         assert_eq!(
             resolve_context_window_tokens(None, "claude-sonnet-4-6"),
-            EXTENDED_CONTEXT_WINDOW_TOKENS
+            STANDARD_CONTEXT_WINDOW_TOKENS
         );
     }
 
     #[test]
-    fn resolve_context_window_tokens_uses_capabilities_aliases_and_standard_models() {
-        assert!(model_has_native_1m_context("claude-sonnet-4-6"));
-        assert!(model_has_native_1m_context("claude-opus-4-7"));
-        assert!(model_has_native_1m_context("claude-4-6-sonnet-20260217"));
-        assert!(!model_has_native_1m_context("claude-sonnet-4-5"));
-        assert!(!model_has_native_1m_context("claude-3-7-sonnet-20250219"));
-        assert!(!model_has_native_1m_context("claude-sonnet-20250219"));
+    fn resolve_context_window_tokens_uses_explicit_context_signals() {
         assert_eq!(
             resolve_context_window_tokens(None, "claude-sonnet-4-6[1m]"),
             EXTENDED_CONTEXT_WINDOW_TOKENS
         );
         assert_eq!(
             resolve_context_window_tokens(None, "claude-sonnet-4-6"),
-            EXTENDED_CONTEXT_WINDOW_TOKENS
+            STANDARD_CONTEXT_WINDOW_TOKENS
         );
         assert_eq!(
             resolve_context_window_tokens(None, "claude-opus-4-7"),
-            EXTENDED_CONTEXT_WINDOW_TOKENS
+            STANDARD_CONTEXT_WINDOW_TOKENS
+        );
+        assert_eq!(
+            resolve_context_window_tokens(None, "claude-4-6-sonnet-20260217"),
+            STANDARD_CONTEXT_WINDOW_TOKENS
         );
         assert_eq!(
             resolve_context_window_tokens(None, "claude-sonnet-4-5"),
@@ -11591,6 +11740,24 @@ mod tests {
                 "claude-haiku-4-5"
             ),
             400_000
+        );
+    }
+
+    #[test]
+    fn infer_context_window_tokens_matches_claude_code_plain_model_percentage() {
+        let window = infer_context_window_tokens(Some("claude-sonnet-4-6"), None, 72, 61_020, 29);
+        assert_eq!(window, STANDARD_CONTEXT_WINDOW_TOKENS);
+        assert!((context_fill_percent(72, 61_020, 29, window) - 30.5605).abs() < 0.0001);
+
+        assert_eq!(
+            infer_context_window_tokens(
+                Some("claude-sonnet-4-6[1m]"),
+                Some("claude-sonnet-4-6"),
+                72,
+                61_020,
+                29,
+            ),
+            EXTENDED_CONTEXT_WINDOW_TOKENS
         );
     }
 
@@ -11729,6 +11896,67 @@ mod tests {
 
         assert_eq!(context_window_tokens, EXTENDED_CONTEXT_WINDOW_TOKENS as i64);
         assert!((context_utilization - 0.251).abs() < 0.0001);
+    }
+
+    #[test]
+    fn repair_turn_snapshot_context_windows_downgrades_legacy_plain_model_1m_rows() {
+        let conn = create_full_test_db();
+        insert_session(
+            &conn,
+            "session-plain",
+            "2026-05-07T07:42:01Z",
+            Some("2026-05-07T07:45:30Z"),
+            "claude-sonnet-4-6",
+            None,
+        );
+        insert_session(
+            &conn,
+            "session-explicit",
+            "2026-05-07T07:42:01Z",
+            Some("2026-05-07T07:45:30Z"),
+            "claude-sonnet-4-6[1m]",
+            None,
+        );
+        for (session_id, requested_model) in [
+            ("session-plain", "claude-sonnet-4-6"),
+            ("session-explicit", "claude-sonnet-4-6[1m]"),
+        ] {
+            conn.execute(
+                "INSERT INTO turn_snapshots (
+                    session_id, turn_number, timestamp, input_tokens, cache_read_tokens,
+                    cache_creation_tokens, output_tokens, ttft_ms, tool_calls, tool_failures,
+                    gap_from_prev_secs, context_utilization, context_window_tokens,
+                    frustration_signals, requested_model, actual_model
+                ) VALUES (?1, 1, '2026-05-07T07:45:30Z', 72, 61020, 29, 40, 1000,
+                    '[]', 0, 0.0, 0.061121, 1000000, 0, ?2, 'claude-sonnet-4-6')",
+                rusqlite::params![session_id, requested_model],
+            )
+            .expect("insert turn snapshot");
+        }
+
+        repair_turn_snapshot_context_windows(&conn).expect("repair turn snapshots");
+
+        let plain: (i64, f64) = conn
+            .query_row(
+                "SELECT context_window_tokens, context_utilization \
+                 FROM turn_snapshots WHERE session_id = 'session-plain'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load plain row");
+        let explicit: (i64, f64) = conn
+            .query_row(
+                "SELECT context_window_tokens, context_utilization \
+                 FROM turn_snapshots WHERE session_id = 'session-explicit'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load explicit row");
+
+        assert_eq!(plain.0, STANDARD_CONTEXT_WINDOW_TOKENS as i64);
+        assert!((plain.1 - 0.305605).abs() < 0.0001);
+        assert_eq!(explicit.0, EXTENDED_CONTEXT_WINDOW_TOKENS as i64);
+        assert!((explicit.1 - 0.061121).abs() < 0.0001);
     }
 
     #[test]

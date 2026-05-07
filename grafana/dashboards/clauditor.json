@@ -31,12 +31,12 @@
       },
       "id": 21,
       "options": {
-        "content": "### How to read this dashboard\n\n**Degraded session** means the session hit a real problem, not just an early warning.\n\n**Degraded sessions %** is the main health number. Lower is better.\n\n**Degraded causes** tells you what kind of problem happened, so you can see patterns.\n\n**Cache reuse %** shows how much old context was reused instead of rebuilt. Higher is better because it usually means faster and cheaper sessions.\n\n**TTL misses** mean the cache expired before the next turn, so Claude had to rebuild context.\n\n**Thrash misses** mean the cache had to be rebuilt again very quickly, which usually points to something in the setup or context changing too often.\n\n**Model fallbacks** mean the requested model was not the one that actually got used.\n\n**Estimated cost** is a best-effort cost estimate. It is useful for trends, but it may not exactly match billing.",
+        "content": "### What the dashboard is telling you\n\n**Estimated spend** is Clauditor's best local cost estimate. Use it for trends; it may not match your bill exactly.\n\n**Finished sessions** are sessions Clauditor has closed and saved a final diagnosis for.\n\n**Problem sessions** are finished sessions where Clauditor found a real problem, such as repeated tool failures, cache rebuilds, or a model switch.\n\n**Cache reused** means Claude could reuse cached input instead of writing that context again. Higher usually means faster and cheaper sessions.\n\n**Cache expired misses** happen when cached context aged out before the next turn, so it had to be rebuilt.\n\n**Fast rebuild misses** happen when the cache is rebuilt again soon after a previous rebuild. That often means the prompt or setup is changing too much.\n\n**Model switches** mean the model that answered was different from the model requested.\n\n**Tool failures** are tool results that came back as errors.",
         "mode": "markdown"
       },
       "pluginVersion": "11.1.0",
-      "title": "Terminology Guide",
-      "description": "Short definitions for the dashboard's main terms and KPIs.",
+      "title": "How to read this dashboard",
+      "description": "Plain-English definitions for the numbers on this dashboard.",
       "type": "text"
     },
     {
@@ -99,8 +99,8 @@
           "refId": "A"
         }
       ],
-      "title": "Estimated cost last 7d",
-      "description": "Rolling 7-day estimated spend from persisted historical gauges.",
+      "title": "Estimated spend in the last 7 days",
+      "description": "Estimated dollars from all saved requests in the last 7 days. This is a local estimate, not your bill.",
       "type": "stat"
     },
     {
@@ -146,8 +146,8 @@
           "refId": "A"
         }
       ],
-      "title": "Sessions finalized (7d)",
-      "description": "Number of finalized sessions in the current 7-day window.",
+      "title": "Finished sessions in the last 7 days",
+      "description": "Sessions with a saved final diagnosis in the last 7 days.",
       "type": "stat"
     },
     {
@@ -210,8 +210,8 @@
           "refId": "A"
         }
       ],
-      "title": "Cache reuse % (7d)",
-      "description": "Token-weighted cache reuse share across finalized sessions over 7 days.",
+      "title": "Cache reused in the last 7 days",
+      "description": "How much cached context was reused instead of being written again in saved requests from the last 7 days.",
       "type": "stat"
     },
     {
@@ -274,8 +274,8 @@
           "refId": "A"
         }
       ],
-      "title": "Degraded sessions % (7d)",
-      "description": "Share of finalized sessions flagged degraded in the current 7-day window.",
+      "title": "Problem sessions in the last 7 days",
+      "description": "Finished sessions in the last 7 days that Clauditor marked as having a real problem.",
       "type": "stat"
     },
     {
@@ -288,8 +288,8 @@
       },
       "id": 5,
       "panels": [],
-      "title": "Estimated waste you didn't know about",
-      "description": "Cache rebuild waste and silent fallback panels for hidden efficiency losses.",
+      "title": "Hidden waste",
+      "description": "Money wasted by cache rebuilds and cases where the answer came from a different model than requested.",
       "type": "row"
     },
     {
@@ -338,8 +338,8 @@
           "refId": "A"
         }
       ],
-      "title": "Estimated cache rebuild waste by model (24h)",
-      "description": "Current rolling 24-hour estimated dollars lost to TTL or thrash-driven cache rebuilds, split by model.",
+      "title": "Cache rebuild waste by model, last 24 hours",
+      "description": "Estimated dollars lost when cache expired or was rebuilt too soon, grouped by model.",
       "type": "bargauge"
     },
     {
@@ -384,12 +384,12 @@
         {
           "editorMode": "code",
           "expr": "clauditor_history_model_fallbacks{window=\"1d\"} > 0",
-          "legendFormat": "{{requested}} -> {{actual}}",
+          "legendFormat": "asked {{requested}}, got {{actual}}",
           "refId": "A"
         }
       ],
-      "title": "Model fallbacks by route (24h)",
-      "description": "Current rolling 24-hour count of requested-vs-actual model mismatches. Only non-zero fallback routes are shown.",
+      "title": "Model switches, last 24 hours",
+      "description": "Times a request asked for one model family but the response came from another. Only non-zero switches are shown.",
       "type": "bargauge"
     },
     {
@@ -402,8 +402,8 @@
       },
       "id": 8,
       "panels": [],
-      "title": "Trends",
-      "description": "Quota burn, spend mix, cache reuse, and degraded-session patterns over time.",
+      "title": "Trends over time",
+      "description": "How token use, cost, cache reuse, and problem causes changed over the selected chart time range.",
       "type": "row"
     },
     {
@@ -488,18 +488,18 @@
         {
           "editorMode": "code",
           "expr": "max(clauditor_weekly_tokens_used)",
-          "legendFormat": "tokens used",
+          "legendFormat": "tokens used this week",
           "refId": "A"
         },
         {
           "editorMode": "code",
           "expr": "max(clauditor_weekly_token_budget)",
-          "legendFormat": "budget",
+          "legendFormat": "weekly budget",
           "refId": "B"
         }
       ],
-      "title": "Weekly tokens used vs cap",
-      "description": "Weekly token usage versus the configured or inferred budget cap. If no budget is configured, only usage will render.",
+      "title": "Weekly tokens used vs budget",
+      "description": "Tokens used since Monday 00:00 UTC compared with the configured or suggested weekly budget. If there is no budget, only usage is shown.",
       "type": "timeseries"
     },
     {
@@ -548,8 +548,8 @@
           "refId": "A"
         }
       ],
-      "title": "Estimated cost by model (24h)",
-      "description": "Current rolling 24-hour estimated spend from persisted requests, grouped by model family.",
+      "title": "Spend by model, last 24 hours",
+      "description": "Estimated dollars from saved requests in the last 24 hours, grouped by model.",
       "type": "bargauge"
     },
     {
@@ -628,12 +628,12 @@
         {
           "editorMode": "code",
           "expr": "100 * clauditor_history_cache_hit_ratio{window=\"7d\"}",
-          "legendFormat": "cache reuse ratio",
+          "legendFormat": "cache reused",
           "refId": "A"
         }
       ],
-      "title": "Cache reuse ratio (current 7d window)",
-      "description": "Current 7-day historical cache reuse ratio rendered as a trend line.",
+      "title": "Cache reuse over time",
+      "description": "Each point shows the cache reuse percentage for the previous 7 days.",
       "type": "timeseries"
     },
     {
@@ -677,13 +677,55 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "clauditor_history_degraded_causes{window=\"7d\"} > 0",
-          "legendFormat": "{{cause_type}}",
+          "expr": "clauditor_history_degraded_causes{window=\"7d\",cause_type=\"cache_miss_ttl\"} > 0",
+          "legendFormat": "cache expired",
           "refId": "A"
+        },
+        {
+          "editorMode": "code",
+          "expr": "clauditor_history_degraded_causes{window=\"7d\",cause_type=\"context_bloat\"} > 0",
+          "legendFormat": "context got too large",
+          "refId": "B"
+        },
+        {
+          "editorMode": "code",
+          "expr": "clauditor_history_degraded_causes{window=\"7d\",cause_type=\"model_fallback\"} > 0",
+          "legendFormat": "model switched",
+          "refId": "C"
+        },
+        {
+          "editorMode": "code",
+          "expr": "clauditor_history_degraded_causes{window=\"7d\",cause_type=\"near_compaction\"} > 0",
+          "legendFormat": "near automatic compaction",
+          "refId": "D"
+        },
+        {
+          "editorMode": "code",
+          "expr": "clauditor_history_degraded_causes{window=\"7d\",cause_type=\"harness_pressure\"} > 0",
+          "legendFormat": "system pressure",
+          "refId": "E"
+        },
+        {
+          "editorMode": "code",
+          "expr": "clauditor_history_degraded_causes{window=\"7d\",cause_type=\"cache_miss_thrash\"} > 0",
+          "legendFormat": "cache rebuilt too soon",
+          "refId": "F"
+        },
+        {
+          "editorMode": "code",
+          "expr": "clauditor_history_degraded_causes{window=\"7d\",cause_type=\"tool_failure_streak\"} > 0",
+          "legendFormat": "repeated tool failures",
+          "refId": "G"
+        },
+        {
+          "editorMode": "code",
+          "expr": "clauditor_history_degraded_causes{window=\"7d\",cause_type=\"compaction_suspected\"} > 0",
+          "legendFormat": "possible compaction",
+          "refId": "H"
         }
       ],
-      "title": "Degraded causes by type (7d)",
-      "description": "Current rolling 7-day degraded-session causes broken out by cause type. Only non-zero causes are shown.",
+      "title": "Problem causes, last 7 days",
+      "description": "Reasons Clauditor marked finished sessions as having problems. Only non-zero causes are shown.",
       "type": "bargauge"
     },
     {
@@ -696,8 +738,8 @@
       },
       "id": 13,
       "panels": [],
-      "title": "Operational signals",
-      "description": "Current activity plus the last 24 hours of cache misses and tool failures.",
+      "title": "Current activity and recent problems",
+      "description": "What is running now, plus cache misses and tool errors from the last 24 hours.",
       "type": "row"
     },
     {
@@ -760,8 +802,8 @@
           "refId": "A"
         }
       ],
-      "title": "Active sessions now",
-      "description": "Current number of active in-memory sessions being tracked.",
+      "title": "Sessions running now",
+      "description": "Sessions the app is tracking right now.",
       "type": "stat"
     },
     {
@@ -824,8 +866,8 @@
           "refId": "A"
         }
       ],
-      "title": "TTL misses (24h)",
-      "description": "TTL-expiry cache misses observed over the last 24 hours.",
+      "title": "Cache expired misses, last 24 hours",
+      "description": "Cache misses where the cached context expired before the next turn.",
       "type": "stat"
     },
     {
@@ -888,8 +930,8 @@
           "refId": "A"
         }
       ],
-      "title": "Thrash misses (24h)",
-      "description": "Thrash-style cache misses observed over the last 24 hours.",
+      "title": "Fast rebuild misses, last 24 hours",
+      "description": "Cache misses where context was rebuilt again soon after a previous rebuild.",
       "type": "stat"
     },
     {
@@ -952,8 +994,8 @@
           "refId": "A"
         }
       ],
-      "title": "Tool failures (24h)",
-      "description": "Total tool_result failures observed over the last 24 hours.",
+      "title": "Tool failures, last 24 hours",
+      "description": "Tool results saved as errors in the last 24 hours.",
       "type": "stat"
     },
     {
@@ -998,18 +1040,18 @@
         {
           "editorMode": "code",
           "expr": "clauditor_history_cache_events{window=\"1d\",event_type=\"miss_ttl\"}",
-          "legendFormat": "ttl",
+          "legendFormat": "cache expired",
           "refId": "A"
         },
         {
           "editorMode": "code",
           "expr": "clauditor_history_cache_events{window=\"1d\",event_type=\"miss_thrash\"}",
-          "legendFormat": "thrash",
+          "legendFormat": "rebuilt too soon",
           "refId": "B"
         }
       ],
-      "title": "Cache misses by type (24h)",
-      "description": "Current rolling 24-hour TTL and thrash cache misses.",
+      "title": "Cache expired/fast rebuild misses, last 24 hours",
+      "description": "The two cache-miss types that usually point to avoidable rebuild work.",
       "type": "bargauge"
     },
     {
@@ -1058,8 +1100,8 @@
           "refId": "A"
         }
       ],
-      "title": "Tool failures by tool (24h)",
-      "description": "Current rolling 24-hour tool failures grouped by tool label. Only non-zero tools are shown.",
+      "title": "Tool failures by tool, last 24 hours",
+      "description": "Tool errors from the last 24 hours, grouped by tool. Only tools with errors are shown.",
       "type": "bargauge"
     },
     {
@@ -1108,8 +1150,8 @@
           "refId": "A"
         }
       ],
-      "title": "Average estimated session cost by model (24h)",
-      "description": "Current rolling 24-hour average estimated cost of finalized sessions, grouped by model family.",
+      "title": "Average session cost by model, last 24 hours",
+      "description": "Average estimated cost of finished sessions in the last 24 hours, grouped by model.",
       "type": "bargauge"
     },
     {
@@ -1155,8 +1197,8 @@
           "refId": "A"
         }
       ],
-      "title": "Skill events since start",
-      "description": "Skill lifecycle events observed by Claude Code hooks or proxy inference since the current clauditor-core start.",
+      "title": "Skill events since app start",
+      "description": "Skill events seen since the app last started. This resets when the app restarts.",
       "type": "stat"
     },
     {
@@ -1219,8 +1261,8 @@
           "refId": "A"
         }
       ],
-      "title": "Skill misses/failures since start",
-      "description": "Skill missed, misfired, or failed events since the current clauditor-core start.",
+      "title": "Skill problems since app start",
+      "description": "Missed, wrong, or failed skill events since the app last started.",
       "type": "stat"
     },
     {
@@ -1266,8 +1308,8 @@
           "refId": "A"
         }
       ],
-      "title": "MCP events since start",
-      "description": "MCP lifecycle events observed by hooks or proxy-derived metrics since the current clauditor-core start.",
+      "title": "External tool events since app start",
+      "description": "External tool-server events seen since the app last started. This resets when the app restarts.",
       "type": "stat"
     },
     {
@@ -1330,8 +1372,8 @@
           "refId": "A"
         }
       ],
-      "title": "MCP failures/denials since start",
-      "description": "Failed or denied MCP lifecycle events since the current clauditor-core start.",
+      "title": "External tool problems since app start",
+      "description": "External tool-server events that failed or were denied since the app last started.",
       "type": "stat"
     },
     {
@@ -1394,8 +1436,8 @@
           "refId": "A"
         }
       ],
-      "title": "Skill lifecycle by skill since start",
-      "description": "Current cumulative skill lifecycle counts by skill, event type, and source since the current clauditor-core start. Only non-zero rows are shown.",
+      "title": "Skill events by skill since app start",
+      "description": "Counts by skill, event type, and where the event came from. Only non-zero rows are shown.",
       "type": "table"
     },
     {
@@ -1458,8 +1500,8 @@
           "refId": "A"
         }
       ],
-      "title": "MCP lifecycle by tool since start",
-      "description": "Current cumulative MCP lifecycle counts by server, tool, event type, and source since the current clauditor-core start. Only non-zero rows are shown.",
+      "title": "External tool events by tool since app start",
+      "description": "Counts by server, tool, event type, and where the event came from. Only non-zero rows are shown.",
       "type": "table"
     }
   ],
@@ -1478,7 +1520,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Clauditor — estimated cost & quality over time",
+  "title": "Clauditor - cost and session health",
   "uid": "clauditor-main",
   "version": 3,
   "weekStart": "monday"

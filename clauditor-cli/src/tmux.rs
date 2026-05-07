@@ -36,7 +36,7 @@ pub fn bootstrap_into_tmux(
     url: &str,
     no_cache: bool,
     no_signals: bool,
-    no_postmortem: bool,
+    postmortem: bool,
     no_analyze_with_claude: bool,
     tmux_max_panes: usize,
 ) -> Result<(), String> {
@@ -74,8 +74,8 @@ pub fn bootstrap_into_tmux(
     if no_signals {
         args.push("--no-signals".into());
     }
-    if no_postmortem {
-        args.push("--no-postmortem".into());
+    if postmortem {
+        args.push("--postmortem".into());
     }
     if no_analyze_with_claude {
         args.push("--no-analyze-with-claude".into());
@@ -246,7 +246,7 @@ fn build_child_watch_command(
     watch_url: &str,
     no_cache: bool,
     no_signals: bool,
-    no_postmortem: bool,
+    postmortem: bool,
     no_analyze_with_claude: bool,
 ) -> String {
     let mut cmd_parts = vec![
@@ -263,8 +263,8 @@ fn build_child_watch_command(
     if no_signals {
         cmd_parts.push("--no-signals".to_string());
     }
-    if no_postmortem {
-        cmd_parts.push("--no-postmortem".to_string());
+    if postmortem {
+        cmd_parts.push("--postmortem".to_string());
     }
     if no_analyze_with_claude {
         cmd_parts.push("--no-analyze-with-claude".to_string());
@@ -313,7 +313,7 @@ pub struct TmuxOrchestrator {
     cli_path: String,
     no_cache: bool,
     no_signals: bool,
-    no_postmortem: bool,
+    postmortem: bool,
     no_analyze_with_claude: bool,
     max_panes: usize,
     rate_limit: Option<RateLimitSummary>,
@@ -324,7 +324,7 @@ impl TmuxOrchestrator {
         watch_url: String,
         no_cache: bool,
         no_signals: bool,
-        no_postmortem: bool,
+        postmortem: bool,
         no_analyze_with_claude: bool,
         max_panes: usize,
     ) -> Result<Self, String> {
@@ -340,7 +340,7 @@ impl TmuxOrchestrator {
             cli_path,
             no_cache,
             no_signals,
-            no_postmortem,
+            postmortem,
             no_analyze_with_claude,
             max_panes,
             rate_limit: None,
@@ -363,7 +363,7 @@ impl TmuxOrchestrator {
             &self.watch_url,
             self.no_cache,
             self.no_signals,
-            self.no_postmortem,
+            self.postmortem,
             self.no_analyze_with_claude,
         );
 
@@ -1080,7 +1080,7 @@ mod tests {
             cli_path: "clauditor".to_string(),
             no_cache: false,
             no_signals: false,
-            no_postmortem: false,
+            postmortem: false,
             no_analyze_with_claude: false,
             max_panes,
             rate_limit: None,
@@ -1131,7 +1131,7 @@ mod tests {
                 true,
                 true,
             ),
-            "'/tmp/clauditor cli' watch --session 'session with spaces' --url 'http://localhost:9091/watch?session=session with spaces' --no-cache --no-signals --no-postmortem --no-analyze-with-claude"
+            "'/tmp/clauditor cli' watch --session 'session with spaces' --url 'http://localhost:9091/watch?session=session with spaces' --no-cache --no-signals --postmortem --no-analyze-with-claude"
         );
     }
 

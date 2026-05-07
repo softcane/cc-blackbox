@@ -1,8 +1,8 @@
 # Clauditor
 
-Claude Code sessions sometimes go bad in ways that are hard to explain after the fact. A run gets slow, repeats tool calls, loses cache, nears compaction, routes to a different model, or burns far more tokens than expected. By the time you notice, the terminal scrollback rarely tells you what actually happened.
+Claude Code can quietly turn expensive or unproductive before it obviously fails. A session repeats tools, loses cache, drifts toward compaction, hits the wrong model route, or burns tokens while the terminal scrollback keeps moving. When you finally stop, it is hard to answer the basic question: what happened, and should I restart?
 
-Clauditor runs Claude Code through a local proxy and gives you a redacted postmortem for the session. It tells you the likely cause, the evidence behind it, the token and cost impact, and the next action worth taking. Live watch and Grafana are there when you need them, but the main output is simple: a useful postmortem after a watched `clauditor run` finishes.
+Clauditor runs Claude Code through a local proxy and gives you a redacted Postmortem for the session. It shows the session state, the signals that matter, the evidence behind the diagnosis, and the next action worth taking. Live watch and Grafana are there when you need them, but the first useful thing is the terminal Postmortem.
 
 The proxy, database, metrics, dashboard, and CLI run on your machine. Clauditor does not send telemetry to a hosted Clauditor service. Claude Code API traffic is proxied to Anthropic, and Claude-assisted postmortems ask Claude to analyze redacted evidence unless you disable that step.
 
@@ -13,75 +13,53 @@ The proxy, database, metrics, dashboard, and CLI run on your machine. Clauditor 
 ```bash
 clauditor run claude --watch
 # work normally, then end the session
-clauditor postmortem last --redact
+clauditor postmortem last
 ```
 
-`clauditor run ... --watch` prints a redacted postmortem after the child Claude process exits. A standalone `clauditor watch` process prints postmortems only while it is still running, either after the idle-postmortem checkpoint or after Clauditor later times out the session. You can also rerun the latest report at any time.
+The default workflow is to use watch for live activity, then run `clauditor postmortem last` when you want the report. Postmortems are redacted by default. `clauditor watch` does not print postmortems automatically unless you opt in with `--postmortem`, which keeps the watch stream readable during busy multi-session work.
 
 ```markdown
-# Clauditor Session Postmortem
+# Clauditor Postmortem
 
-## Summary
-- Session: `session_1776_abcd`
-- Status: redacted
-- Outcome: degraded
-- Model: claude-opus-4
-- Started: 2026-05-05T14:03:10Z
-- Ended: 2026-05-05T14:21:18Z
-- Duration: 18m
-- Turns: 7, tokens: 214K
-- Initial prompt: Initial prompt captured (redacted, 12 words).
-- Final response: Final response summary captured (redacted, 27 words).
+## Snapshot
+  Session       `session_1776_abcd`
+  State         final postmortem
+  Outcome       Degraded
+  Model         claude-sonnet-4-6
+  Duration      18m
+  Turns/tokens  7 turns, 214K
+  Cost          $4.91
 
-## Likely Cause
-- Cause: repeated tool loop after cache rebuild
-- Detail: Claude repeatedly read and edited the same files after a cache miss, then hit high context pressure.
-- Confidence: high
-- Next action: restart with a shorter prompt and the generated summary, then inspect the repeated Read/Edit path first.
+## Signals
+  Cause    Repeated cache rebuilds [heuristic]
+  Cache    Low: 42% reusable prompt cache; 36% of input from cache
+  Context  High: 87% full; about 1 turn before auto-compaction
+  Waste    Likely waste: 76K tokens, $1.84
+  Tools    14 calls, 0 failures; repeated: Read, Edit
+  Skills   No failed skill events detected
+  MCP      No failed MCP calls detected
+  Next     Restart with a shorter prompt and inspect the repeated Read/Edit path first.
 
 ## Evidence
-- [direct] cache: cache miss followed by 62K cache creation tokens
-- [direct] tools: 14 Read/Edit calls against `<path>`
-- [heuristic] context: peaked at 87% full with about 1 turn to compact
-- [direct] model: requested opus, response used sonnet
-
-## Token And Cost Impact
-- Total tokens: 214K (input 88K, cache read 64K, cache create 62K, output 432)
-- Estimated total cost: $4.91 (builtin_model_family_pricing)
-- Estimated likely waste: 76K tokens, $1.84
-- Cache reusable-prefix ratio: 42%
-- Total input cache rate: 36%
-- Context max: 87% full; inferred turns to compact: 1
-- Caveat: costs are estimates, not billing truth. Built-in pricing may exclude contract discounts, data residency, fast-mode modifiers, and server-tool charges unless you reconcile billed costs.
-
-## Timeline Highlights
-- 2026-05-05T14:03:10Z: session_started: Session row created.
-- 2026-05-05T14:17:42Z: turn 6, turn_signal: cache rebuild without long idle gap; context 87% full
-- 2026-05-05T14:21:18Z: session_ended: Degraded
-
-## Recommendations
-- Restart with a shorter prompt and the generated summary.
-- Inspect the repeated Read/Edit path first.
-
-## Caveats
-- This report is generated from local Clauditor SQLite data.
-- Context runway and some degradation causes are heuristics.
-- Redacted output omits raw prompts, absolute paths, query strings, secret-like values, and structured tool payloads.
+  Type        Signal        Turn   Detail
+  ----------  ------------  -----  ------
+  direct      cache         6      cache miss followed by 62K cache creation tokens
+  direct      tools         7      14 Read/Edit calls against the same redacted path
 
 ## Claude Analysis
-- Likely cause: Claude likely lost useful cached context, rebuilt a large prompt, and repeated edits while near compaction.
-- Confidence: high, because cache, tool, context, and model evidence all point at the same turn range.
-- What changed the user's decision: restarting is cheaper than continuing the degraded session.
-- Next action: start fresh with the final summary and ask for one file-level change at a time.
+  Status       Final - session degraded after a cache rebuild
+  Main signal  Read/Edit loop began after the cache miss
+  Risk         High - context estimate is heuristic, but the direct tool loop is enough to act
+  Next action  Restart with the summary and ask for one file-level change at a time
 
 ## Restart Prompt
-Continue from this summary. Make one file-level change at a time, and inspect the repeated Read/Edit path before editing.
+  Continue from this summary. Make one file-level change at a time, and inspect the repeated Read/Edit path before editing.
 ```
 
 Claude-assisted synthesis is on by default. It sends only the redacted postmortem JSON to Claude for analysis. For deterministic output without that extra Claude analysis call, run:
 
 ```bash
-clauditor postmortem last --redact --no-analyze-with-claude
+clauditor postmortem last --no-analyze-with-claude
 ```
 
 ## Quick Start
@@ -129,10 +107,11 @@ Clauditor is designed to be safe to try because it stays local and is easy to st
 
 Postmortems explain one session. Watch mode and Grafana help when you want live status or history across many sessions.
 
-- **Read the latest postmortem:** `clauditor postmortem last --redact`
-- **Force local-only postmortem synthesis:** `clauditor postmortem last --redact --no-analyze-with-claude`
+- **Read the latest postmortem:** `clauditor postmortem last`
+- **Force local-only postmortem synthesis:** `clauditor postmortem last --no-analyze-with-claude`
+- **Render local unredacted evidence:** `clauditor postmortem last --no-redact`
 - **Watch all active sessions:** `clauditor watch --url http://127.0.0.1:9091`
-- **Skip automatic postmortems while watching:** `clauditor watch --no-postmortem`
+- **Opt into automatic watch postmortems:** `clauditor watch --postmortem`
 - **Watch all sessions in tmux:** `clauditor watch --tmux`
 - **Watch one session:** `clauditor watch --session session_1776... --url http://127.0.0.1:9091`
 - **Review recent sessions:** `clauditor sessions --limit 20 --days 7`

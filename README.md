@@ -123,7 +123,7 @@ Postmortems explain one session. Watch mode and Grafana help when you want live 
 
 Open Grafana at [http://127.0.0.1:3000/d/cc-blackbox-main](http://127.0.0.1:3000/d/cc-blackbox-main). Anonymous viewer mode is enabled, and the local admin login is `admin` / `admin`.
 
-![grafana dashboard](docs/grafana-overview.png)
+![Grafana dashboard showing the last 5 minutes](docs/grafana-overview.png)
 
 Live watch output stays compact:
 

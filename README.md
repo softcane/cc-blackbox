@@ -125,15 +125,6 @@ Open Grafana at [http://127.0.0.1:3000/d/cc-blackbox-main](http://127.0.0.1:3000
 
 ![Grafana dashboard showing the last 5 minutes](docs/grafana-overview.png)
 
-Live watch output stays compact:
-
-```text
-[session-api]     14:03:11  READ    src/routes.rs
-[session-api]     14:03:13  CACHE   ○ miss (TTL inferred) · expires in 2m14s · est. rebuild $0.43
-[session-worker]  14:04:02  CONTEXT 82% full · inferred ~2 turns to auto-compact
-[session-auth]    14:05:20  ⚠ MODEL ROUTE requested opus, got sonnet
-```
-
 Replace `session_1776...` and `<session_id>` with real session IDs from watch output or `/api/sessions`. Recall searches the cleaned first prompt and compact final summary for each stored session. If you subscribe to a known in-progress session after it already started, cc-blackbox injects a synthetic `SessionStart` so the watcher still gets the session header and cleaned initial prompt.
 
 ### Links

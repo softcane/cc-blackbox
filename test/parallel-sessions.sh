@@ -27,13 +27,13 @@ echo "=== Parallel sessions regression test (N=$N) ==="
 
 # Stack must be running.
 if ! curl -sf http://localhost:9091/health >/dev/null; then
-    fail "clauditor-core not healthy at http://localhost:9091 — run 'docker compose up -d' first"
+    fail "cc-blackbox-core not healthy at http://localhost:9091 — run 'docker compose up -d' first"
 fi
 
 # Unique run marker so we only count hashes logged for requests from *this*
 # invocation. We inject it into the first user message.
 RUN_ID="parallel-$(date +%s)-$RANDOM"
-WORKDIR_TAG="/tmp/clauditor-parallel"
+WORKDIR_TAG="/tmp/cc-blackbox-parallel"
 
 # Fire N parallel requests with distinct first user messages.
 pids=()
@@ -63,7 +63,7 @@ sleep 2
 # Count distinct sys_prompt_hash values in a tight recent window. We pull the
 # last 30s of logs and then keep only entries from requests adjacent to ours,
 # which is good enough in practice because the test runs in under 5s.
-logs=$(docker compose logs --since 30s --no-color clauditor-core 2>/dev/null \
+logs=$(docker compose logs --since 30s --no-color cc-blackbox-core 2>/dev/null \
     | grep "$RUN_ID" || true)
 hashes=$(printf '%s\n' "$logs" \
     | grep -oE '"sys_prompt_hash":[-0-9]+' \

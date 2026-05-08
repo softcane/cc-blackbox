@@ -6,7 +6,7 @@ services:
     ports:
       - "127.0.0.1:10000:10000"
     depends_on:
-      clauditor-core:
+      cc-blackbox-core:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/10000'"]
@@ -14,21 +14,21 @@ services:
       timeout: 3s
       retries: 5
 
-  clauditor-core:
+  cc-blackbox-core:
     build:
       context: .
-      dockerfile: clauditor-core/Dockerfile
+      dockerfile: cc-blackbox-core/Dockerfile
     expose:
       - "50051"
     ports:
       - "127.0.0.1:9091:9090"
     environment:
       - RUST_LOG=info
-      - CLAUDITOR_SESSION_BUDGET_DOLLARS=0
-      - CLAUDITOR_SESSION_BUDGET_TOKENS=0
-      - CLAUDITOR_CIRCUIT_BREAKER_THRESHOLD=5
+      - CC_BLACKBOX_SESSION_BUDGET_DOLLARS=0
+      - CC_BLACKBOX_SESSION_BUDGET_TOKENS=0
+      - CC_BLACKBOX_CIRCUIT_BREAKER_THRESHOLD=5
     volumes:
-      - clauditor_data:/data
+      - cc_blackbox_data:/data
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/health"]
       interval: 5s
@@ -48,7 +48,7 @@ services:
       - "--storage.tsdb.retention.time=30d"
       - "--web.enable-lifecycle"
     depends_on:
-      clauditor-core:
+      cc-blackbox-core:
         condition: service_healthy
 
   grafana:
@@ -69,6 +69,6 @@ services:
       - prometheus
 
 volumes:
-  clauditor_data:
+  cc_blackbox_data:
   prometheus_data:
   grafana_data:

@@ -11,11 +11,11 @@ services:
     volumes:
       - ./test/envoy.e2e.yaml:/etc/envoy/envoy.yaml:ro
     depends_on:
-      clauditor-core:
+      cc-blackbox-core:
         condition: service_healthy
       fake-anthropic:
         condition: service_started
 
-  clauditor-core:
+  cc-blackbox-core:
     environment:
-      - CLAUDITOR_SESSION_TIMEOUT_MINUTES=1
+      - CC_BLACKBOX_SESSION_TIMEOUT_MINUTES=1

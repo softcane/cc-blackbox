@@ -280,6 +280,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "cc-blackbox-cli"
+version = "0.4.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "colored",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "cc-blackbox-core"
+version = "0.4.0"
+dependencies = [
+ "async-stream",
+ "axum 0.7.9",
+ "dashmap",
+ "futures-core",
+ "prometheus",
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tonic",
+ "tonic-build",
+ "tower 0.4.13",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -341,47 +382,6 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
-
-[[package]]
-name = "clauditor-cli"
-version = "0.2.0"
-dependencies = [
- "chrono",
- "clap",
- "colored",
- "futures-util",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "clauditor-core"
-version = "0.2.0"
-dependencies = [
- "async-stream",
- "axum 0.7.9",
- "dashmap",
- "futures-core",
- "prometheus",
- "prost",
- "prost-types",
- "protoc-bin-vendored",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "toml",
- "tonic",
- "tonic-build",
- "tower 0.4.13",
- "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "colorchoice"

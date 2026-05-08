@@ -52,7 +52,7 @@ jobs:
             fi
             sleep 2
           done
-          echo "clauditor-core did not become healthy in time"
+          echo "cc-blackbox-core did not become healthy in time"
           exit 1
 
       - name: Run parallel session regression
@@ -68,16 +68,16 @@ jobs:
       - name: Capture docker compose state on failure
         if: failure()
         run: |
-          mkdir -p /tmp/clauditor-ci
-          docker compose ps > /tmp/clauditor-ci/compose-ps.txt 2>&1 || true
-          docker compose logs --no-color > /tmp/clauditor-ci/compose-logs.txt 2>&1 || true
+          mkdir -p /tmp/cc-blackbox-ci
+          docker compose ps > /tmp/cc-blackbox-ci/compose-ps.txt 2>&1 || true
+          docker compose logs --no-color > /tmp/cc-blackbox-ci/compose-logs.txt 2>&1 || true
 
       - name: Upload failure logs
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: docker-compose-logs
-          path: /tmp/clauditor-ci
+          path: /tmp/cc-blackbox-ci
 
       - name: Tear down stack
         if: always()

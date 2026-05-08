@@ -1,4 +1,4 @@
-# Clauditor E2E Envoy proxy.
+# cc-blackbox E2E Envoy proxy.
 # This config mirrors envoy/envoy.yaml, but routes Anthropic traffic to the
 # deterministic fake upstream in test/docker-compose.e2e.yml.
 
@@ -60,7 +60,7 @@ static_resources:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
                       grpc_service:
                         envoy_grpc:
-                          cluster_name: clauditor_ext_proc
+                          cluster_name: cc_blackbox_ext_proc
                       failure_mode_allow: true
                       message_timeout: 10s
                       processing_mode:
@@ -88,7 +88,7 @@ static_resources:
                       address: fake-anthropic
                       port_value: 8000
 
-    - name: clauditor_ext_proc
+    - name: cc_blackbox_ext_proc
       type: STRICT_DNS
       connect_timeout: 1s
       typed_extension_protocol_options:
@@ -97,11 +97,11 @@ static_resources:
           explicit_http_config:
             http2_protocol_options: {}
       load_assignment:
-        cluster_name: clauditor_ext_proc
+        cluster_name: cc_blackbox_ext_proc
         endpoints:
           - lb_endpoints:
               - endpoint:
                   address:
                     socket_address:
-                      address: clauditor-core
+                      address: cc-blackbox-core
                       port_value: 50051

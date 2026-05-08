@@ -2,7 +2,7 @@
 
 ## Claude Code Hook Telemetry
 
-Add hooks like these to your Claude Code settings, for example `.claude/settings.local.json` for one project or `~/.claude/settings.json` globally. The Docker Compose stack exposes Clauditor on host port `9091`; if you run `clauditor-core` directly, use its default `9090` port instead.
+Add hooks like these to your Claude Code settings, for example `.claude/settings.local.json` for one project or `~/.claude/settings.json` globally. The Docker Compose stack exposes cc-blackbox on host port `9091`; if you run `cc-blackbox-core` directly, use its default `9090` port instead.
 
 ```json
 {
@@ -106,9 +106,9 @@ Add hooks like these to your Claude Code settings, for example `.claude/settings
 
 ## How It Works
 
-Claude Code points to a local envoy proxy. The proxy forwards normal API traffic to Anthropic and streams request/response metadata to `clauditor-core`. `clauditor-core` parses streamed responses, tracks sessions, writes local SQLite history, exposes `/watch`, `/metrics`, and JSON APIs, and feeds Prometheus and Grafana.
+Claude Code points to a local envoy proxy. The proxy forwards normal API traffic to Anthropic and streams request/response metadata to `cc-blackbox-core`. `cc-blackbox-core` parses streamed responses, tracks sessions, writes local SQLite history, exposes `/watch`, `/metrics`, and JSON APIs, and feeds Prometheus and Grafana.
 
-Fail-open behavior means the local proxy keeps routing even if `clauditor-core` dies, so observability is not a hard dependency for Claude Code traffic.
+Fail-open behavior means the local proxy keeps routing even if `cc-blackbox-core` dies, so observability is not a hard dependency for Claude Code traffic.
 
 ```text
 Claude Code  (ANTHROPIC_BASE_URL=http://127.0.0.1:10000)
@@ -116,13 +116,13 @@ Claude Code  (ANTHROPIC_BASE_URL=http://127.0.0.1:10000)
     v
 +---------------------------------------------+
 | Local proxy :10000                          |
-|   +-- metadata --> clauditor-core :50051    |
+|   +-- metadata --> cc-blackbox-core :50051    |
 |   +-- router   --> api.anthropic.com :443   |
 +---------------------------------------------+
                     |
                     v
           +---------------------------+
-          | clauditor-core            |
+          | cc-blackbox-core            |
           | Rust + tonic + axum       |
           | SSE parser                |
           | watch broadcaster         |
@@ -131,5 +131,5 @@ Claude Code  (ANTHROPIC_BASE_URL=http://127.0.0.1:10000)
           +---------------------------+
                     ^
                     |
-          clauditor watch / Grafana
+          cc-blackbox watch / Grafana
 ```

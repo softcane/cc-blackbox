@@ -1,8 +1,8 @@
-# Developing On Clauditor
+# Developing On cc-blackbox
 
 ```bash
 docker compose up -d --build
-docker compose logs -f clauditor-core
+docker compose logs -f cc-blackbox-core
 bash test/e2e.sh
 bash test/parallel-sessions.sh 4
 cargo fmt

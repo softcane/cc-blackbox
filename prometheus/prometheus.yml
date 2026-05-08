@@ -3,8 +3,8 @@ global:
   evaluation_interval: 15s
 
 scrape_configs:
-  - job_name: clauditor-core
+  - job_name: cc-blackbox-core
     metrics_path: /metrics
     static_configs:
       - targets:
-          - clauditor-core:9090
+          - cc-blackbox-core:9090

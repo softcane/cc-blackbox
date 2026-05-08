@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic Anthropic Messages API stand-in for Clauditor E2E tests."""
+"""Deterministic Anthropic Messages API stand-in for cc-blackbox E2E tests."""
 
 from __future__ import annotations
 

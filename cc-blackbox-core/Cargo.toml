@@ -1,0 +1,33 @@
+[package]
+name = "cc-blackbox-core"
+version = "0.4.0"
+edition = "2021"
+
+[[bin]]
+name = "cc-blackbox-core"
+path = "src/main.rs"
+
+[dependencies]
+tonic = "0.11"
+prost = "0.12"
+prost-types = "0.12"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "json", "env-filter"] }
+dashmap = "6"
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+regex = "1"
+async-stream = "0.3"
+futures-core = "0.3"
+prometheus = "0.13"
+toml = "0.8"
+
+[build-dependencies]
+tonic-build = "0.11"
+protoc-bin-vendored = "3"

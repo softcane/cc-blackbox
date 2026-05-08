@@ -1,6 +1,6 @@
-# Contributing to Clauditor
+# Contributing to cc-blackbox
 
-Clauditor is a local observability layer for Claude Code. The project is fairly
+cc-blackbox is a local observability layer for Claude Code. The project is fairly
 compact, but parts of the proxy path are load-bearing. This guide is the
 public, human-facing version of the contribution workflow and the invariants you
 should keep in mind before changing request handling, streaming, session
@@ -12,14 +12,14 @@ Prerequisites:
 
 - Rust toolchain
 - Docker / Docker Compose
-- tmux for `clauditor watch --tmux`
+- tmux for `cc-blackbox watch --tmux`
 
 Useful commands:
 
 ```bash
-cargo build --release -p clauditor-cli
+cargo build --release -p cc-blackbox-cli
 docker compose up -d --build
-docker compose logs -f clauditor-core
+docker compose logs -f cc-blackbox-core
 ```
 
 ## Checks to run before opening a PR
@@ -33,7 +33,7 @@ bash test/e2e.sh
 ```
 
 If your change touches session identity, broadcast ordering, `/watch`, or tmux
-watch mode, also exercise `clauditor watch --tmux` manually.
+watch mode, also exercise `cc-blackbox watch --tmux` manually.
 
 ## Load-bearing invariants
 
@@ -44,7 +44,7 @@ watch mode, also exercise `clauditor watch --tmux` manually.
 - **Response body mode must stay `STREAMED`.**
   Buffering the whole SSE response would break live `/watch`.
 - **Envoy must stay fail-open.**
-  `failure_mode_allow: true` is deliberate: if `clauditor-core` crashes,
+  `failure_mode_allow: true` is deliberate: if `cc-blackbox-core` crashes,
   Claude traffic should still reach Anthropic.
 - **`Accept-Encoding` is stripped on request headers.**
   Anthropic otherwise returns gzip SSE, and the parser expects plaintext.
@@ -68,13 +68,13 @@ watch mode, also exercise `clauditor watch --tmux` manually.
 
 ## Code map
 
-- `clauditor-core/src/main.rs` — ext_proc server, HTTP server, session
+- `cc-blackbox-core/src/main.rs` — ext_proc server, HTTP server, session
   lifecycle, response finalization
-- `clauditor-core/src/metrics.rs` — Prometheus registration and metric helpers
-- `clauditor-core/src/watch.rs` — watch event model and replay broadcaster
-- `clauditor-core/src/diagnosis.rs` — diagnosis and degradation analysis
-- `clauditor-cli/src/main.rs` — CLI commands and inline watch rendering
-- `clauditor-cli/src/tmux.rs` — tmux bootstrap and multi-pane orchestrator
+- `cc-blackbox-core/src/metrics.rs` — Prometheus registration and metric helpers
+- `cc-blackbox-core/src/watch.rs` — watch event model and replay broadcaster
+- `cc-blackbox-core/src/diagnosis.rs` — diagnosis and degradation analysis
+- `cc-blackbox-cli/src/main.rs` — CLI commands and inline watch rendering
+- `cc-blackbox-cli/src/tmux.rs` — tmux bootstrap and multi-pane orchestrator
 - `envoy/envoy.yaml` — the proxy/filter chain
 - `test/parallel-sessions.sh` — session identity regression
 - `test/e2e.sh` — full-stack smoke test
@@ -84,7 +84,7 @@ watch mode, also exercise `clauditor watch --tmux` manually.
 - If you change session identity or request parsing, run
   `bash test/parallel-sessions.sh 4`.
 - If you change watch replay, synthetic session start handling, or tmux
-  orchestration, test `clauditor watch --tmux` manually.
+  orchestration, test `cc-blackbox watch --tmux` manually.
 - If you change metrics names, update Grafana and tests in the same patch.
 - If you change the proxy behavior in `envoy/envoy.yaml`, be conservative:
   small misconfigurations can silently break all Claude Code traffic.
@@ -96,10 +96,10 @@ Pushing a tag like `v0.1.0` runs `.github/workflows/release.yml`.
 The release workflow:
 
 - builds CLI tarballs for macOS and Linux on x86_64 and arm64/aarch64
-- pushes `ghcr.io/softcane/clauditor-core:v0.1.0`
+- pushes `ghcr.io/softcane/cc-blackbox-core:v0.1.0`
 - publishes SHA-256 checksums and `install.sh` to the GitHub Release
 
-The installed CLI can run `clauditor up` without a git checkout. If it cannot
+The installed CLI can run `cc-blackbox up` without a git checkout. If it cannot
 find a repo-level compose file, it writes bundled stack assets under
-`$CLAUDITOR_HOME` or `~/.local/share/clauditor` and uses the released
-`clauditor-core` container image.
+`$CC_BLACKBOX_HOME` or `~/.local/share/cc-blackbox` and uses the released
+`cc-blackbox-core` container image.

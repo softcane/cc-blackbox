@@ -1,10 +1,10 @@
 #!/usr/bin/env sh
 set -eu
 
-repo="softcane/clauditor"
-bin_name="clauditor"
-install_dir="${CLAUDITOR_INSTALL_DIR:-$HOME/.local/bin}"
-version="${CLAUDITOR_VERSION:-latest}"
+repo="softcane/cc-blackbox"
+bin_name="cc-blackbox"
+install_dir="${CC_BLACKBOX_INSTALL_DIR:-$HOME/.local/bin}"
+version="${CC_BLACKBOX_VERSION:-latest}"
 
 need() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -77,7 +77,7 @@ need install
 need awk
 
 target="$(detect_target)"
-archive="clauditor-${target}.tar.gz"
+archive="cc-blackbox-${target}.tar.gz"
 base_url="https://github.com/${repo}/releases"
 if [ "$version" = "latest" ]; then
   artifact_url="${base_url}/latest/download/${archive}"
@@ -122,4 +122,4 @@ esac
 
 echo
 echo "Try:"
-echo "  clauditor doctor"
+echo "  cc-blackbox doctor"

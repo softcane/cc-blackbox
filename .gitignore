@@ -16,7 +16,7 @@ target/
 *~
 
 # Runtime state — SQLite DB + docker volumes created locally during dev
-clauditor_data/
+cc_blackbox_data/
 prometheus_data/
 grafana_data/
 *.db
@@ -32,11 +32,11 @@ docker-compose.override.yml
 
 # Demo recordings
 docs/demo.cast
-docs/clauditor-product-assessment.md
+docs/cc-blackbox-product-assessment.md
 docs/prd-postmortem-command.md
 
 # Scratch / logs
-/tmp/clauditor-repro/
+/tmp/cc-blackbox-repro/
 *.log
 
 # Planning docs (not shipped per CLAUDE.md)

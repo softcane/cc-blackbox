@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deterministic Clauditor end-to-end test.
+# Deterministic cc-blackbox end-to-end test.
 #
 # This intentionally does not run a real Claude Code session. Instead it routes
 # Envoy to test/fake-anthropic.py and drives Claude Code hook payloads directly.
@@ -25,7 +25,7 @@ for cmd in docker curl python3 sqlite3; do
     require_cmd "$cmd"
 done
 
-RUN_ID="${CLAUDITOR_E2E_RUN_ID:-e2e-$(date +%s)-$$}"
+RUN_ID="${CC_BLACKBOX_E2E_RUN_ID:-e2e-$(date +%s)-$$}"
 CORE_URL="http://localhost:9091"
 ENVOY_URL="http://localhost:10000"
 PROM_URL="http://localhost:9092"
@@ -38,25 +38,25 @@ compose() {
 }
 
 cleanup_e2e_stack_on_failure() {
-    if [ "$E2E_COMPLETED" = "1" ] || [ "${CLAUDITOR_E2E_KEEP_STACK:-0}" = "1" ]; then
+    if [ "$E2E_COMPLETED" = "1" ] || [ "${CC_BLACKBOX_E2E_KEEP_STACK:-0}" = "1" ]; then
         return
     fi
     compose down --remove-orphans -t 5 >/dev/null 2>&1 || true
 }
 
 restore_normal_stack() {
-    if [ "${CLAUDITOR_E2E_KEEP_STACK:-0}" = "1" ]; then
-        info "Leaving fake Anthropic E2E stack running because CLAUDITOR_E2E_KEEP_STACK=1"
+    if [ "${CC_BLACKBOX_E2E_KEEP_STACK:-0}" = "1" ]; then
+        info "Leaving fake Anthropic E2E stack running because CC_BLACKBOX_E2E_KEEP_STACK=1"
         return
     fi
 
     info "Stopping fake Anthropic E2E stack..."
     compose down --remove-orphans -t 5 >/dev/null
 
-    if [ "${CLAUDITOR_E2E_RESTORE_NORMAL_STACK:-1}" = "1" ]; then
-        info "Restoring normal Clauditor stack..."
+    if [ "${CC_BLACKBOX_E2E_RESTORE_NORMAL_STACK:-1}" = "1" ]; then
+        info "Restoring normal cc-blackbox stack..."
         docker compose up -d >/dev/null
-        pass "Normal Clauditor stack restored"
+        pass "Normal cc-blackbox stack restored"
     else
         pass "Fake Anthropic E2E stack stopped"
     fi
@@ -76,7 +76,7 @@ wait_for_core() {
         sleep 2
     done
     compose ps
-    fail "clauditor-core did not become healthy"
+    fail "cc-blackbox-core did not become healthy"
 }
 
 wait_for_envoy() {
@@ -117,7 +117,7 @@ payload = {
     "model": model,
     "max_tokens": 128,
     "stream": stream.lower() == "true",
-    "system": f"Primary working directory: /tmp/clauditor-e2e/{run_id}. Read-only E2E.",
+    "system": f"Primary working directory: /tmp/cc-blackbox-e2e/{run_id}. Read-only E2E.",
     "messages": [
         {
             "role": "user",
@@ -343,13 +343,13 @@ assert_json_python() {
     fi
 }
 
-echo "=== Clauditor deterministic E2E Test ==="
+echo "=== cc-blackbox deterministic E2E Test ==="
 info "run_id=$RUN_ID"
 info "Starting docker compose with fake Anthropic upstream..."
 compose down --remove-orphans -t 5 2>/dev/null || true
 compose up -d --build
 
-info "Waiting for clauditor-core and envoy..."
+info "Waiting for cc-blackbox-core and envoy..."
 wait_for_core
 wait_for_envoy
 
@@ -357,7 +357,7 @@ running=$(compose ps --status running -q | wc -l | tr -d ' ')
 [ "$running" -ge 5 ] && pass "E2E stack running ($running services)" || fail "Only $running services running"
 
 health=$(curl_core /health)
-[ "$health" = "ok" ] && pass "clauditor-core /health" || fail "clauditor-core /health returned: '$health'"
+[ "$health" = "ok" ] && pass "cc-blackbox-core /health" || fail "cc-blackbox-core /health returned: '$health'"
 
 info "Exercising Claude Code hook telemetry..."
 HOOK_A="hook_${RUN_ID}_kustomize"
@@ -384,10 +384,10 @@ pass "Envoy ext_proc observed fake streaming, delayed streaming, and JSON turns"
 sleep 4
 
 metrics=$(curl_core /metrics)
-grep -q "clauditor_requests_total" <<<"$metrics" && pass "Core request metrics registered" || fail "No request metrics"
-grep -q "clauditor_tool_calls_total" <<<"$metrics" && pass "Core tool metrics registered" || fail "No tool metrics"
-grep -q "clauditor_skill_events_total" <<<"$metrics" && pass "Core skill metrics registered" || fail "No skill metrics"
-grep -q "clauditor_mcp_events_total" <<<"$metrics" && pass "Core MCP metrics registered" || fail "No MCP metrics"
+grep -q "cc_blackbox_requests_total" <<<"$metrics" && pass "Core request metrics registered" || fail "No request metrics"
+grep -q "cc_blackbox_tool_calls_total" <<<"$metrics" && pass "Core tool metrics registered" || fail "No tool metrics"
+grep -q "cc_blackbox_skill_events_total" <<<"$metrics" && pass "Core skill metrics registered" || fail "No skill metrics"
+grep -q "cc_blackbox_mcp_events_total" <<<"$metrics" && pass "Core MCP metrics registered" || fail "No MCP metrics"
 
 summary=$(curl_core /api/summary)
 SUMMARY_JSON="$summary" assert_json_python "/api/summary includes sessions" 'import json, os; d=json.loads(os.environ["SUMMARY_JSON"]); assert d["today"]["sessions"] >= 2'
@@ -396,27 +396,27 @@ sessions_resp=$(curl_core /api/sessions)
 SESSIONS_JSON="$sessions_resp" assert_json_python "/api/sessions returns session list" 'import json, os; d=json.loads(os.environ["SESSIONS_JSON"]); assert isinstance(d.get("sessions"), list)'
 
 info "Waiting for Prometheus to scrape E2E metrics..."
-wait_prom_ge 'clauditor_tool_calls_total{tool="skill"}' 2 "Prometheus sees Skill tool calls"
-wait_prom_ge 'clauditor_tool_calls_total{tool="read"}' 1 "Prometheus sees Read tool calls"
-wait_prom_ge 'clauditor_tool_calls_total{tool="glob"}' 1 "Prometheus sees Glob tool calls"
-wait_prom_ge 'clauditor_skill_events_total{skill="platform-engineering_kustomize-helm-charts",event_type="fired",source="hook"}' 1 "Prometheus sees hook skill fired"
-wait_prom_ge 'clauditor_skill_events_total{skill="platform-engineering_kubernetes-cicd",event_type="fired",source="proxy"}' 1 "Prometheus sees proxy skill fired"
-wait_prom_ge 'clauditor_mcp_events_total{server="github",tool="get_issue",event_type="called",source="hook"}' 1 "Prometheus sees hook MCP call"
+wait_prom_ge 'cc_blackbox_tool_calls_total{tool="skill"}' 2 "Prometheus sees Skill tool calls"
+wait_prom_ge 'cc_blackbox_tool_calls_total{tool="read"}' 1 "Prometheus sees Read tool calls"
+wait_prom_ge 'cc_blackbox_tool_calls_total{tool="glob"}' 1 "Prometheus sees Glob tool calls"
+wait_prom_ge 'cc_blackbox_skill_events_total{skill="platform-engineering_kustomize-helm-charts",event_type="fired",source="hook"}' 1 "Prometheus sees hook skill fired"
+wait_prom_ge 'cc_blackbox_skill_events_total{skill="platform-engineering_kubernetes-cicd",event_type="fired",source="proxy"}' 1 "Prometheus sees proxy skill fired"
+wait_prom_ge 'cc_blackbox_mcp_events_total{server="github",tool="get_issue",event_type="called",source="hook"}' 1 "Prometheus sees hook MCP call"
 
 info "Checking Grafana API and provisioned dashboard..."
 grafana_health=$(curl -fsS "$GRAFANA_URL/api/health")
 GRAFANA_HEALTH="$grafana_health" assert_json_python "Grafana API healthy" 'import json, os; d=json.loads(os.environ["GRAFANA_HEALTH"]); assert d.get("database") == "ok"'
-grafana_search=$(curl -fsS "$GRAFANA_URL/api/search?query=Clauditor")
-GRAFANA_SEARCH="$grafana_search" assert_json_python "Grafana dashboard provisioned" 'import json, os; data=json.loads(os.environ["GRAFANA_SEARCH"]); assert any("Clauditor" in item.get("title","") for item in data)'
+grafana_search=$(curl -fsS "$GRAFANA_URL/api/search?query=cc-blackbox")
+GRAFANA_SEARCH="$grafana_search" assert_json_python "Grafana dashboard provisioned" 'import json, os; data=json.loads(os.environ["GRAFANA_SEARCH"]); assert any("cc-blackbox" in item.get("title","") for item in data)'
 
 info "Copying SQLite database and asserting run-scoped records..."
-CORE_CID=$(compose ps -q clauditor-core)
-compose stop clauditor-core >/dev/null
-DB_COPY="/tmp/clauditor-e2e-db-${RUN_ID}"
+CORE_CID=$(compose ps -q cc-blackbox-core)
+compose stop cc-blackbox-core >/dev/null
+DB_COPY="/tmp/cc-blackbox-e2e-db-${RUN_ID}"
 rm -rf "$DB_COPY"
 mkdir -p "$DB_COPY"
 docker cp "$CORE_CID:/data/." "$DB_COPY" >/dev/null
-DB_FILE="$DB_COPY/clauditor.db"
+DB_FILE="$DB_COPY/cc-blackbox.db"
 [ -f "$DB_FILE" ] || fail "SQLite database not found at $DB_FILE"
 
 PROXY_SESSION_FILTER="SELECT session_id FROM sessions WHERE initial_prompt LIKE '%${RUN_ID}%'"
@@ -431,18 +431,18 @@ assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM skill_events WHERE session_id IN 
 assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM mcp_events WHERE session_id IN ('$HOOK_A', '$HOOK_B') AND source = 'hook' AND event_type IN ('called', 'succeeded');" 4 "SQLite captured hook MCP lifecycle"
 
 info "Restarting core and verifying persisted data is readable..."
-compose start clauditor-core >/dev/null
+compose start cc-blackbox-core >/dev/null
 wait_for_core
 summary_after=$(curl_core /api/summary)
 SUMMARY_AFTER_JSON="$summary_after" assert_json_python "Data readable after core restart" 'import json, os; d=json.loads(os.environ["SUMMARY_AFTER_JSON"]); assert d["today"]["sessions"] >= 2'
 
 metrics_after=$(curl_core /metrics)
-grep -q "clauditor_history_estimated_spend_dollars" <<<"$metrics_after" \
+grep -q "cc_blackbox_history_estimated_spend_dollars" <<<"$metrics_after" \
     && pass "Historical spend metrics present after restart" \
     || fail "Historical spend metrics missing after restart"
 
 info "Testing Envoy failure_mode_allow against fake upstream..."
-compose stop clauditor-core >/dev/null
+compose stop cc-blackbox-core >/dev/null
 sleep 3
 failopen_payload=$(proxy_payload "$SKILL_A" "fail-open")
 failopen_response=$(curl -fsS --max-time 30 -N \
@@ -451,13 +451,13 @@ failopen_response=$(curl -fsS --max-time 30 -N \
     -H "content-type: application/json" \
     -d "$failopen_payload" \
     "$ENVOY_URL/v1/messages")
-compose start clauditor-core >/dev/null
+compose start cc-blackbox-core >/dev/null
 wait_for_core
 grep -q "message_stop" <<<"$failopen_response" \
-    && pass "failure_mode_allow preserves upstream traffic when clauditor-core is stopped" \
+    && pass "failure_mode_allow preserves upstream traffic when cc-blackbox-core is stopped" \
     || fail "failure_mode_allow response did not reach fake upstream: $failopen_response"
 
-size=$(docker images clauditor-clauditor-core --format '{{.Size}}' | head -1)
+size=$(docker images cc-blackbox-cc-blackbox-core --format '{{.Size}}' | head -1)
 pass "Docker image size: $size"
 
 echo ""

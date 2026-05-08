@@ -1,5 +1,5 @@
-# Clauditor Envoy proxy — Phase 2: ext_proc integration.
-# Forwards all processing phases to clauditor-core for observation.
+# cc-blackbox Envoy proxy — Phase 2: ext_proc integration.
+# Forwards all processing phases to cc-blackbox-core for observation.
 
 admin:
   address:
@@ -57,14 +57,14 @@ static_resources:
                           response_flags: "%RESPONSE_FLAGS%"
 
                 http_filters:
-                  # ext_proc: send all phases to clauditor-core for observation.
+                  # ext_proc: send all phases to cc-blackbox-core for observation.
                   - name: envoy.filters.http.ext_proc
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
                       grpc_service:
                         envoy_grpc:
-                          cluster_name: clauditor_ext_proc
-                      # If clauditor-core is down, traffic still flows.
+                          cluster_name: cc_blackbox_ext_proc
+                      # If cc-blackbox-core is down, traffic still flows.
                       failure_mode_allow: true
                       message_timeout: 10s
                       processing_mode:
@@ -103,8 +103,8 @@ static_resources:
               trusted_ca:
                 filename: /etc/ssl/certs/ca-certificates.crt
 
-    # ext_proc: clauditor-core gRPC service (HTTP/2 required).
-    - name: clauditor_ext_proc
+    # ext_proc: cc-blackbox-core gRPC service (HTTP/2 required).
+    - name: cc_blackbox_ext_proc
       type: STRICT_DNS
       connect_timeout: 1s
       typed_extension_protocol_options:
@@ -113,11 +113,11 @@ static_resources:
           explicit_http_config:
             http2_protocol_options: {}
       load_assignment:
-        cluster_name: clauditor_ext_proc
+        cluster_name: cc_blackbox_ext_proc
         endpoints:
           - lb_endpoints:
               - endpoint:
                   address:
                     socket_address:
-                      address: clauditor-core
+                      address: cc-blackbox-core
                       port_value: 50051

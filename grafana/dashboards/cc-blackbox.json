@@ -99,7 +99,7 @@
           "refId": "A"
         }
       ],
-      "title": "Estimated spend in the last 7 days",
+      "title": "7-day spend",
       "description": "Estimated dollars from all saved requests in the last 7 days. This is a local estimate, not your bill.",
       "type": "stat"
     },
@@ -146,7 +146,7 @@
           "refId": "A"
         }
       ],
-      "title": "Finished sessions in the last 7 days",
+      "title": "Finished sessions",
       "description": "Sessions with a saved final diagnosis in the last 7 days.",
       "type": "stat"
     },
@@ -210,7 +210,7 @@
           "refId": "A"
         }
       ],
-      "title": "Cache reused in the last 7 days",
+      "title": "7-day cache reuse",
       "description": "How much cached context was reused instead of being written again in saved requests from the last 7 days.",
       "type": "stat"
     },
@@ -274,7 +274,7 @@
           "refId": "A"
         }
       ],
-      "title": "Problem sessions in the last 7 days",
+      "title": "Problem sessions",
       "description": "Finished sessions in the last 7 days that cc-blackbox marked as having a real problem.",
       "type": "stat"
     },
@@ -338,7 +338,7 @@
           "refId": "A"
         }
       ],
-      "title": "Cache rebuild waste by model, last 24 hours",
+      "title": "Cache rebuild waste",
       "description": "Estimated dollars lost when cache expired or was rebuilt too soon, grouped by model.",
       "type": "bargauge"
     },
@@ -388,7 +388,7 @@
           "refId": "A"
         }
       ],
-      "title": "Model switches, last 24 hours",
+      "title": "Model switches",
       "description": "Times a request asked for one model family but the response came from another. Only non-zero switches are shown.",
       "type": "bargauge"
     },
@@ -548,7 +548,7 @@
           "refId": "A"
         }
       ],
-      "title": "Spend by model, last 24 hours",
+      "title": "24h spend by model",
       "description": "Estimated dollars from saved requests in the last 24 hours, grouped by model.",
       "type": "bargauge"
     },
@@ -724,7 +724,7 @@
           "refId": "H"
         }
       ],
-      "title": "Problem causes, last 7 days",
+      "title": "Problem causes",
       "description": "Reasons cc-blackbox marked finished sessions as having problems. Only non-zero causes are shown.",
       "type": "bargauge"
     },
@@ -866,7 +866,7 @@
           "refId": "A"
         }
       ],
-      "title": "Cache expired misses, last 24 hours",
+      "title": "Cache expired misses",
       "description": "Cache misses where the cached context expired before the next turn.",
       "type": "stat"
     },
@@ -930,7 +930,7 @@
           "refId": "A"
         }
       ],
-      "title": "Fast rebuild misses, last 24 hours",
+      "title": "Fast rebuild misses",
       "description": "Cache misses where context was rebuilt again soon after a previous rebuild.",
       "type": "stat"
     },
@@ -994,7 +994,7 @@
           "refId": "A"
         }
       ],
-      "title": "Tool failures, last 24 hours",
+      "title": "Tool failures",
       "description": "Tool results saved as errors in the last 24 hours.",
       "type": "stat"
     },
@@ -1050,7 +1050,7 @@
           "refId": "B"
         }
       ],
-      "title": "Cache expired/fast rebuild misses, last 24 hours",
+      "title": "Cache misses",
       "description": "The two cache-miss types that usually point to avoidable rebuild work.",
       "type": "bargauge"
     },
@@ -1100,7 +1100,7 @@
           "refId": "A"
         }
       ],
-      "title": "Tool failures by tool, last 24 hours",
+      "title": "Tool failures by tool",
       "description": "Tool errors from the last 24 hours, grouped by tool. Only tools with errors are shown.",
       "type": "bargauge"
     },
@@ -1150,7 +1150,7 @@
           "refId": "A"
         }
       ],
-      "title": "Average session cost by model, last 24 hours",
+      "title": "Avg session cost by model",
       "description": "Average estimated cost of finished sessions in the last 24 hours, grouped by model.",
       "type": "bargauge"
     },
@@ -1197,7 +1197,7 @@
           "refId": "A"
         }
       ],
-      "title": "Skill events since app start",
+      "title": "Skill events",
       "description": "Skill events seen since the app last started. This resets when the app restarts.",
       "type": "stat"
     },
@@ -1261,7 +1261,7 @@
           "refId": "A"
         }
       ],
-      "title": "Skill problems since app start",
+      "title": "Skill problems",
       "description": "Missed, wrong, or failed skill events since the app last started.",
       "type": "stat"
     },
@@ -1308,7 +1308,7 @@
           "refId": "A"
         }
       ],
-      "title": "External tool events since app start",
+      "title": "External tool events",
       "description": "External tool-server events seen since the app last started. This resets when the app restarts.",
       "type": "stat"
     },
@@ -1372,7 +1372,7 @@
           "refId": "A"
         }
       ],
-      "title": "External tool problems since app start",
+      "title": "External tool problems",
       "description": "External tool-server events that failed or were denied since the app last started.",
       "type": "stat"
     },
@@ -1436,7 +1436,7 @@
           "refId": "A"
         }
       ],
-      "title": "Skill events by skill since app start",
+      "title": "Skill events by skill",
       "description": "Counts by skill, event type, and where the event came from. Only non-zero rows are shown.",
       "type": "table"
     },
@@ -1500,7 +1500,7 @@
           "refId": "A"
         }
       ],
-      "title": "External tool events by tool since app start",
+      "title": "External tools by tool",
       "description": "Counts by server, tool, event type, and where the event came from. Only non-zero rows are shown.",
       "type": "table"
     }

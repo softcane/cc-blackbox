@@ -89,7 +89,7 @@ cc-blackbox run claude --watch
 cc-blackbox is designed to be safe to try because it stays local and is easy to stop using.
 
 - **Local-first:** The proxy, core service, SQLite database, metrics, dashboard, and CLI run on your machine. Ports bind to `127.0.0.1` by default.
-- **No full transcript storage:** cc-blackbox stores metrics, cleaned first-prompt excerpts, compact response summaries, and tool summaries, not full conversation history or raw file contents.
+- **Derived metadata storage:** cc-blackbox stores metrics, session facts, first-message hashes, and derived findings. It does not persist raw prompts, assistant text, tool outputs, file contents, or raw JSONL message text.
 - **Fails open:** If cc-blackbox stops, Claude Code traffic can keep going to Anthropic.
 - **Evidence is labeled:** Costs are estimates, context runway is heuristic, and model route mismatch reports observed requested/actual models without claiming provider cause.
 
@@ -125,7 +125,7 @@ Open Grafana at [http://127.0.0.1:3000/d/cc-blackbox-main](http://127.0.0.1:3000
 
 ![Grafana dashboard showing the last 5 minutes](docs/grafana-overview.png)
 
-Replace `session_1776...` and `<session_id>` with real session IDs from watch output or `/api/sessions`. Recall searches the cleaned first prompt and compact final summary for each stored session. If you subscribe to a known in-progress session after it already started, cc-blackbox injects a synthetic `SessionStart` so the watcher still gets the session header and cleaned initial prompt.
+Replace `session_1776...` and `<session_id>` with real session IDs from watch output or `/api/sessions`. Recall uses local metadata for stored sessions; new guard-mode persistence avoids raw prompt or assistant text. If you subscribe to a known in-progress session after it already started, cc-blackbox injects a synthetic `SessionStart` so the watcher still gets the session header and cleaned initial prompt.
 
 ### Links
 

@@ -237,6 +237,19 @@ pub(crate) enum WatchEvent {
         error_type: String,
         message: String,
     },
+    GuardFinding {
+        session_id: String,
+        rule_id: String,
+        severity: String,
+        action: String,
+        evidence_level: String,
+        source: String,
+        confidence: f64,
+        timestamp: String,
+        detail: String,
+        #[serde(default)]
+        suggested_action: Option<String>,
+    },
     SessionStart {
         session_id: String,
         display_name: String,
@@ -1326,6 +1339,7 @@ pub(crate) fn event_session_id(event: &WatchEvent) -> Option<&str> {
         | WatchEvent::Diagnosis { session_id, .. }
         | WatchEvent::CacheWarning { session_id, .. }
         | WatchEvent::RequestError { session_id, .. }
+        | WatchEvent::GuardFinding { session_id, .. }
         | WatchEvent::ModelFallback { session_id, .. }
         | WatchEvent::ContextStatus { session_id, .. } => Some(session_id.as_str()),
         WatchEvent::Lagged { .. } | WatchEvent::RateLimitStatus { .. } => None,
@@ -1787,6 +1801,48 @@ fn render_event(
                     .bold()
                     .to_string(),
             );
+        }
+
+        WatchEvent::GuardFinding {
+            session_id: _,
+            rule_id,
+            severity,
+            action,
+            evidence_level,
+            source,
+            confidence,
+            timestamp,
+            detail,
+            suggested_action,
+        } => {
+            let time = now_hms();
+            let advice = suggested_action
+                .as_deref()
+                .map(|text| format!("  \u{00b7} {}", text))
+                .unwrap_or_default();
+            let evidence = format!(
+                "{} \u{00b7} {} \u{00b7} {} \u{00b7} {:.0}% \u{00b7} {}",
+                severity,
+                evidence_level,
+                source,
+                confidence * 100.0,
+                timestamp
+            );
+            let line = format!(
+                "{}  GUARD {}  {}  \u{00b7} {}  \u{00b7} {}{}",
+                time,
+                action.to_ascii_uppercase(),
+                rule_id,
+                detail,
+                evidence,
+                advice
+            );
+            let rendered = if action == "block" || action == "cooldown" {
+                line.red().bold().to_string()
+            } else {
+                line.yellow().to_string()
+            };
+            print_tagged(&tag, &rendered);
         }
 
         WatchEvent::ModelFallback {
@@ -6248,6 +6304,21 @@ If failures recur, restart with a shorter prompt.\n\
             summary: "src/main.rs".to_string(),
         };
         assert_eq!(event_session_id(&event), Some("session_a"));
+        assert_eq!(
+            event_session_id(&WatchEvent::GuardFinding {
+                session_id: "session_guard".to_string(),
+                rule_id: "per_session_token_budget_exceeded".to_string(),
+                severity: "critical".to_string(),
+                action: "block".to_string(),
+                evidence_level: "direct_proxy".to_string(),
+                source: "proxy".to_string(),
+                confidence: 1.0,
+                timestamp: "2026-05-10T00:00:00Z".to_string(),
+                detail: "Session token budget exceeded.".to_string(),
+                suggested_action: Some("Start a fresh session.".to_string()),
+            }),
+            Some("session_guard")
+        );
 
         assert_eq!(
             event_session_id(&WatchEvent::RateLimitStatus {
@@ -6310,6 +6381,7 @@ If failures recur, restart with a shorter prompt.\n\
             r#"{"type":"compaction_loop","session_id":"s","consecutive":3,"wasted_tokens":12000}"#,
             r#"{"type":"diagnosis","session_id":"s","report":{"outcome":"Completed","total_turns":4,"total_tokens":123,"cache_hit_ratio":0.5,"degraded":false,"degradation_turn":null,"causes":[],"advice":[]}}"#,
             r#"{"type":"cache_warning","session_id":"s","idle_secs":240,"ttl_secs":300}"#,
+            r#"{"type":"guard_finding","session_id":"s","rule_id":"per_session_token_budget_exceeded","severity":"critical","action":"block","evidence_level":"direct_proxy","source":"proxy","confidence":1.0,"timestamp":"2026-05-10T00:00:00Z","detail":"Session token budget exceeded.","suggested_action":"Start a fresh session."}"#,
             r#"{"type":"model_fallback","session_id":"s","requested":"claude-opus-4-7","actual":"claude-sonnet-4-6"}"#,
             r#"{"type":"context_status","session_id":"s","fill_percent":72.5,"context_window_tokens":1000000,"turns_to_compact":2}"#,
             r#"{"type":"quota_burn_status","seconds_to_reset":3600,"tokens_used_this_week":10,"tokens_limit":100,"tokens_remaining":90,"budget_source":"env","projected_exhaustion_secs":1800}"#,

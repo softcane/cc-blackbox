@@ -30,6 +30,9 @@ pub enum EvidenceLevel {
     Heuristic,
     Derived,
     Direct,
+    DirectProxy,
+    DirectJsonl,
+    Inferred,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -37,6 +40,7 @@ pub enum EvidenceLevel {
 pub enum FindingSource {
     Proxy,
     Jsonl,
+    Heuristic,
     Policy,
 }
 
@@ -56,6 +60,29 @@ pub enum RuleId {
     JsonlOnlyToolFailureStreak,
     AmbiguousCacheTtlMiss,
     TaskAbandonmentInference,
+}
+
+impl fmt::Display for RuleId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = match self {
+            Self::PerSessionTokenBudgetExceeded => "per_session_token_budget_exceeded",
+            Self::PerSessionTrustedDollarBudgetExceeded => {
+                "per_session_trusted_dollar_budget_exceeded"
+            }
+            Self::ApiErrorCircuitBreakerCooldown => "api_error_circuit_breaker_cooldown",
+            Self::RepeatedCacheRebuilds => "repeated_cache_rebuilds",
+            Self::ContextNearWarningThreshold => "context_near_warning_threshold",
+            Self::ModelMismatch => "model_mismatch",
+            Self::SuspectedCompactionLoop => "suspected_compaction_loop",
+            Self::ToolFailureStreak => "tool_failure_streak",
+            Self::HighWeeklyProjectQuotaBurn => "high_weekly_project_quota_burn",
+            Self::NoProgressTurns => "no_progress_turns",
+            Self::JsonlOnlyToolFailureStreak => "jsonl_only_tool_failure_streak",
+            Self::AmbiguousCacheTtlMiss => "ambiguous_cache_ttl_miss",
+            Self::TaskAbandonmentInference => "task_abandonment_inference",
+        };
+        f.write_str(value)
+    }
 }
 
 impl RuleId {
@@ -84,6 +111,14 @@ impl RuleId {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RulePolicy {
     pub action: GuardAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_dollars: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -111,6 +146,7 @@ pub struct FindingDraft {
     pub turn_number: Option<u32>,
     pub timestamp: String,
     pub detail: String,
+    pub suggested_action: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -128,6 +164,46 @@ pub struct GuardFinding {
     pub turn_number: Option<u32>,
     pub timestamp: String,
     pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggested_action: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionBudgetObservation {
+    pub session_id: String,
+    pub total_tokens: u64,
+    pub trusted_spend_dollars: f64,
+    pub untrusted_spend_dollars: f64,
+    pub total_spend_dollars: f64,
+    pub request_count: u64,
+    pub estimated_cache_waste_dollars: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApiCooldownObservation {
+    pub session_id: Option<String>,
+    pub consecutive_errors: u64,
+    pub remaining_cooldown_secs: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct GuardBlock {
+    pub error_type: String,
+    pub reason: String,
+    pub rule_id: RuleId,
+    pub configured_threshold_or_limit: String,
+    pub current_observed_value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub suggested_next_action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_remaining_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RequestGuardDecision {
+    pub block: Option<GuardBlock>,
+    pub finding: Option<GuardFinding>,
 }
 
 #[derive(Clone, Debug)]
@@ -194,6 +270,7 @@ impl FindingDraft {
             turn_number: None,
             timestamp: timestamp.into(),
             detail: detail.into(),
+            suggested_action: None,
         }
     }
 
@@ -204,6 +281,11 @@ impl FindingDraft {
 
     pub fn with_turn_number(mut self, turn_number: u32) -> Self {
         self.turn_number = Some(turn_number);
+        self
+    }
+
+    pub fn with_suggested_action(mut self, suggested_action: impl Into<String>) -> Self {
+        self.suggested_action = Some(suggested_action.into());
         self
     }
 }
@@ -229,6 +311,189 @@ fn finding_with_action(draft: FindingDraft, action: GuardAction) -> GuardFinding
         turn_number: draft.turn_number,
         timestamp: draft.timestamp,
         detail: draft.detail,
+        suggested_action: draft.suggested_action,
+    }
+}
+
+impl RulePolicy {
+    fn with_action(action: GuardAction) -> Self {
+        Self {
+            action,
+            limit_tokens: None,
+            limit_dollars: None,
+            threshold_count: None,
+            cooldown_secs: None,
+        }
+    }
+}
+
+pub fn evaluate_session_budget_for_request(
+    policy: Option<&GuardPolicy>,
+    observation: Result<Option<SessionBudgetObservation>, String>,
+    timestamp: &str,
+) -> RequestGuardDecision {
+    let Some(policy) = policy else {
+        return RequestGuardDecision::default();
+    };
+    let Ok(Some(observation)) = observation else {
+        return RequestGuardDecision::default();
+    };
+
+    if let Some(limit) = policy
+        .rules
+        .get(&RuleId::PerSessionTokenBudgetExceeded)
+        .and_then(|rule| (rule.action == GuardAction::Block).then_some(rule.limit_tokens))
+        .flatten()
+    {
+        if observation.total_tokens >= limit {
+            let suggested =
+                "Start a fresh session, raise the per-session token limit, or disable the limit."
+                    .to_string();
+            let detail = format!(
+                "Session has used {} tokens across {} requests, crossing the configured {} token limit.",
+                observation.total_tokens, observation.request_count, limit
+            );
+            let draft = FindingDraft::new(
+                RuleId::PerSessionTokenBudgetExceeded,
+                FindingSeverity::Critical,
+                EvidenceLevel::DirectProxy,
+                FindingSource::Proxy,
+                1.0,
+                observation.session_id.clone(),
+                timestamp,
+                detail,
+            )
+            .with_suggested_action(suggested.clone());
+
+            return RequestGuardDecision {
+                block: Some(GuardBlock {
+                    error_type: "budget_exceeded".to_string(),
+                    reason: "Session token budget exceeded.".to_string(),
+                    rule_id: RuleId::PerSessionTokenBudgetExceeded,
+                    configured_threshold_or_limit: format!("{limit} tokens"),
+                    current_observed_value: format!("{} tokens", observation.total_tokens),
+                    session_id: Some(observation.session_id),
+                    suggested_next_action: suggested,
+                    cooldown_remaining_secs: None,
+                }),
+                finding: Some(policy.resolve_finding(draft)),
+            };
+        }
+    }
+
+    if let Some(limit) = policy
+        .rules
+        .get(&RuleId::PerSessionTrustedDollarBudgetExceeded)
+        .and_then(|rule| (rule.action == GuardAction::Block).then_some(rule.limit_dollars))
+        .flatten()
+    {
+        if observation.trusted_spend_dollars >= limit {
+            let suggested =
+                "Start a fresh session, raise the trusted-dollar limit, or disable the limit."
+                    .to_string();
+            let detail = format!(
+                "Session trusted spend is ${:.2} across {} requests, crossing the configured ${:.2} limit. Total estimated spend is ${:.2}; display-only untrusted spend is ${:.2}; estimated cache rebuild waste is ${:.2}.",
+                observation.trusted_spend_dollars,
+                observation.request_count,
+                limit,
+                observation.total_spend_dollars,
+                observation.untrusted_spend_dollars,
+                observation.estimated_cache_waste_dollars
+            );
+            let draft = FindingDraft::new(
+                RuleId::PerSessionTrustedDollarBudgetExceeded,
+                FindingSeverity::Critical,
+                EvidenceLevel::DirectProxy,
+                FindingSource::Proxy,
+                1.0,
+                observation.session_id.clone(),
+                timestamp,
+                detail,
+            )
+            .with_suggested_action(suggested.clone());
+
+            return RequestGuardDecision {
+                block: Some(GuardBlock {
+                    error_type: "budget_exceeded".to_string(),
+                    reason: "Session trusted-dollar budget exceeded.".to_string(),
+                    rule_id: RuleId::PerSessionTrustedDollarBudgetExceeded,
+                    configured_threshold_or_limit: format!("${limit:.2} trusted spend"),
+                    current_observed_value: format!(
+                        "${:.2} trusted spend",
+                        observation.trusted_spend_dollars
+                    ),
+                    session_id: Some(observation.session_id),
+                    suggested_next_action: suggested,
+                    cooldown_remaining_secs: None,
+                }),
+                finding: Some(policy.resolve_finding(draft)),
+            };
+        }
+    }
+
+    RequestGuardDecision::default()
+}
+
+pub fn evaluate_api_cooldown_for_request(
+    policy: Option<&GuardPolicy>,
+    observation: Result<Option<ApiCooldownObservation>, String>,
+    timestamp: &str,
+) -> RequestGuardDecision {
+    let Some(policy) = policy else {
+        return RequestGuardDecision::default();
+    };
+    let Ok(Some(observation)) = observation else {
+        return RequestGuardDecision::default();
+    };
+    let Some(rule) = policy.rules.get(&RuleId::ApiErrorCircuitBreakerCooldown) else {
+        return RequestGuardDecision::default();
+    };
+    if !matches!(rule.action, GuardAction::Cooldown | GuardAction::Block) {
+        return RequestGuardDecision::default();
+    }
+
+    let threshold = rule.threshold_count.unwrap_or(5);
+    let cooldown_secs = rule.cooldown_secs.unwrap_or(30);
+    let suggested =
+        "Wait for the cooldown to expire, fix the API error cause, or raise the cooldown policy."
+            .to_string();
+    let detail = format!(
+        "{} consecutive API errors opened a {}s cooldown; {}s remain.",
+        observation.consecutive_errors, cooldown_secs, observation.remaining_cooldown_secs
+    );
+    let session_id = observation
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let draft = FindingDraft::new(
+        RuleId::ApiErrorCircuitBreakerCooldown,
+        FindingSeverity::Critical,
+        EvidenceLevel::DirectProxy,
+        FindingSource::Proxy,
+        1.0,
+        session_id,
+        timestamp,
+        detail,
+    )
+    .with_suggested_action(suggested.clone());
+
+    RequestGuardDecision {
+        block: Some(GuardBlock {
+            error_type: "circuit_breaker".to_string(),
+            reason: "API error cooldown is active.".to_string(),
+            rule_id: RuleId::ApiErrorCircuitBreakerCooldown,
+            configured_threshold_or_limit: format!(
+                "{threshold} consecutive API errors; cooldown {cooldown_secs}s"
+            ),
+            current_observed_value: format!(
+                "{} consecutive API errors",
+                observation.consecutive_errors
+            ),
+            session_id: observation.session_id,
+            suggested_next_action: suggested,
+            cooldown_remaining_secs: Some(observation.remaining_cooldown_secs),
+        }),
+        finding: Some(policy.resolve_finding(draft)),
     }
 }
 
@@ -261,6 +526,10 @@ struct PolicyToml {
 #[derive(Deserialize)]
 struct RulePolicyToml {
     action: Option<GuardAction>,
+    limit_tokens: Option<u64>,
+    limit_dollars: Option<f64>,
+    threshold_count: Option<u64>,
+    cooldown_secs: Option<u64>,
 }
 
 impl GuardPolicy {
@@ -321,7 +590,39 @@ impl GuardPolicy {
                         }
                     })?;
                 if let Some(action) = overlay.action {
-                    policy.rules.insert(rule_id, RulePolicy { action });
+                    policy
+                        .rules
+                        .entry(rule_id)
+                        .and_modify(|rule| rule.action = action)
+                        .or_insert_with(|| RulePolicy::with_action(action));
+                }
+                if let Some(limit_tokens) = overlay.limit_tokens {
+                    policy
+                        .rules
+                        .entry(rule_id)
+                        .or_insert_with(|| RulePolicy::with_action(GuardAction::Allow))
+                        .limit_tokens = Some(limit_tokens);
+                }
+                if let Some(limit_dollars) = overlay.limit_dollars {
+                    policy
+                        .rules
+                        .entry(rule_id)
+                        .or_insert_with(|| RulePolicy::with_action(GuardAction::Allow))
+                        .limit_dollars = Some(limit_dollars);
+                }
+                if let Some(threshold_count) = overlay.threshold_count {
+                    policy
+                        .rules
+                        .entry(rule_id)
+                        .or_insert_with(|| RulePolicy::with_action(GuardAction::Allow))
+                        .threshold_count = Some(threshold_count);
+                }
+                if let Some(cooldown_secs) = overlay.cooldown_secs {
+                    policy
+                        .rules
+                        .entry(rule_id)
+                        .or_insert_with(|| RulePolicy::with_action(GuardAction::Allow))
+                        .cooldown_secs = Some(cooldown_secs);
                 }
             }
         }
@@ -369,7 +670,10 @@ fn unknown_policy_key_warnings(document: &toml::Value) -> Vec<String> {
             continue;
         };
         for field_key in rule_table.keys() {
-            if field_key != "action" {
+            if !matches!(
+                field_key.as_str(),
+                "action" | "limit_tokens" | "limit_dollars" | "threshold_count" | "cooldown_secs"
+            ) {
                 warnings.push(format!(
                     "unknown guard policy key `rules.{rule_key}.{field_key}` ignored"
                 ));
@@ -385,22 +689,16 @@ impl Default for GuardPolicy {
         let mut rules = BTreeMap::new();
         rules.insert(
             RuleId::PerSessionTokenBudgetExceeded,
-            RulePolicy {
-                action: GuardAction::Block,
-            },
+            RulePolicy::with_action(GuardAction::Block),
         );
         rules.insert(
             RuleId::PerSessionTrustedDollarBudgetExceeded,
-            RulePolicy {
-                action: GuardAction::Block,
-            },
+            RulePolicy::with_action(GuardAction::Block),
         );
-        rules.insert(
-            RuleId::ApiErrorCircuitBreakerCooldown,
-            RulePolicy {
-                action: GuardAction::Cooldown,
-            },
-        );
+        let mut api_error_policy = RulePolicy::with_action(GuardAction::Cooldown);
+        api_error_policy.threshold_count = Some(5);
+        api_error_policy.cooldown_secs = Some(30);
+        rules.insert(RuleId::ApiErrorCircuitBreakerCooldown, api_error_policy);
 
         for rule_id in [
             RuleId::RepeatedCacheRebuilds,
@@ -410,12 +708,7 @@ impl Default for GuardPolicy {
             RuleId::ToolFailureStreak,
             RuleId::HighWeeklyProjectQuotaBurn,
         ] {
-            rules.insert(
-                rule_id,
-                RulePolicy {
-                    action: GuardAction::Warn,
-                },
-            );
+            rules.insert(rule_id, RulePolicy::with_action(GuardAction::Warn));
         }
 
         for rule_id in [
@@ -424,12 +717,7 @@ impl Default for GuardPolicy {
             RuleId::AmbiguousCacheTtlMiss,
             RuleId::TaskAbandonmentInference,
         ] {
-            rules.insert(
-                rule_id,
-                RulePolicy {
-                    action: GuardAction::DiagnoseOnly,
-                },
-            );
+            rules.insert(rule_id, RulePolicy::with_action(GuardAction::DiagnoseOnly));
         }
 
         Self {
@@ -446,8 +734,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        evaluate_finding, EvidenceLevel, FindingDraft, FindingSeverity, FindingSource, GuardAction,
-        GuardPolicy, PolicyManager, RuleId,
+        evaluate_api_cooldown_for_request, evaluate_finding, evaluate_session_budget_for_request,
+        ApiCooldownObservation, EvidenceLevel, FindingDraft, FindingSeverity, FindingSource,
+        GuardAction, GuardPolicy, PolicyManager, RequestGuardDecision, RuleId,
+        SessionBudgetObservation,
     };
 
     fn unique_policy_path(test_name: &str) -> PathBuf {
@@ -527,6 +817,54 @@ action = "block"
                 .rule_action(RuleId::JsonlOnlyToolFailureStreak),
             GuardAction::DiagnoseOnly
         );
+
+        fs::remove_file(path).expect("remove policy fixture");
+    }
+
+    #[test]
+    fn toml_overrides_load_request_enforcement_thresholds() {
+        let path = unique_policy_path("request-thresholds");
+        fs::write(
+            &path,
+            r#"
+[rules.per_session_token_budget_exceeded]
+limit_tokens = 1500
+
+[rules.per_session_trusted_dollar_budget_exceeded]
+limit_dollars = 7.25
+
+[rules.api_error_circuit_breaker_cooldown]
+threshold_count = 3
+cooldown_secs = 90
+"#,
+        )
+        .expect("write policy fixture");
+
+        let loaded = GuardPolicy::load_effective_from_path(&path).expect("policy loads");
+
+        assert_eq!(
+            loaded
+                .policy
+                .rules
+                .get(&RuleId::PerSessionTokenBudgetExceeded)
+                .and_then(|rule| rule.limit_tokens),
+            Some(1500)
+        );
+        assert_eq!(
+            loaded
+                .policy
+                .rules
+                .get(&RuleId::PerSessionTrustedDollarBudgetExceeded)
+                .and_then(|rule| rule.limit_dollars),
+            Some(7.25)
+        );
+        let api_rule = loaded
+            .policy
+            .rules
+            .get(&RuleId::ApiErrorCircuitBreakerCooldown)
+            .expect("api rule exists");
+        assert_eq!(api_rule.threshold_count, Some(3));
+        assert_eq!(api_rule.cooldown_secs, Some(90));
 
         fs::remove_file(path).expect("remove policy fixture");
     }
@@ -674,6 +1012,186 @@ action = "page_the_user"
     }
 
     #[test]
+    fn crossed_token_budget_resolves_to_explainable_request_block() {
+        let mut policy = GuardPolicy::default();
+        policy
+            .rules
+            .get_mut(&RuleId::PerSessionTokenBudgetExceeded)
+            .expect("default token rule exists")
+            .limit_tokens = Some(100);
+
+        let decision = evaluate_session_budget_for_request(
+            Some(&policy),
+            Ok(Some(SessionBudgetObservation {
+                session_id: "session-token-block".to_string(),
+                total_tokens: 101,
+                trusted_spend_dollars: 0.0,
+                untrusted_spend_dollars: 0.0,
+                total_spend_dollars: 0.0,
+                request_count: 2,
+                estimated_cache_waste_dollars: 0.0,
+            })),
+            "2026-05-10T00:00:00Z",
+        );
+
+        let block = decision.block.expect("request should block");
+        assert_eq!(block.rule_id, RuleId::PerSessionTokenBudgetExceeded);
+        assert_eq!(block.reason, "Session token budget exceeded.");
+        assert_eq!(block.configured_threshold_or_limit, "100 tokens");
+        assert_eq!(block.current_observed_value, "101 tokens");
+        assert_eq!(block.session_id.as_deref(), Some("session-token-block"));
+        assert!(block
+            .suggested_next_action
+            .to_ascii_lowercase()
+            .contains("start a fresh session"));
+
+        let finding = decision.finding.expect("block emits finding");
+        assert_eq!(finding.action, GuardAction::Block);
+        assert_eq!(finding.evidence_level, EvidenceLevel::DirectProxy);
+        assert_eq!(finding.source, FindingSource::Proxy);
+        assert_eq!(finding.session_id, "session-token-block");
+    }
+
+    #[test]
+    fn crossed_trusted_dollar_budget_resolves_to_explainable_request_block() {
+        let mut policy = GuardPolicy::default();
+        policy
+            .rules
+            .get_mut(&RuleId::PerSessionTrustedDollarBudgetExceeded)
+            .expect("default dollar rule exists")
+            .limit_dollars = Some(2.5);
+
+        let decision = evaluate_session_budget_for_request(
+            Some(&policy),
+            Ok(Some(SessionBudgetObservation {
+                session_id: "session-dollar-block".to_string(),
+                total_tokens: 10,
+                trusted_spend_dollars: 2.75,
+                untrusted_spend_dollars: 4.0,
+                total_spend_dollars: 6.75,
+                request_count: 3,
+                estimated_cache_waste_dollars: 0.25,
+            })),
+            "2026-05-10T00:00:00Z",
+        );
+
+        let block = decision.block.expect("request should block");
+        assert_eq!(block.rule_id, RuleId::PerSessionTrustedDollarBudgetExceeded);
+        assert_eq!(block.reason, "Session trusted-dollar budget exceeded.");
+        assert_eq!(block.configured_threshold_or_limit, "$2.50 trusted spend");
+        assert_eq!(block.current_observed_value, "$2.75 trusted spend");
+        assert_eq!(block.session_id.as_deref(), Some("session-dollar-block"));
+
+        let finding = decision.finding.expect("block emits finding");
+        assert_eq!(finding.action, GuardAction::Block);
+        assert_eq!(
+            finding.rule_id,
+            RuleId::PerSessionTrustedDollarBudgetExceeded
+        );
+        assert!(finding.detail.contains("display-only untrusted spend"));
+    }
+
+    #[test]
+    fn untrusted_dollar_spend_does_not_hard_block_by_default() {
+        let mut policy = GuardPolicy::default();
+        policy
+            .rules
+            .get_mut(&RuleId::PerSessionTrustedDollarBudgetExceeded)
+            .expect("default dollar rule exists")
+            .limit_dollars = Some(2.5);
+
+        let decision = evaluate_session_budget_for_request(
+            Some(&policy),
+            Ok(Some(SessionBudgetObservation {
+                session_id: "session-untrusted-allow".to_string(),
+                total_tokens: 10,
+                trusted_spend_dollars: 0.0,
+                untrusted_spend_dollars: 50.0,
+                total_spend_dollars: 50.0,
+                request_count: 3,
+                estimated_cache_waste_dollars: 2.0,
+            })),
+            "2026-05-10T00:00:00Z",
+        );
+
+        assert_eq!(decision, RequestGuardDecision::default());
+    }
+
+    #[test]
+    fn active_api_error_cooldown_blocks_with_remaining_cooldown() {
+        let mut policy = GuardPolicy::default();
+        let api_rule = policy
+            .rules
+            .get_mut(&RuleId::ApiErrorCircuitBreakerCooldown)
+            .expect("default api cooldown rule exists");
+        api_rule.threshold_count = Some(3);
+        api_rule.cooldown_secs = Some(45);
+
+        let decision = evaluate_api_cooldown_for_request(
+            Some(&policy),
+            Ok(Some(ApiCooldownObservation {
+                session_id: Some("session-cooldown".to_string()),
+                consecutive_errors: 3,
+                remaining_cooldown_secs: 17,
+            })),
+            "2026-05-10T00:00:00Z",
+        );
+
+        let block = decision.block.expect("cooldown should block");
+        assert_eq!(block.error_type, "circuit_breaker");
+        assert_eq!(block.rule_id, RuleId::ApiErrorCircuitBreakerCooldown);
+        assert_eq!(
+            block.configured_threshold_or_limit,
+            "3 consecutive API errors; cooldown 45s"
+        );
+        assert_eq!(block.current_observed_value, "3 consecutive API errors");
+        assert_eq!(block.cooldown_remaining_secs, Some(17));
+        assert_eq!(block.session_id.as_deref(), Some("session-cooldown"));
+
+        let finding = decision.finding.expect("cooldown emits finding");
+        assert_eq!(finding.action, GuardAction::Cooldown);
+        assert_eq!(finding.rule_id, RuleId::ApiErrorCircuitBreakerCooldown);
+    }
+
+    #[test]
+    fn request_enforcement_fails_open_without_policy_or_detector_state() {
+        let observation = SessionBudgetObservation {
+            session_id: "session-fail-open".to_string(),
+            total_tokens: 1_000_000,
+            trusted_spend_dollars: 100.0,
+            untrusted_spend_dollars: 0.0,
+            total_spend_dollars: 100.0,
+            request_count: 20,
+            estimated_cache_waste_dollars: 0.0,
+        };
+
+        assert_eq!(
+            evaluate_session_budget_for_request(
+                None,
+                Ok(Some(observation)),
+                "2026-05-10T00:00:00Z",
+            ),
+            RequestGuardDecision::default()
+        );
+        assert_eq!(
+            evaluate_session_budget_for_request(
+                Some(&GuardPolicy::default()),
+                Err("detector failed".to_string()),
+                "2026-05-10T00:00:00Z",
+            ),
+            RequestGuardDecision::default()
+        );
+        assert_eq!(
+            evaluate_api_cooldown_for_request(
+                Some(&GuardPolicy::default()),
+                Err("cooldown detector failed".to_string()),
+                "2026-05-10T00:00:00Z",
+            ),
+            RequestGuardDecision::default()
+        );
+    }
+
+    #[test]
     fn serialized_findings_carry_metadata_without_raw_content_fields() {
         let draft = FindingDraft::new(
             RuleId::ModelMismatch,
@@ -736,5 +1254,30 @@ action = "page_the_user"
                 "finding exposed content-bearing field {forbidden_key}"
             );
         }
+    }
+
+    #[test]
+    fn phase3_provenance_labels_cover_proxy_jsonl_and_heuristic_evidence() {
+        let labels = serde_json::json!([
+            {
+                "source": FindingSource::Proxy,
+                "evidence_level": EvidenceLevel::DirectProxy,
+            },
+            {
+                "source": FindingSource::Jsonl,
+                "evidence_level": EvidenceLevel::DirectJsonl,
+            },
+            {
+                "source": FindingSource::Heuristic,
+                "evidence_level": EvidenceLevel::Inferred,
+            }
+        ]);
+
+        assert_eq!(labels[0]["source"], "proxy");
+        assert_eq!(labels[0]["evidence_level"], "direct_proxy");
+        assert_eq!(labels[1]["source"], "jsonl");
+        assert_eq!(labels[1]["evidence_level"], "direct_jsonl");
+        assert_eq!(labels[2]["source"], "heuristic");
+        assert_eq!(labels[2]["evidence_level"], "inferred");
     }
 }

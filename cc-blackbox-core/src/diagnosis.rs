@@ -196,20 +196,25 @@ fn estimate_cache_rebuild_waste_for_turn(model: &str, turn: &TurnSnapshot) -> f6
     .total_cost_dollars
 }
 
+fn response_error_message_metadata(message: Option<&str>) -> String {
+    let Some(message) = message.map(str::trim).filter(|message| !message.is_empty()) else {
+        return "no response error message was captured".to_string();
+    };
+    let words = message.split_whitespace().count();
+    let chars = message.chars().count();
+    format!("response error message captured (redacted, {words} words, {chars} chars)")
+}
+
 fn api_error_cause(turn: &TurnSnapshot) -> Option<DegradationCause> {
     let error_type = turn.response_error_type.as_deref()?;
-    let message = turn
-        .response_error_message
-        .as_deref()
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or("stream ended with an API error");
+    let message_metadata = response_error_message_metadata(turn.response_error_message.as_deref());
     Some(DegradationCause {
         turn_first_noticed: turn.turn_number,
         turn_last_noticed: None,
         cause_type: "api_error".to_string(),
         detail: format!(
-            "Claude API streaming error at turn {} ({}): {}",
-            turn.turn_number, error_type, message
+            "Claude API streaming error at turn {} ({}); {}.",
+            turn.turn_number, error_type, message_metadata
         ),
         estimated_cost: 0.0,
         estimated_wasted_tokens: None,
@@ -1074,6 +1079,10 @@ mod tests {
             .find(|cause| cause.cause_type == "api_error")
             .expect("api error cause");
         assert!(cause.detail.contains("overloaded_error"));
+        assert!(!cause.detail.contains("server overloaded"));
+        assert!(cause
+            .detail
+            .contains("response error message captured (redacted"));
         assert!(!cause.is_heuristic);
     }
 

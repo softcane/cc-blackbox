@@ -53,6 +53,7 @@ pub mod envoy {
     }
 }
 
+pub mod correlation;
 pub mod diagnosis;
 pub mod guard;
 pub mod metrics;
@@ -230,6 +231,7 @@ static RUNTIME_STATE: LazyLock<Mutex<RuntimeState>> =
     LazyLock::new(|| Mutex::new(RuntimeState::new()));
 static SESSION_BUDGETS: LazyLock<DashMap<String, SessionBudgetState>> = LazyLock::new(DashMap::new);
 static FALLBACK_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+const GUARD_POLICY_PATH_ENV: &str = "CC_BLACKBOX_GUARD_POLICY_PATH";
 
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard<'a, T> {
     match mutex.lock() {
@@ -250,72 +252,204 @@ fn fallback_request_id() -> String {
     format!("req_fallback_{nanos}_{counter}")
 }
 
-/// Check if request should be blocked by the process-wide circuit breaker.
-fn check_circuit_breaker() -> Option<(&'static str, String)> {
-    let runtime = lock_or_recover(&RUNTIME_STATE, "runtime_state");
+fn session_budget_observation(
+    session_id: Option<&str>,
+) -> Result<Option<guard::SessionBudgetObservation>, String> {
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
+    let Some(state) = SESSION_BUDGETS.get(session_id) else {
+        return Ok(None);
+    };
 
-    // Circuit breaker check.
-    if let Some(until) = runtime.circuit_open_until {
-        if Instant::now() < until {
-            let remaining = until.duration_since(Instant::now()).as_secs();
-            return Some((
-                "circuit_breaker",
-                format!(
-                    "cc-blackbox: circuit breaker open. {} consecutive errors detected. \
-                 Pausing requests for {}s to prevent runaway estimated cost.",
-                    runtime.consecutive_errors, remaining
-                ),
-            ));
+    Ok(Some(guard::SessionBudgetObservation {
+        session_id: session_id.to_string(),
+        total_tokens: state.total_tokens,
+        trusted_spend_dollars: state.trusted_spend,
+        untrusted_spend_dollars: state.untrusted_spend,
+        total_spend_dollars: state.total_spend,
+        request_count: state.request_count,
+        estimated_cache_waste_dollars: state.estimated_cache_waste_dollars,
+    }))
+}
+
+fn api_cooldown_observation(
+    session_id: Option<&str>,
+) -> Result<Option<guard::ApiCooldownObservation>, String> {
+    let mut runtime = lock_or_recover(&RUNTIME_STATE, "runtime_state");
+    let Some(until) = runtime.circuit_open_until else {
+        return Ok(None);
+    };
+    let now = Instant::now();
+    if now >= until {
+        runtime.circuit_open_until = None;
+        return Ok(None);
+    }
+
+    let remaining = until.duration_since(now);
+    let remaining_secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+    Ok(Some(guard::ApiCooldownObservation {
+        session_id: session_id.map(str::to_string),
+        consecutive_errors: runtime.consecutive_errors,
+        remaining_cooldown_secs: remaining_secs,
+    }))
+}
+
+fn record_api_response_for_guard(
+    status: u32,
+    has_parsed_model: bool,
+    policy: Option<&guard::GuardPolicy>,
+) {
+    if !has_parsed_model {
+        return;
+    }
+
+    let mut runtime = lock_or_recover(&RUNTIME_STATE, "runtime_state");
+    if status >= 400 {
+        runtime.consecutive_errors += 1;
+        let Some(policy) = policy else {
+            return;
+        };
+        let Some(rule) = policy
+            .rules
+            .get(&guard::RuleId::ApiErrorCircuitBreakerCooldown)
+        else {
+            return;
+        };
+        if !matches!(
+            rule.action,
+            guard::GuardAction::Cooldown | guard::GuardAction::Block
+        ) {
+            return;
+        }
+        let threshold = rule.threshold_count.unwrap_or(5);
+        let cooldown_secs = rule.cooldown_secs.unwrap_or(30);
+        if threshold > 0
+            && cooldown_secs > 0
+            && runtime.consecutive_errors >= threshold
+            && runtime.circuit_open_until.is_none()
+        {
+            runtime.circuit_open_until = Some(Instant::now() + Duration::from_secs(cooldown_secs));
+            warn!(
+                consecutive_errors = runtime.consecutive_errors,
+                http_status = status,
+                cooldown_secs,
+                "guard API error cooldown tripped"
+            );
+        }
+    } else {
+        runtime.consecutive_errors = 0;
+        if runtime.circuit_open_until.is_some() {
+            runtime.circuit_open_until = None;
+            info!("guard API error cooldown reset after successful response");
+        }
+    }
+}
+
+fn apply_legacy_env_limits(policy: &mut guard::GuardPolicy) {
+    let token_budget = env_u64("CC_BLACKBOX_SESSION_BUDGET_TOKENS", 0);
+    if token_budget > 0 {
+        if let Some(rule) = policy
+            .rules
+            .get_mut(&guard::RuleId::PerSessionTokenBudgetExceeded)
+        {
+            rule.limit_tokens = Some(token_budget);
         }
     }
 
+    let dollar_budget = env_f64("CC_BLACKBOX_SESSION_BUDGET_DOLLARS", 0.0);
+    if dollar_budget > 0.0 {
+        if let Some(rule) = policy
+            .rules
+            .get_mut(&guard::RuleId::PerSessionTrustedDollarBudgetExceeded)
+        {
+            rule.limit_dollars = Some(dollar_budget);
+        }
+    }
+
+    let api_threshold = env_u64("CC_BLACKBOX_CIRCUIT_BREAKER_THRESHOLD", 0);
+    if api_threshold > 0 {
+        if let Some(rule) = policy
+            .rules
+            .get_mut(&guard::RuleId::ApiErrorCircuitBreakerCooldown)
+        {
+            rule.threshold_count = Some(api_threshold);
+        }
+    }
+
+    let cooldown_secs = env_u64("CC_BLACKBOX_CIRCUIT_BREAKER_COOLDOWN_SECS", 0);
+    if cooldown_secs > 0 {
+        if let Some(rule) = policy
+            .rules
+            .get_mut(&guard::RuleId::ApiErrorCircuitBreakerCooldown)
+        {
+            rule.cooldown_secs = Some(cooldown_secs);
+        }
+    }
+}
+
+fn request_guard_policy() -> Option<guard::GuardPolicy> {
+    let mut policy = match std::env::var(GUARD_POLICY_PATH_ENV) {
+        Ok(path) if !path.trim().is_empty() => {
+            match guard::GuardPolicy::load_effective_from_path(Path::new(&path)) {
+                Ok(loaded) => loaded.policy,
+                Err(err) => {
+                    warn!(error = %err, "guard policy failed to load; allowing request");
+                    return None;
+                }
+            }
+        }
+        _ => guard::GuardPolicy::default(),
+    };
+    apply_legacy_env_limits(&mut policy);
+    Some(policy)
+}
+
+fn evaluate_request_guard_for_session(
+    session_id: Option<&str>,
+    policy: Option<&guard::GuardPolicy>,
+) -> Option<guard::RequestGuardDecision> {
+    let timestamp = now_iso8601();
+    let cooldown_decision = guard::evaluate_api_cooldown_for_request(
+        policy,
+        api_cooldown_observation(session_id),
+        &timestamp,
+    );
+    if cooldown_decision.block.is_some() {
+        return Some(cooldown_decision);
+    }
+
+    let budget_decision = guard::evaluate_session_budget_for_request(
+        policy,
+        session_budget_observation(session_id),
+        &timestamp,
+    );
+    if budget_decision.block.is_some() {
+        return Some(budget_decision);
+    }
+
     None
 }
 
-/// Check if the current session has exceeded its configured budget.
-fn check_session_budget(session_id: Option<&str>) -> Option<(&'static str, String)> {
-    let session_id = session_id?;
-    let state = SESSION_BUDGETS.get(session_id)?;
-
-    // Estimated-dollar budget check. Only per-request spend marked trusted by
-    // pricing resolution is enforceable; untrusted estimates remain display-only.
-    let budget = env_f64("CC_BLACKBOX_SESSION_BUDGET_DOLLARS", 0.0);
-    if budget > 0.0 && state.trusted_spend >= budget {
-        return Some(("budget_exceeded", format!(
-            "cc-blackbox: trusted estimated session budget exceeded (${:.2}). Trusted spend: ${:.2}; \
-             untrusted display-only spend: ${:.2}; total estimated spend: ${:.2} across {} requests. \
-             Estimated cache rebuild waste: ${:.2}. Reset with CC_BLACKBOX_SESSION_BUDGET_DOLLARS=0 or restart session.",
-            budget,
-            state.trusted_spend,
-            state.untrusted_spend,
-            state.total_spend,
-            state.request_count,
-            state.estimated_cache_waste_dollars
-        )));
-    }
-
-    // Token budget check.
-    let token_budget = env_u64("CC_BLACKBOX_SESSION_BUDGET_TOKENS", 0);
-    if token_budget > 0 && state.total_tokens >= token_budget {
-        return Some((
-            "budget_exceeded",
-            format!(
-                "cc-blackbox: token budget exceeded ({}). Used: {} tokens across {} requests. \
-             Reset with CC_BLACKBOX_SESSION_BUDGET_TOKENS=0 or restart session.",
-                token_budget, state.total_tokens, state.request_count
-            ),
-        ));
-    }
-
-    None
-}
-
-fn make_block_response(error_type: &str, message: &str) -> ProcessingResponse {
+fn make_guard_block_response(block: &guard::GuardBlock) -> ProcessingResponse {
+    let message = format!(
+        "cc-blackbox blocked this request: {} {}",
+        block.reason, block.suggested_next_action
+    );
     let body = serde_json::json!({
         "type": "error",
         "error": {
-            "type": error_type,
-            "message": message
+            "type": block.error_type,
+            "message": message,
+            "reason": block.reason,
+            "rule_id": block.rule_id,
+            "configured_threshold_or_limit": block.configured_threshold_or_limit,
+            "configured_limit": block.configured_threshold_or_limit,
+            "configured_threshold": block.configured_threshold_or_limit,
+            "current_observed_value": block.current_observed_value,
+            "session_id": block.session_id,
+            "suggested_next_action": block.suggested_next_action,
+            "cooldown_remaining_secs": block.cooldown_remaining_secs,
         }
     })
     .to_string();
@@ -343,6 +477,28 @@ fn make_block_response(error_type: &str, message: &str) -> ProcessingResponse {
     }
 }
 
+fn guard_finding_watch_event(finding: guard::GuardFinding) -> watch::WatchEvent {
+    watch::WatchEvent::GuardFinding {
+        session_id: finding.session_id,
+        rule_id: finding.rule_id,
+        severity: finding.severity,
+        action: finding.action,
+        evidence_level: finding.evidence_level,
+        source: finding.source,
+        confidence: finding.confidence,
+        timestamp: finding.timestamp,
+        detail: finding.detail,
+        suggested_action: finding.suggested_action,
+    }
+}
+
+fn broadcast_guard_finding(finding: guard::GuardFinding) {
+    let _ = DB_TX.send(DbCommand::WriteGuardFinding {
+        finding: finding.clone(),
+    });
+    watch::BROADCASTER.broadcast(guard_finding_watch_event(finding));
+}
+
 // ---------------------------------------------------------------------------
 // SQLite persistence (Phase 6)
 // ---------------------------------------------------------------------------
@@ -364,6 +520,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     cache_waste_dollars REAL DEFAULT 0.0,
     request_count INTEGER DEFAULT 0,
     model TEXT,
+    working_dir TEXT,
+    first_message_hash TEXT,
     initial_prompt TEXT
 );
 
@@ -495,12 +653,30 @@ CREATE TABLE IF NOT EXISTS billing_reconciliations (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
+CREATE TABLE IF NOT EXISTS guard_findings (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id       TEXT NOT NULL,
+    request_id       TEXT,
+    turn_number      INTEGER,
+    timestamp        TEXT NOT NULL,
+    rule_id          TEXT NOT NULL,
+    severity         TEXT NOT NULL,
+    action           TEXT NOT NULL,
+    source           TEXT NOT NULL,
+    evidence_level   TEXT NOT NULL,
+    confidence       REAL NOT NULL,
+    detail           TEXT NOT NULL,
+    suggested_action TEXT,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turn_snapshots(session_id, turn_number);
 CREATE INDEX IF NOT EXISTS idx_diagnoses_completed ON session_diagnoses(completed_at);
 CREATE INDEX IF NOT EXISTS idx_tool_outcomes_session ON tool_outcomes(session_id);
 CREATE INDEX IF NOT EXISTS idx_skill_events_session ON skill_events(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_mcp_events_session ON mcp_events(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_session_recall_session ON session_recall(session_id);
+CREATE INDEX IF NOT EXISTS idx_guard_findings_session ON guard_findings(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_billing_reconciliations_session_imported
     ON billing_reconciliations(session_id, imported_at DESC);
 ";
@@ -511,6 +687,8 @@ enum DbCommand {
         started_at: String,
         model: String,
         initial_prompt: Option<String>,
+        working_dir: String,
+        first_message_hash: String,
     },
     RecordRequest {
         request_id: String,
@@ -594,6 +772,9 @@ enum DbCommand {
         event_type: String,
         source: String,
         detail: Option<String>,
+    },
+    WriteGuardFinding {
+        finding: guard::GuardFinding,
     },
     WriteBillingReconciliation {
         session_id: String,
@@ -712,6 +893,15 @@ fn ensure_session_columns(conn: &Connection) -> rusqlite::Result<()> {
     if !columns.contains("initial_prompt") {
         conn.execute("ALTER TABLE sessions ADD COLUMN initial_prompt TEXT", [])?;
     }
+    if !columns.contains("working_dir") {
+        conn.execute("ALTER TABLE sessions ADD COLUMN working_dir TEXT", [])?;
+    }
+    if !columns.contains("first_message_hash") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN first_message_hash TEXT",
+            [],
+        )?;
+    }
     let added_last_activity_at = !columns.contains("last_activity_at");
     if added_last_activity_at {
         conn.execute("ALTER TABLE sessions ADD COLUMN last_activity_at TEXT", [])?;
@@ -761,6 +951,45 @@ fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
     )
     .optional()
     .map(|row| row.is_some())
+}
+
+fn derived_content_metadata(label: &str, value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let words = trimmed.split_whitespace().count();
+    let chars = trimmed.chars().count();
+    Some(format!(
+        "{label} captured (redacted, {words} words, {chars} chars)."
+    ))
+}
+
+fn is_derived_content_metadata(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.contains(" captured (redacted, ") && trimmed.ends_with(").")
+}
+
+fn content_metadata_for_storage(label: &str, value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if is_derived_content_metadata(trimmed) {
+        return Some(trimmed.to_string());
+    }
+    derived_content_metadata(label, trimmed)
+}
+
+fn derived_optional_content_metadata(label: &str, value: Option<String>) -> Option<String> {
+    value.and_then(|value| content_metadata_for_storage(label, &value))
+}
+
+fn serialized_label<T: serde::Serialize>(value: T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 fn ensure_request_cost_columns(conn: &Connection) -> rusqlite::Result<()> {
@@ -981,17 +1210,16 @@ fn persist_final_session_artifacts(
     }
 
     if let Some(recall) = recall {
+        let initial_prompt = content_metadata_for_storage("initial prompt", &recall.initial_prompt);
+        let final_response_summary =
+            content_metadata_for_storage("final response summary", &recall.final_response_summary);
         tx.execute(
             "INSERT INTO session_recall (session_id, initial_prompt, final_response_summary) \
              VALUES (?1,?2,?3) \
              ON CONFLICT(session_id) DO UPDATE SET \
                 initial_prompt = excluded.initial_prompt, \
                 final_response_summary = excluded.final_response_summary",
-            rusqlite::params![
-                session_id,
-                &recall.initial_prompt,
-                &recall.final_response_summary
-            ],
+            rusqlite::params![session_id, initial_prompt, final_response_summary],
         )?;
     }
 
@@ -1052,6 +1280,10 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
         eprintln!("Failed to repair session_diagnoses degradation turns: {e}");
         return;
     }
+    if let Err(e) = repair_legacy_raw_content_storage(&conn) {
+        eprintln!("Failed to repair legacy raw content storage: {e}");
+        return;
+    }
     if let Err(e) = seed_live_metric_labels_from_db(&conn) {
         eprintln!("Failed to seed live metric labels from SQLite: {e}");
         return;
@@ -1064,12 +1296,25 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 started_at,
                 model,
                 initial_prompt,
+                working_dir,
+                first_message_hash,
             } => {
+                let initial_prompt =
+                    derived_optional_content_metadata("initial prompt", initial_prompt);
+                let working_dir = normalize_working_dir(&working_dir);
                 let _ = conn.execute(
                     "INSERT OR IGNORE INTO sessions \
-                     (session_id, started_at, last_activity_at, model, initial_prompt) \
-                     VALUES (?1, ?2, ?2, ?3, ?4)",
-                    rusqlite::params![session_id, started_at, model, initial_prompt],
+                     (session_id, started_at, last_activity_at, model, working_dir, \
+                      first_message_hash, initial_prompt) \
+                     VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        session_id,
+                        started_at,
+                        model,
+                        working_dir,
+                        first_message_hash,
+                        initial_prompt
+                    ],
                 );
             }
             DbCommand::RecordRequest {
@@ -1097,6 +1342,8 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 tool_calls_list,
                 cache_event,
             } => {
+                let error_message =
+                    derived_optional_content_metadata("error message", error_message);
                 let inserted_rows = conn
                     .execute(
                     "INSERT OR IGNORE INTO requests (request_id, session_id, timestamp, model, \
@@ -1189,6 +1436,12 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 response_error_type,
                 response_error_message,
             } => {
+                let response_summary =
+                    derived_optional_content_metadata("assistant response", response_summary);
+                let response_error_message = derived_optional_content_metadata(
+                    "response error message",
+                    response_error_message,
+                );
                 let _ = conn.execute(
                     "INSERT INTO turn_snapshots (session_id, turn_number, timestamp, \
                      input_tokens, cache_read_tokens, cache_creation_tokens, output_tokens, \
@@ -1258,6 +1511,7 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 outcome,
                 duration_ms,
             } => {
+                let input_summary = content_metadata_for_storage("tool input", &input_summary);
                 let _ = conn.execute(
                     "INSERT INTO tool_outcomes (session_id, turn_number, timestamp, \
                      tool_name, input_summary, outcome, duration_ms) \
@@ -1282,6 +1536,7 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 source,
                 detail,
             } => {
+                let detail = derived_optional_content_metadata("event detail", detail);
                 let _ = conn.execute(
                     "INSERT INTO skill_events (session_id, timestamp, skill_name, event_type, \
                      confidence, source, detail) VALUES (?1,?2,?3,?4,?5,?6,?7)",
@@ -1299,11 +1554,39 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 source,
                 detail,
             } => {
+                let detail = derived_optional_content_metadata("event detail", detail);
                 let _ = conn.execute(
                     "INSERT INTO mcp_events (session_id, timestamp, server, tool, event_type, \
                      source, detail) VALUES (?1,?2,?3,?4,?5,?6,?7)",
                     rusqlite::params![
                         session_id, timestamp, server, tool, event_type, source, detail,
+                    ],
+                );
+            }
+            DbCommand::WriteGuardFinding { finding } => {
+                let rule_id = finding.rule_id.to_string();
+                let severity = serialized_label(finding.severity);
+                let action = serialized_label(finding.action);
+                let source = serialized_label(finding.source);
+                let evidence_level = serialized_label(finding.evidence_level);
+                let _ = conn.execute(
+                    "INSERT INTO guard_findings (
+                        session_id, request_id, turn_number, timestamp, rule_id, severity,
+                        action, source, evidence_level, confidence, detail, suggested_action
+                    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                    rusqlite::params![
+                        finding.session_id,
+                        finding.request_id,
+                        finding.turn_number,
+                        finding.timestamp,
+                        rule_id,
+                        severity,
+                        action,
+                        source,
+                        evidence_level,
+                        finding.confidence,
+                        finding.detail,
+                        finding.suggested_action,
                     ],
                 );
             }
@@ -4012,6 +4295,8 @@ fn ensure_session_inserted(
     sys_prompt_hash: u64,
     session_id: &str,
     model: &str,
+    working_dir: &str,
+    first_message_hash: &str,
     user_prompt_excerpt: &str,
 ) {
     let insert_info = {
@@ -4038,6 +4323,8 @@ fn ensure_session_inserted(
             started_at: now_iso8601(),
             model: model.to_string(),
             initial_prompt: initial_prompt.clone(),
+            working_dir: working_dir.to_string(),
+            first_message_hash: first_message_hash.to_string(),
         });
         watch::BROADCASTER.broadcast(watch::WatchEvent::SessionStart {
             session_id: session_id.to_string(),
@@ -4126,6 +4413,7 @@ fn finalize_response(
     tool_results: &[ParsedToolResult],
     sys_prompt_hash: u64,
     working_dir_str: &str,
+    first_message_hash: &str,
     user_prompt_excerpt: &str,
     context_window_tokens: u64,
     is_internal_request: bool,
@@ -4172,6 +4460,13 @@ fn finalize_response(
         (acc.http_status >= 400 && !acc.error_body.is_empty())
             .then(|| String::from_utf8_lossy(&acc.error_body).to_string())
     });
+    if acc.stream_error_type.is_some() {
+        let policy = request_guard_policy();
+        record_api_response_for_guard(500, !model.is_empty(), policy.as_ref());
+    } else if acc.http_status > 0 && acc.http_status < 400 {
+        let policy = request_guard_policy();
+        record_api_response_for_guard(acc.http_status, !model.is_empty(), policy.as_ref());
+    }
     let cache_event = if is_internal_request || acc.has_response_error() {
         "none"
     } else {
@@ -4225,7 +4520,14 @@ fn finalize_response(
     }
 
     if !is_internal_request {
-        ensure_session_inserted(sys_prompt_hash, &session_id, model, user_prompt_excerpt);
+        ensure_session_inserted(
+            sys_prompt_hash,
+            &session_id,
+            model,
+            working_dir_str,
+            first_message_hash,
+            user_prompt_excerpt,
+        );
 
         for tool_result in tool_results {
             if tool_result.is_error {
@@ -4728,12 +5030,143 @@ fn diagnosis_outcome_needs_refresh(outcome: Option<&str>) -> bool {
     )
 }
 
+fn repair_legacy_content_metadata_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    label: &str,
+) -> rusqlite::Result<usize> {
+    let select_sql = format!(
+        "SELECT rowid, {column} FROM {table} \
+         WHERE {column} IS NOT NULL AND trim({column}) != ''"
+    );
+    let mut stmt = conn.prepare(&select_sql)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|row| row.ok())
+        .collect::<Vec<_>>();
+
+    let update_sql = format!("UPDATE {table} SET {column} = ?1 WHERE rowid = ?2");
+    let mut repaired = 0usize;
+    for (rowid, current) in rows {
+        let Some(derived) = content_metadata_for_storage(label, &current) else {
+            continue;
+        };
+        if derived == current.trim() {
+            continue;
+        }
+        conn.execute(&update_sql, rusqlite::params![derived, rowid])?;
+        repaired += 1;
+    }
+    Ok(repaired)
+}
+
+fn legacy_api_error_detail_replacement(cause: &Value) -> String {
+    let turn = cause
+        .get("turn_first_noticed")
+        .and_then(|value| value.as_u64())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!(
+        "Claude API streaming error at turn {turn}; response error message captured as derived metadata."
+    )
+}
+
+fn repair_legacy_api_error_causes_value(causes: &mut Value) -> bool {
+    let Some(items) = causes.as_array_mut() else {
+        return false;
+    };
+
+    let mut changed = false;
+    for cause in items {
+        if cause.get("cause_type").and_then(|value| value.as_str()) != Some("api_error") {
+            continue;
+        }
+        let detail_is_already_derived = cause
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .is_some_and(|detail| {
+                detail.contains("response error message captured (redacted")
+                    || detail.contains("response error message captured as derived metadata")
+                    || detail.contains("no response error message was captured")
+            });
+        if detail_is_already_derived {
+            continue;
+        }
+        let replacement = legacy_api_error_detail_replacement(cause);
+        if let Some(object) = cause.as_object_mut() {
+            object.insert("detail".to_string(), Value::String(replacement));
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn repair_legacy_api_error_diagnosis_details(conn: &Connection) -> rusqlite::Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT rowid, causes_json FROM session_diagnoses \
+         WHERE causes_json IS NOT NULL AND trim(causes_json) != ''",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|row| row.ok())
+        .collect::<Vec<_>>();
+
+    let mut repaired = 0usize;
+    for (rowid, causes_json) in rows {
+        let Ok(mut causes) = serde_json::from_str::<Value>(&causes_json) else {
+            continue;
+        };
+        if !repair_legacy_api_error_causes_value(&mut causes) {
+            continue;
+        }
+        let repaired_json = serde_json::to_string(&causes).unwrap_or_else(|_| "[]".to_string());
+        conn.execute(
+            "UPDATE session_diagnoses SET causes_json = ?1 WHERE rowid = ?2",
+            rusqlite::params![repaired_json, rowid],
+        )?;
+        repaired += 1;
+    }
+    Ok(repaired)
+}
+
+fn repair_legacy_raw_content_storage(conn: &Connection) -> rusqlite::Result<()> {
+    for (table, column, label) in [
+        ("sessions", "initial_prompt", "initial prompt"),
+        ("requests", "error_message", "error message"),
+        ("turn_snapshots", "response_summary", "assistant response"),
+        (
+            "turn_snapshots",
+            "response_error_message",
+            "response error message",
+        ),
+        ("tool_outcomes", "input_summary", "tool input"),
+        ("skill_events", "detail", "event detail"),
+        ("mcp_events", "detail", "event detail"),
+        ("session_recall", "initial_prompt", "initial prompt"),
+        (
+            "session_recall",
+            "final_response_summary",
+            "final response summary",
+        ),
+    ] {
+        let _ = repair_legacy_content_metadata_column(conn, table, column, label)?;
+    }
+    let _ = repair_legacy_api_error_diagnosis_details(conn)?;
+    Ok(())
+}
+
 fn repair_persisted_session_artifacts(conn: &Connection) -> rusqlite::Result<()> {
     let _ = ensure_turn_snapshot_model_columns(conn);
     let _ = ensure_session_columns(conn);
     let _ = ensure_request_cost_columns(conn);
     let _ = repair_turn_snapshot_context_windows(conn);
     let _ = repair_session_diagnosis_degradation_turns(conn);
+    let _ = repair_legacy_raw_content_storage(conn);
     let cutoff = epoch_to_iso8601(now_epoch_secs().saturating_sub(session_timeout_secs()));
     let mut stmt = conn.prepare(
         "SELECT s.session_id, s.ended_at, s.initial_prompt, d.outcome, \
@@ -4813,6 +5246,8 @@ fn repair_persisted_session_artifacts(conn: &Connection) -> rusqlite::Result<()>
                 .unwrap_or_default();
             let prompt = initial_prompt.unwrap_or_default();
             if !prompt.is_empty() || !summary.is_empty() {
+                let prompt = content_metadata_for_storage("initial prompt", &prompt);
+                let summary = content_metadata_for_storage("final response summary", &summary);
                 let _ = conn.execute(
                     "INSERT OR IGNORE INTO session_recall (session_id, initial_prompt, final_response_summary) \
                      VALUES (?1,?2,?3)",
@@ -5456,6 +5891,7 @@ struct ParsedRequestBody {
     estimated_input_tokens: usize,
     sys_prompt_hash: u64,
     working_dir: String,
+    first_message_hash: String,
     user_prompt_excerpt: String,
     is_internal_request: bool,
     cache_ttl_evidence: Option<CacheTtlEvidence>,
@@ -5613,6 +6049,7 @@ fn parse_request_body(body: &[u8]) -> Option<ParsedRequestBody> {
     };
 
     let user_prompt_excerpt = clean_user_prompt(&first_user_message);
+    let first_message_hash = hash_text_hex(&first_user_message);
     let cache_ttl_evidence = request_cache_ttl_evidence(&v);
     let is_internal_request =
         is_internal_request_shape(&working_dir, sl, mc, ht, &user_prompt_excerpt);
@@ -5624,7 +6061,8 @@ fn parse_request_body(body: &[u8]) -> Option<ParsedRequestBody> {
         system_prompt_length: sl,
         estimated_input_tokens: body.len() / 4,
         sys_prompt_hash,
-        working_dir,
+        working_dir: normalize_working_dir(&working_dir),
+        first_message_hash,
         user_prompt_excerpt,
         is_internal_request,
         cache_ttl_evidence,
@@ -5782,6 +6220,21 @@ fn extract_working_dir(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn normalize_working_dir(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed == "/" {
+        return trimmed.to_string();
+    }
+    trimmed.trim_end_matches('/').to_string()
+}
+
+fn hash_text_hex(raw: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    raw.hash(&mut hasher);
+    format!("firstmsg_{:016x}", hasher.finish())
 }
 
 #[derive(Clone, Debug)]
@@ -6481,6 +6934,7 @@ impl ExternalProcessor for CcBlackboxProcessor {
             let mut tool_results: Vec<ParsedToolResult> = Vec::new();
             let mut sys_prompt_hash: u64 = 0;
             let mut working_dir_str = String::new();
+            let mut first_message_hash_buf = String::new();
             let mut user_prompt_excerpt_buf = String::new();
             let mut is_internal_request = false;
             let mut request_cache_ttl: Option<CacheTtlEvidence> = None;
@@ -6503,6 +6957,7 @@ impl ExternalProcessor for CcBlackboxProcessor {
                                 &tool_results,
                                 sys_prompt_hash,
                                 &working_dir_str,
+                                &first_message_hash_buf,
                                 &user_prompt_excerpt_buf,
                                 context_window_tokens,
                                 is_internal_request,
@@ -6523,6 +6978,7 @@ impl ExternalProcessor for CcBlackboxProcessor {
                                 &tool_results,
                                 sys_prompt_hash,
                                 &working_dir_str,
+                                &first_message_hash_buf,
                                 &user_prompt_excerpt_buf,
                                 context_window_tokens,
                                 is_internal_request,
@@ -6544,16 +7000,6 @@ impl ExternalProcessor for CcBlackboxProcessor {
                         request_context_window_hint = request_context_window_hint_from_headers(h);
                         context_window_tokens = configured_context_window_tokens()
                             .unwrap_or(STANDARD_CONTEXT_WINDOW_TOKENS);
-
-                        // Phase 7: process-wide circuit breaker.
-                        if let Some((err_type, msg)) = check_circuit_breaker() {
-                            warn!(request_id = %request_id, error_type = err_type, "request blocked");
-                            let response = make_block_response(err_type, &msg);
-                            if tx.send(Ok(response)).await.is_err() {
-                                break;
-                            }
-                            continue; // stream will close after immediate response
-                        }
 
                         let response = ProcessingResponse {
                             response: Some(ExtProcResponse::RequestHeaders(HeadersResponse {
@@ -6582,21 +7028,30 @@ impl ExternalProcessor for CcBlackboxProcessor {
                         match parse_request_body(&b.body) {
                             Some(parsed) => {
                                 info!(phase="request_body", request_id=%request_id, model=%parsed.model, message_count=parsed.message_count, has_tools=parsed.has_tools, system_prompt_length=parsed.system_prompt_length, estimated_input_tokens=parsed.estimated_input_tokens, sys_prompt_hash=parsed.sys_prompt_hash, "ext_proc");
-                                if let Some((err_type, msg)) = check_session_budget(
-                                    diagnosis::SESSIONS
-                                        .get(&parsed.sys_prompt_hash)
-                                        .as_deref()
-                                        .map(|state| state.session_id.as_str()),
+                                let session_id = diagnosis::SESSIONS
+                                    .get(&parsed.sys_prompt_hash)
+                                    .map(|state| state.session_id.clone());
+                                let policy = request_guard_policy();
+                                if let Some(decision) = evaluate_request_guard_for_session(
+                                    session_id.as_deref(),
+                                    policy.as_ref(),
                                 ) {
-                                    warn!(request_id = %request_id, error_type = err_type, "request blocked");
-                                    let response = make_block_response(err_type, &msg);
-                                    if tx.send(Ok(response)).await.is_err() {
-                                        break;
+                                    let finding = decision.finding.clone();
+                                    if let Some(block) = decision.block.as_ref() {
+                                        warn!(request_id = %request_id, error_type = %block.error_type, rule_id = %block.rule_id, "request blocked");
+                                        let response = make_guard_block_response(block);
+                                        if tx.send(Ok(response)).await.is_err() {
+                                            break;
+                                        }
+                                        if let Some(finding) = finding {
+                                            broadcast_guard_finding(finding);
+                                        }
+                                        blocked = true;
                                     }
-                                    blocked = true;
                                 }
                                 sys_prompt_hash = parsed.sys_prompt_hash;
                                 working_dir_str = parsed.working_dir;
+                                first_message_hash_buf = parsed.first_message_hash;
                                 // Only first turn carries a meaningful "initial prompt"; for mc>1
                                 // messages[0] is still the original, but we only register the
                                 // session once (see SESSIONS.get_mut in finalize_response), so
@@ -6675,40 +7130,20 @@ impl ExternalProcessor for CcBlackboxProcessor {
                         // token counters instead.
                         let _ = h;
 
-                        // Phase 7: circuit breaker — only track errors from real API requests
-                        // (ones where we parsed a model). Ignores envoy DPE/protocol errors.
-                        {
-                            let mut runtime = lock_or_recover(&RUNTIME_STATE, "runtime_state");
-                            if status >= 400 && !model.is_empty() {
-                                runtime.consecutive_errors += 1;
-                                let threshold = env_u64("CC_BLACKBOX_CIRCUIT_BREAKER_THRESHOLD", 5);
-                                if runtime.consecutive_errors >= threshold
-                                    && runtime.circuit_open_until.is_none()
-                                {
-                                    runtime.circuit_open_until =
-                                        Some(Instant::now() + Duration::from_secs(30));
-                                    warn!(
-                                        consecutive_errors = runtime.consecutive_errors,
-                                        http_status = status,
-                                        "circuit breaker tripped — blocking requests for 30s"
-                                    );
-                                }
-                            } else {
-                                runtime.consecutive_errors = 0;
-                                // Auto-reset circuit breaker on success.
-                                if runtime.circuit_open_until.is_some() {
-                                    runtime.circuit_open_until = None;
-                                    info!("circuit breaker reset after successful response");
-                                }
-                            }
-                        }
-
                         let response = ProcessingResponse {
                             response: Some(ExtProcResponse::ResponseHeaders(headers_continue())),
                             ..Default::default()
                         };
                         if tx.send(Ok(response)).await.is_err() {
                             break;
+                        }
+                        if status >= 400 {
+                            let policy = request_guard_policy();
+                            record_api_response_for_guard(
+                                status,
+                                !model.is_empty(),
+                                policy.as_ref(),
+                            );
                         }
                     }
                     Some(ExtProcRequest::ResponseBody(ref b)) => {
@@ -6739,6 +7174,8 @@ impl ExternalProcessor for CcBlackboxProcessor {
                                     sys_prompt_hash,
                                     &session_id,
                                     &model,
+                                    &working_dir_str,
+                                    &first_message_hash_buf,
                                     &user_prompt_excerpt_buf,
                                 );
                                 flush_deferred_watch_events(
@@ -6773,6 +7210,7 @@ impl ExternalProcessor for CcBlackboxProcessor {
                                     &tool_results,
                                     sys_prompt_hash,
                                     &working_dir_str,
+                                    &first_message_hash_buf,
                                     &user_prompt_excerpt_buf,
                                     context_window_tokens,
                                     is_internal_request,
@@ -6957,6 +7395,7 @@ fn event_matches_session(ev: &watch::WatchEvent, filter: Option<&str>) -> bool {
         | watch::WatchEvent::Diagnosis { session_id, .. }
         | watch::WatchEvent::CacheWarning { session_id, .. }
         | watch::WatchEvent::RequestError { session_id, .. }
+        | watch::WatchEvent::GuardFinding { session_id, .. }
         | watch::WatchEvent::ModelFallback { session_id, .. }
         | watch::WatchEvent::ContextStatus { session_id, .. } => session_id == want,
         watch::WatchEvent::RateLimitStatus { .. } => true,
@@ -8089,6 +8528,10 @@ async fn data_retention_cleanup() {
                 rusqlite::params![thirty_days_ago],
             );
             let _ = conn.execute(
+                "DELETE FROM guard_findings WHERE timestamp < ?1",
+                rusqlite::params![thirty_days_ago],
+            );
+            let _ = conn.execute(
                 "DELETE FROM session_recall WHERE session_id IN \
                  (SELECT session_id FROM session_diagnoses WHERE completed_at < ?1)",
                 rusqlite::params![ninety_days_ago],
@@ -8319,30 +8762,31 @@ mod tests {
         build_cache_rebuilds_response_from_db, build_diagnosis_response_json,
         build_postmortem_response_from_db, build_session_summary_json,
         build_sessions_response_json, build_summary_response_json, canonical_telemetry_name,
-        check_session_budget, classify_cache_event, clean_user_prompt, compact_response_summary,
-        context_fill_percent, context_fill_ratio, db_writer_loop, derive_display_name, diagnosis,
-        end_session_with_db_tx, ensure_session_columns, epoch_to_iso8601,
-        estimated_rebuild_cost_for_cache_event, extract_explicit_skill_refs, extract_header,
-        extract_headers, extract_working_dir, fallback_request_id, in_memory_postmortem_totals,
-        infer_context_window_tokens, is_internal_request_shape, load_degradation_view_from_db,
-        lock_or_recover, looks_like_machine_recall_line, looks_like_title_request, metrics,
-        model_requests_1m_context, normalize_search_text, now_epoch_secs,
+        classify_cache_event, clean_user_prompt, compact_response_summary, context_fill_percent,
+        context_fill_ratio, db_writer_loop, derive_display_name, diagnosis, end_session_with_db_tx,
+        ensure_session_columns, epoch_to_iso8601, estimated_rebuild_cost_for_cache_event,
+        evaluate_request_guard_for_session, extract_explicit_skill_refs, extract_header,
+        extract_headers, extract_working_dir, fallback_request_id, guard,
+        guard_finding_watch_event, in_memory_postmortem_totals, infer_context_window_tokens,
+        is_internal_request_shape, load_degradation_view_from_db, lock_or_recover,
+        looks_like_machine_recall_line, looks_like_title_request, make_guard_block_response,
+        metrics, model_requests_1m_context, normalize_search_text, now_epoch_secs,
         parse_latest_tool_results, parse_request_body, persist_billing_reconciliation,
         persist_final_session_artifacts, pricing, query_historical_metrics, query_summary,
-        redact_operational_text, repair_persisted_session_artifacts,
+        record_api_response_for_guard, redact_operational_text, repair_persisted_session_artifacts,
         repair_turn_snapshot_context_windows, request_cache_ttl_evidence, request_cache_ttl_secs,
-        request_context_window_hint_from_headers, request_uses_1m_context,
+        request_context_window_hint_from_headers, request_guard_policy, request_uses_1m_context,
         resolve_context_window_tokens, resolve_context_window_tokens_with_config,
         response_cache_ttl_secs, score_recall_doc, seed_live_metric_labels_from_db,
         session_state_if_still_expired, session_timeout_secs, should_broadcast_quota_snapshot,
         skill_name_from_skill_file, skill_name_from_tool_input_json, strip_model_1m_alias,
         summarize_hook_tool_input, tokenize_search_text, tool_recall_context, truncate_detail,
         upstream_request_adjustment_for_body, BillingReconciliationInput,
-        BillingReconciliationWriteError, CacheTracker, CacheTtlEvidence, DbCommand, HttpHeaders,
-        ParsedToolResult, PersistedDiagnosis, PersistedRecall, PostmortemError, ProtoHeaderValue,
-        ResponseAccumulator, SessionBudgetState, SummaryWindowData, ESTIMATED_COST_SOURCE,
-        EXTENDED_CONTEXT_WINDOW_TOKENS, QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA, SESSION_BUDGETS,
-        STANDARD_CONTEXT_WINDOW_TOKENS,
+        BillingReconciliationWriteError, CacheTracker, CacheTtlEvidence, DbCommand,
+        ExtProcResponse, HttpHeaders, ParsedToolResult, PersistedDiagnosis, PersistedRecall,
+        PostmortemError, ProtoHeaderValue, ResponseAccumulator, SessionBudgetState,
+        SummaryWindowData, ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS,
+        QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA, SESSION_BUDGETS, STANDARD_CONTEXT_WINDOW_TOKENS,
     };
 
     static METRICS_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -8377,6 +8821,19 @@ mod tests {
         }
     }
 
+    fn reset_runtime_state_for_test() {
+        let mut runtime = lock_or_recover(&super::RUNTIME_STATE, "runtime_state_test");
+        *runtime = super::RuntimeState::new();
+    }
+
+    fn unique_temp_path(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("cc-blackbox-{label}-{nanos}.toml"))
+    }
+
     fn create_history_test_db() -> Connection {
         let conn = Connection::open_in_memory().expect("open sqlite");
         conn.execute_batch(
@@ -8386,6 +8843,8 @@ mod tests {
                 last_activity_at TEXT,
                 ended_at TEXT,
                 model TEXT,
+                working_dir TEXT,
+                first_message_hash TEXT,
                 initial_prompt TEXT
             );
             CREATE TABLE requests (
@@ -9251,14 +9710,17 @@ mod tests {
         let last_activity_at = ended_at.unwrap_or(started_at);
         conn.execute(
             "INSERT INTO sessions \
-             (session_id, started_at, last_activity_at, ended_at, model, initial_prompt) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (session_id, started_at, last_activity_at, ended_at, model, working_dir, \
+              first_message_hash, initial_prompt) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 session_id,
                 started_at,
                 last_activity_at,
                 ended_at,
                 model,
+                "/tmp/cc-blackbox-test",
+                "firstmsg_test",
                 initial_prompt
             ],
         )
@@ -9429,6 +9891,290 @@ mod tests {
             response_error_type: None,
             response_error_message: None,
         }
+    }
+
+    #[test]
+    fn db_writer_persists_only_derived_metadata_not_raw_content() {
+        let path = unique_test_db_path("privacy-derived-metadata");
+        let (tx, rx) = std_mpsc::channel();
+        let writer_path = path.clone();
+        let handle = std::thread::spawn(move || db_writer_loop(&writer_path, rx));
+
+        let raw_prompt = "RAW_PROMPT_SECRET_41";
+        let raw_assistant = "RAW_ASSISTANT_TEXT_42";
+        let raw_tool_input = "/tmp/RAW_FILE_CONTENT_SECRET_43.rs";
+        let raw_error = "RAW_TOOL_OUTPUT_44";
+        let raw_skill_detail = "RAW_SKILL_DETAIL_45";
+        let raw_mcp_detail = "RAW_MCP_DETAIL_46";
+
+        tx.send(DbCommand::InsertSession {
+            session_id: "session-privacy-db".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            model: "claude-sonnet".to_string(),
+            initial_prompt: Some(raw_prompt.to_string()),
+            working_dir: "/tmp/privacy".to_string(),
+            first_message_hash: "firstmsg_privacy".to_string(),
+        })
+        .expect("queue session insert");
+        let mut request = test_record_request_command(
+            "req-privacy-db",
+            "session-privacy-db",
+            "2026-01-01T00:01:00Z",
+        );
+        if let DbCommand::RecordRequest { error_message, .. } = &mut request {
+            *error_message = Some(raw_error.to_string());
+        }
+        tx.send(request).expect("queue request");
+
+        tx.send(DbCommand::WriteTurnSnapshot {
+            session_id: "session-privacy-db".to_string(),
+            turn_number: 1,
+            timestamp: "2026-01-01T00:01:00Z".to_string(),
+            input_tokens: 1_000,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_ttl_min_secs: 300,
+            cache_ttl_max_secs: 300,
+            cache_ttl_source: "default_5m".to_string(),
+            output_tokens: 100,
+            ttft_ms: 10,
+            tool_calls_json: r#"["Read"]"#.to_string(),
+            tool_failures: 1,
+            gap_from_prev_secs: 0.0,
+            context_utilization: 0.01,
+            context_window_tokens: STANDARD_CONTEXT_WINDOW_TOKENS,
+            frustration_signals: 0,
+            requested_model: Some("claude-sonnet".to_string()),
+            actual_model: Some("claude-sonnet".to_string()),
+            response_summary: Some(raw_assistant.to_string()),
+            response_error_type: Some("tool_error".to_string()),
+            response_error_message: Some(raw_error.to_string()),
+        })
+        .expect("queue turn snapshot");
+        tx.send(DbCommand::WriteToolOutcome {
+            session_id: "session-privacy-db".to_string(),
+            turn_number: 1,
+            timestamp: "2026-01-01T00:01:00Z".to_string(),
+            tool_name: "Read".to_string(),
+            input_summary: raw_tool_input.to_string(),
+            outcome: "error".to_string(),
+            duration_ms: 11,
+        })
+        .expect("queue tool outcome");
+        tx.send(DbCommand::WriteSkillEvent {
+            session_id: "session-privacy-db".to_string(),
+            timestamp: "2026-01-01T00:01:00Z".to_string(),
+            skill_name: "qa".to_string(),
+            event_type: "failed".to_string(),
+            confidence: 1.0,
+            source: "hook".to_string(),
+            detail: Some(raw_skill_detail.to_string()),
+        })
+        .expect("queue skill event");
+        tx.send(DbCommand::WriteMcpEvent {
+            session_id: "session-privacy-db".to_string(),
+            timestamp: "2026-01-01T00:01:00Z".to_string(),
+            server: "filesystem".to_string(),
+            tool: "read_file".to_string(),
+            event_type: "failed".to_string(),
+            source: "hook".to_string(),
+            detail: Some(raw_mcp_detail.to_string()),
+        })
+        .expect("queue mcp event");
+
+        let (response_tx, response_rx) = std_mpsc::channel();
+        tx.send(DbCommand::FinalizeSession {
+            session_id: "session-privacy-db".to_string(),
+            ended_at: "2026-01-01T00:02:00Z".to_string(),
+            diagnosis: PersistedDiagnosis {
+                completed_at: "2026-01-01T00:02:00Z".to_string(),
+                outcome: "Likely Completed".to_string(),
+                total_turns: 1,
+                total_cost: 0.01,
+                cache_hit_ratio: 0.0,
+                degraded: false,
+                degradation_turn: None,
+                causes_json: "[]".to_string(),
+                advice_json: "[]".to_string(),
+            },
+            recall: Some(PersistedRecall {
+                initial_prompt: raw_prompt.to_string(),
+                final_response_summary: raw_assistant.to_string(),
+            }),
+            response_tx,
+        })
+        .expect("queue finalization");
+        response_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("finalization ack")
+            .expect("finalization ok");
+        drop(tx);
+        handle.join().expect("db writer exits");
+
+        let conn = Connection::open(&path).expect("open test db");
+        let mut persisted_text = String::new();
+        for sql in [
+            "SELECT COALESCE(initial_prompt, '') FROM sessions",
+            "SELECT COALESCE(error_message, '') || ' ' || COALESCE(tool_calls, '') FROM requests",
+            "SELECT COALESCE(response_summary, '') || ' ' || COALESCE(response_error_message, '') || ' ' || COALESCE(tool_calls, '') FROM turn_snapshots",
+            "SELECT COALESCE(input_summary, '') || ' ' || COALESCE(outcome, '') FROM tool_outcomes",
+            "SELECT COALESCE(detail, '') FROM skill_events",
+            "SELECT COALESCE(detail, '') FROM mcp_events",
+            "SELECT COALESCE(initial_prompt, '') || ' ' || COALESCE(final_response_summary, '') FROM session_recall",
+        ] {
+            let mut stmt = conn.prepare(sql).expect("prepare privacy query");
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query privacy rows");
+            for row in rows {
+                persisted_text.push_str(&row.expect("text row"));
+                persisted_text.push('\n');
+            }
+        }
+
+        for forbidden in [
+            raw_prompt,
+            raw_assistant,
+            raw_tool_input,
+            raw_error,
+            raw_skill_detail,
+            raw_mcp_detail,
+        ] {
+            assert!(
+                !persisted_text.contains(forbidden),
+                "persisted raw content sample {forbidden}: {persisted_text}"
+            );
+        }
+
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn session_rows_keep_correlation_metadata_without_hash_input() {
+        let path = unique_test_db_path("session-correlation-metadata");
+        let (tx, rx) = std_mpsc::channel();
+        let writer_path = path.clone();
+        let handle = std::thread::spawn(move || db_writer_loop(&writer_path, rx));
+
+        tx.send(DbCommand::InsertSession {
+            session_id: "session-correlation-db".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            model: "claude-sonnet".to_string(),
+            initial_prompt: Some("RAW_FIRST_MESSAGE_HASH_INPUT".to_string()),
+            working_dir: "/Users/pradeepsingh/code/cc-blackbox/".to_string(),
+            first_message_hash: "firstmsg_8f14e45fceea".to_string(),
+        })
+        .expect("queue session insert");
+        tx.send(test_record_request_command(
+            "req-correlation-db",
+            "session-correlation-db",
+            "2026-01-01T00:03:00Z",
+        ))
+        .expect("queue request");
+        drop(tx);
+        handle.join().expect("db writer exits");
+
+        let conn = Connection::open(&path).expect("open test db");
+        let row: (String, String, String, String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT session_id, working_dir, first_message_hash, model, initial_prompt, request_count \
+                 FROM sessions WHERE session_id = ?1",
+                rusqlite::params!["session-correlation-db"],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("query session metadata");
+
+        assert_eq!(row.0, "session-correlation-db");
+        assert_eq!(row.1, "/Users/pradeepsingh/code/cc-blackbox");
+        assert_eq!(row.2, "firstmsg_8f14e45fceea");
+        assert_eq!(row.3, "claude-sonnet");
+        assert_eq!(row.5, 1);
+        assert!(
+            !row.4
+                .unwrap_or_default()
+                .contains("RAW_FIRST_MESSAGE_HASH_INPUT"),
+            "session row stored hash input"
+        );
+
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn jsonl_enriched_findings_persist_source_evidence_and_no_raw_log_text() {
+        let path = unique_test_db_path("jsonl-finding-privacy");
+        let (tx, rx) = std_mpsc::channel();
+        let writer_path = path.clone();
+        let handle = std::thread::spawn(move || db_writer_loop(&writer_path, rx));
+        let raw_jsonl_text =
+            r#"{"message":"RAW_JSONL_MESSAGE_TEXT_77","tool_output":"RAW_TOOL_OUTPUT_78"}"#;
+
+        tx.send(DbCommand::InsertSession {
+            session_id: "session-jsonl-finding".to_string(),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            model: "claude-sonnet".to_string(),
+            initial_prompt: None,
+            working_dir: "/tmp/cc-blackbox-test".to_string(),
+            first_message_hash: "firstmsg_jsonl".to_string(),
+        })
+        .expect("queue session insert");
+        tx.send(DbCommand::WriteGuardFinding {
+            finding: guard::GuardFinding {
+                rule_id: guard::RuleId::JsonlOnlyToolFailureStreak,
+                severity: guard::FindingSeverity::Warning,
+                action: guard::GuardAction::DiagnoseOnly,
+                evidence_level: guard::EvidenceLevel::DirectJsonl,
+                source: guard::FindingSource::Jsonl,
+                confidence: 0.92,
+                session_id: "session-jsonl-finding".to_string(),
+                request_id: None,
+                turn_number: Some(3),
+                timestamp: "2026-01-01T00:02:00Z".to_string(),
+                detail: "2 failed Bash tool calls observed in JSONL metadata.".to_string(),
+                suggested_action: Some("Inspect the failing command outside Claude.".to_string()),
+            },
+        })
+        .expect("queue finding write");
+        drop(tx);
+        handle.join().expect("db writer exits");
+
+        let conn = Connection::open(&path).expect("open test db");
+        let row: (String, String, String, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT rule_id, source, evidence_level, detail, session_id, suggested_action \
+                 FROM guard_findings WHERE session_id = ?1",
+                rusqlite::params!["session-jsonl-finding"],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("query finding");
+
+        assert_eq!(row.0, "jsonl_only_tool_failure_streak");
+        assert_eq!(row.1, "jsonl");
+        assert_eq!(row.2, "direct_jsonl");
+        assert_eq!(row.4, "session-jsonl-finding");
+        let persisted = format!("{} {} {}", row.3, row.5.unwrap_or_default(), row.2);
+        assert!(!persisted.contains(raw_jsonl_text));
+        assert!(!persisted.contains("RAW_JSONL_MESSAGE_TEXT_77"));
+        assert!(!persisted.contains("RAW_TOOL_OUTPUT_78"));
+
+        cleanup_test_db(&path);
     }
 
     fn test_live_turn(turn_number: u32, response_summary: Option<&str>) -> diagnosis::TurnSnapshot {
@@ -10705,6 +11451,8 @@ mod tests {
             started_at: "2026-01-01T00:00:00Z".to_string(),
             model: "claude-sonnet".to_string(),
             initial_prompt: Some("Keep working".to_string()),
+            working_dir: "/tmp/cc-blackbox-test".to_string(),
+            first_message_hash: "firstmsg_test".to_string(),
         })
         .expect("queue session insert");
         tx.send(test_record_request_command(
@@ -10826,11 +11574,13 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("none")
         );
-        assert_eq!(
-            json.pointer("/summary/final_response_summary")
-                .and_then(|value| value.as_str()),
-            Some("Live turn summary.")
-        );
+        let final_response_summary = json
+            .pointer("/summary/final_response_summary")
+            .and_then(|value| value.as_str())
+            .expect("final response summary");
+        assert!(final_response_summary.contains("assistant response captured (redacted"));
+        let rendered = serde_json::to_string(&json).expect("serialize postmortem");
+        assert!(!rendered.contains("Live turn summary."));
 
         let _ = diagnosis::SESSION_TURNS.remove(session_id);
     }
@@ -10899,16 +11649,137 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("2026-01-01T00:10:00Z")
         );
-        assert_eq!(
-            json.pointer("/summary/final_response_summary")
-                .and_then(|value| value.as_str()),
-            Some("Final answer shipped.")
-        );
+        let final_response_summary = json
+            .pointer("/summary/final_response_summary")
+            .and_then(|value| value.as_str())
+            .expect("final response summary");
+        assert!(final_response_summary.contains("final response summary captured (redacted"));
+        let rendered = serde_json::to_string(&json).expect("serialize postmortem");
+        assert!(!rendered.contains("Finish the feature"));
+        assert!(!rendered.contains("Final answer shipped."));
         assert_eq!(
             json.pointer("/summary/outcome")
                 .and_then(|value| value.as_str()),
             Some("Likely Completed")
         );
+    }
+
+    #[test]
+    fn repair_persisted_session_artifacts_derives_legacy_raw_recall() {
+        let conn = create_full_test_db();
+        let ended_at =
+            epoch_to_iso8601(now_epoch_secs().saturating_sub(session_timeout_secs() + 3_600));
+        let raw_prompt = "Investigate payment token sk-ant-legacysecret";
+        let raw_summary = "Assistant copied /Users/pradeep/private/source.rs into the answer.";
+
+        insert_session(
+            &conn,
+            "session-legacy-raw-recall",
+            &ended_at,
+            Some(&ended_at),
+            "claude-sonnet",
+            Some(raw_prompt),
+        );
+        insert_turn_snapshot(
+            &conn,
+            "session-legacy-raw-recall",
+            1,
+            &ended_at,
+            0,
+            0,
+            100,
+            0.0,
+            0.02,
+            Some(raw_summary),
+        );
+        conn.execute(
+            "INSERT INTO session_recall (session_id, initial_prompt, final_response_summary) \
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params!["session-legacy-raw-recall", raw_prompt, raw_summary],
+        )
+        .expect("insert legacy raw recall");
+
+        repair_persisted_session_artifacts(&conn).expect("repair persisted artifacts");
+
+        let persisted = conn
+            .query_row(
+                "SELECT COALESCE(s.initial_prompt, '') || ' ' || \
+                        COALESCE(r.initial_prompt, '') || ' ' || \
+                        COALESCE(r.final_response_summary, '') \
+                 FROM sessions s \
+                 JOIN session_recall r ON r.session_id = s.session_id \
+                 WHERE s.session_id = 'session-legacy-raw-recall'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("load repaired recall text");
+        assert!(!persisted.contains(raw_prompt));
+        assert!(!persisted.contains(raw_summary));
+        assert!(persisted.contains("initial prompt captured (redacted"));
+        assert!(persisted.contains("final response summary captured (redacted"));
+
+        let json = build_postmortem_response_from_db(&conn, "session-legacy-raw-recall", false)
+            .expect("postmortem");
+        let rendered = serde_json::to_string(&json).expect("serialize postmortem");
+        assert!(!rendered.contains(raw_prompt));
+        assert!(!rendered.contains(raw_summary));
+    }
+
+    #[test]
+    fn repair_persisted_session_artifacts_derives_legacy_api_error_cause_detail() {
+        let conn = create_full_test_db();
+        let ended_at =
+            epoch_to_iso8601(now_epoch_secs().saturating_sub(session_timeout_secs() + 3_600));
+        let raw_error = "server echoed /Users/pradeep/private/source.rs token=sk-ant-legacysecret";
+
+        insert_session(
+            &conn,
+            "session-legacy-api-error",
+            &ended_at,
+            Some(&ended_at),
+            "claude-sonnet",
+            None,
+        );
+        insert_turn_snapshot(
+            &conn,
+            "session-legacy-api-error",
+            1,
+            &ended_at,
+            0,
+            0,
+            100,
+            0.0,
+            0.02,
+            None,
+        );
+        conn.execute(
+            "INSERT INTO session_diagnoses (
+                session_id, completed_at, outcome, total_turns, total_cost, cache_hit_ratio,
+                degraded, degradation_turn, causes_json, advice_json
+            ) VALUES (?1, ?2, 'Degraded', 1, 0.01, 0.0, 1, 1, ?3, '[]')",
+            rusqlite::params![
+                "session-legacy-api-error",
+                ended_at,
+                format!(
+                    r#"[{{"turn_first_noticed":1,"cause_type":"api_error","detail":"Claude API streaming error at turn 1 (overloaded_error): {raw_error}","estimated_cost":0.0,"is_heuristic":false}}]"#
+                ),
+            ],
+        )
+        .expect("insert raw api error diagnosis");
+
+        repair_persisted_session_artifacts(&conn).expect("repair persisted artifacts");
+
+        let causes_json = conn
+            .query_row(
+                "SELECT causes_json FROM session_diagnoses WHERE session_id = 'session-legacy-api-error'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("load repaired causes");
+        assert!(!causes_json.contains(raw_error));
+        assert!(!causes_json.contains("/Users/pradeep/private/source.rs"));
+        assert!(!causes_json.contains("sk-ant-legacysecret"));
+        assert!(causes_json.contains("response error message captured as derived metadata"));
     }
 
     #[test]
@@ -10923,6 +11794,8 @@ mod tests {
             started_at: "2026-01-01T00:00:00Z".to_string(),
             model: "claude-sonnet".to_string(),
             initial_prompt: Some("Summarize final state".to_string()),
+            working_dir: "/tmp/cc-blackbox-test".to_string(),
+            first_message_hash: "firstmsg_test".to_string(),
         })
         .expect("queue session insert");
         tx.send(test_record_request_command(
@@ -10988,7 +11861,7 @@ mod tests {
         assert_eq!(
             json.pointer("/summary/final_response_summary")
                 .and_then(|value| value.as_str()),
-            Some("Final persisted summary.")
+            Some("final response summary captured (redacted, 3 words, 24 chars).")
         );
 
         cleanup_test_db(&path);
@@ -11109,6 +11982,8 @@ mod tests {
             started_at: "2026-01-01T00:00:00Z".to_string(),
             model: "claude-sonnet".to_string(),
             initial_prompt: Some("Finish cleanly".to_string()),
+            working_dir: "/tmp/cc-blackbox-test".to_string(),
+            first_message_hash: "firstmsg_test".to_string(),
         })
         .expect("queue session insert");
         diagnosis::SESSIONS.insert(
@@ -11153,7 +12028,7 @@ mod tests {
         assert_eq!(
             json.pointer("/summary/final_response_summary")
                 .and_then(|value| value.as_str()),
-            Some("Final summary ready.")
+            Some("final response summary captured (redacted, 3 words, 20 chars).")
         );
 
         drop(tx);
@@ -11456,6 +12331,7 @@ mod tests {
     #[test]
     fn trusted_dollar_spend_can_block_session_budget() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
         let _dollar_budget = EnvVarGuard::set("CC_BLACKBOX_SESSION_BUDGET_DOLLARS", "10");
         let _token_budget = EnvVarGuard::remove("CC_BLACKBOX_SESSION_BUDGET_TOKENS");
         let session_id = "session-trusted-budget";
@@ -11471,10 +12347,21 @@ mod tests {
             },
         );
 
-        let blocked = check_session_budget(Some(session_id)).expect("budget blocks");
-        assert_eq!(blocked.0, "budget_exceeded");
-        assert!(blocked.1.contains("Trusted spend: $12.00"));
-        assert!(blocked.1.contains("untrusted display-only spend: $0.00"));
+        let policy = request_guard_policy().expect("default policy loads");
+        let decision = evaluate_request_guard_for_session(Some(session_id), Some(&policy))
+            .expect("budget blocks");
+        let block = decision.block.expect("block metadata");
+        assert_eq!(block.error_type, "budget_exceeded");
+        assert_eq!(
+            block.rule_id,
+            guard::RuleId::PerSessionTrustedDollarBudgetExceeded
+        );
+        assert_eq!(block.current_observed_value, "$12.00 trusted spend");
+        assert!(decision
+            .finding
+            .expect("finding")
+            .detail
+            .contains("display-only untrusted spend is $0.00"));
 
         SESSION_BUDGETS.remove(session_id);
     }
@@ -11482,6 +12369,7 @@ mod tests {
     #[test]
     fn untrusted_dollar_spend_cannot_hard_block_session_budget() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
         let _dollar_budget = EnvVarGuard::set("CC_BLACKBOX_SESSION_BUDGET_DOLLARS", "10");
         let _token_budget = EnvVarGuard::remove("CC_BLACKBOX_SESSION_BUDGET_TOKENS");
         let session_id = "session-untrusted-budget";
@@ -11497,7 +12385,8 @@ mod tests {
             },
         );
 
-        assert!(check_session_budget(Some(session_id)).is_none());
+        let policy = request_guard_policy().expect("default policy loads");
+        assert!(evaluate_request_guard_for_session(Some(session_id), Some(&policy)).is_none());
 
         SESSION_BUDGETS.remove(session_id);
     }
@@ -11505,6 +12394,7 @@ mod tests {
     #[test]
     fn token_budget_enforcement_still_blocks() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
         let _dollar_budget = EnvVarGuard::remove("CC_BLACKBOX_SESSION_BUDGET_DOLLARS");
         let _token_budget = EnvVarGuard::set("CC_BLACKBOX_SESSION_BUDGET_TOKENS", "100");
         let session_id = "session-token-budget";
@@ -11520,11 +12410,291 @@ mod tests {
             },
         );
 
-        let blocked = check_session_budget(Some(session_id)).expect("token budget blocks");
-        assert_eq!(blocked.0, "budget_exceeded");
-        assert!(blocked.1.contains("token budget exceeded (100)"));
+        let policy = request_guard_policy().expect("default policy loads");
+        let decision = evaluate_request_guard_for_session(Some(session_id), Some(&policy))
+            .expect("token budget blocks");
+        let block = decision.block.expect("block metadata");
+        assert_eq!(block.error_type, "budget_exceeded");
+        assert_eq!(block.rule_id, guard::RuleId::PerSessionTokenBudgetExceeded);
+        assert_eq!(block.configured_threshold_or_limit, "100 tokens");
 
         SESSION_BUDGETS.remove(session_id);
+    }
+
+    #[test]
+    fn request_guard_token_budget_builds_structured_block_response() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
+        let session_id = "session-structured-token-block";
+        SESSION_BUDGETS.insert(
+            session_id.to_string(),
+            SessionBudgetState {
+                total_spend: 0.0,
+                trusted_spend: 0.0,
+                untrusted_spend: 0.0,
+                total_tokens: 100,
+                request_count: 1,
+                estimated_cache_waste_dollars: 0.0,
+            },
+        );
+        let mut policy = guard::GuardPolicy::default();
+        policy
+            .rules
+            .get_mut(&guard::RuleId::PerSessionTokenBudgetExceeded)
+            .expect("default token rule exists")
+            .limit_tokens = Some(100);
+
+        let decision = evaluate_request_guard_for_session(Some(session_id), Some(&policy))
+            .expect("request should block");
+        let response = make_guard_block_response(decision.block.as_ref().expect("block metadata"));
+        let body = match response.response.expect("immediate response") {
+            ExtProcResponse::ImmediateResponse(response) => response.body,
+            other => panic!("expected immediate response, got {other:?}"),
+        };
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid json block body");
+
+        assert_eq!(json["error"]["type"], "budget_exceeded");
+        assert_eq!(
+            json["error"]["rule_id"],
+            "per_session_token_budget_exceeded"
+        );
+        assert_eq!(json["error"]["reason"], "Session token budget exceeded.");
+        assert_eq!(json["error"]["configured_threshold_or_limit"], "100 tokens");
+        assert_eq!(json["error"]["current_observed_value"], "100 tokens");
+        assert_eq!(json["error"]["session_id"], session_id);
+        assert!(json["error"]["suggested_next_action"]
+            .as_str()
+            .expect("suggested action")
+            .contains("fresh session"));
+
+        for forbidden in [
+            "raw_prompt",
+            "prompt",
+            "messages",
+            "assistant_text",
+            "tool_output",
+            "file_contents",
+        ] {
+            assert!(
+                body.contains(forbidden) == false,
+                "block response leaked content field {forbidden}"
+            );
+        }
+
+        SESSION_BUDGETS.remove(session_id);
+    }
+
+    #[test]
+    fn guard_block_decision_serializes_watch_event_without_raw_content() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
+        let session_id = "session-guard-event";
+        SESSION_BUDGETS.insert(
+            session_id.to_string(),
+            SessionBudgetState {
+                total_spend: 0.0,
+                trusted_spend: 0.0,
+                untrusted_spend: 0.0,
+                total_tokens: 100,
+                request_count: 1,
+                estimated_cache_waste_dollars: 0.0,
+            },
+        );
+        let mut policy = guard::GuardPolicy::default();
+        policy
+            .rules
+            .get_mut(&guard::RuleId::PerSessionTokenBudgetExceeded)
+            .expect("default token rule exists")
+            .limit_tokens = Some(100);
+
+        let decision = evaluate_request_guard_for_session(Some(session_id), Some(&policy))
+            .expect("request should block");
+        let event = guard_finding_watch_event(decision.finding.expect("proxy finding"));
+        let json = serde_json::to_string(&event).expect("guard finding event serializes");
+
+        assert!(json.contains(r#""type":"guard_finding""#));
+        assert!(json.contains(r#""rule_id":"per_session_token_budget_exceeded""#));
+        assert!(json.contains(r#""action":"block""#));
+        assert!(json.contains(r#""evidence_level":"direct_proxy""#));
+        assert!(json.contains(r#""source":"proxy""#));
+        for forbidden in [
+            "raw_prompt",
+            "prompt",
+            "messages",
+            "assistant_text",
+            "tool_output",
+            "file_contents",
+            "raw_jsonl",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "guard finding event leaked content field {forbidden}"
+            );
+        }
+
+        SESSION_BUDGETS.remove(session_id);
+    }
+
+    #[test]
+    fn cache_rebuild_waste_does_not_block_under_default_policy() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
+        let session_id = "session-cache-default-allow";
+        SESSION_BUDGETS.insert(
+            session_id.to_string(),
+            SessionBudgetState {
+                total_spend: 20.0,
+                trusted_spend: 20.0,
+                untrusted_spend: 0.0,
+                total_tokens: 20_000,
+                request_count: 5,
+                estimated_cache_waste_dollars: 19.0,
+            },
+        );
+        let policy = guard::GuardPolicy::default();
+
+        assert!(evaluate_request_guard_for_session(Some(session_id), Some(&policy)).is_none());
+
+        SESSION_BUDGETS.remove(session_id);
+    }
+
+    #[test]
+    fn request_guard_policy_preserves_legacy_env_token_budget() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
+        let _token_budget = EnvVarGuard::set("CC_BLACKBOX_SESSION_BUDGET_TOKENS", "100");
+        let _dollar_budget = EnvVarGuard::remove("CC_BLACKBOX_SESSION_BUDGET_DOLLARS");
+        let _policy_path = EnvVarGuard::remove("CC_BLACKBOX_GUARD_POLICY_PATH");
+        let session_id = "session-env-token-policy";
+        SESSION_BUDGETS.insert(
+            session_id.to_string(),
+            SessionBudgetState {
+                total_spend: 0.0,
+                trusted_spend: 0.0,
+                untrusted_spend: 0.0,
+                total_tokens: 100,
+                request_count: 1,
+                estimated_cache_waste_dollars: 0.0,
+            },
+        );
+
+        let policy = request_guard_policy().expect("default policy loads");
+        let decision = evaluate_request_guard_for_session(Some(session_id), Some(&policy))
+            .expect("legacy env token budget should block");
+
+        assert_eq!(
+            decision.block.expect("block").rule_id,
+            guard::RuleId::PerSessionTokenBudgetExceeded
+        );
+
+        SESSION_BUDGETS.remove(session_id);
+    }
+
+    #[test]
+    fn invalid_request_guard_policy_fails_open() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
+        let _token_budget = EnvVarGuard::remove("CC_BLACKBOX_SESSION_BUDGET_TOKENS");
+        let _dollar_budget = EnvVarGuard::remove("CC_BLACKBOX_SESSION_BUDGET_DOLLARS");
+        let path = unique_temp_path("invalid-guard-policy");
+        fs::write(
+            &path,
+            r#"
+[rules.per_session_token_budget_exceeded]
+action = "page_the_user"
+"#,
+        )
+        .expect("write invalid policy");
+        let _policy_path = EnvVarGuard::set(
+            "CC_BLACKBOX_GUARD_POLICY_PATH",
+            path.to_str().expect("temp path is utf-8"),
+        );
+
+        let session_id = "session-invalid-policy-open";
+        SESSION_BUDGETS.insert(
+            session_id.to_string(),
+            SessionBudgetState {
+                total_spend: 0.0,
+                trusted_spend: 0.0,
+                untrusted_spend: 0.0,
+                total_tokens: 1_000_000,
+                request_count: 9,
+                estimated_cache_waste_dollars: 0.0,
+            },
+        );
+
+        assert!(request_guard_policy().is_none());
+        assert!(evaluate_request_guard_for_session(
+            Some(session_id),
+            request_guard_policy().as_ref()
+        )
+        .is_none());
+
+        SESSION_BUDGETS.remove(session_id);
+        fs::remove_file(path).expect("remove invalid policy fixture");
+    }
+
+    #[test]
+    fn api_error_streak_trips_policy_cooldown_for_next_request() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
+        let mut policy = guard::GuardPolicy::default();
+        let api_rule = policy
+            .rules
+            .get_mut(&guard::RuleId::ApiErrorCircuitBreakerCooldown)
+            .expect("default api cooldown rule exists");
+        api_rule.threshold_count = Some(2);
+        api_rule.cooldown_secs = Some(60);
+
+        record_api_response_for_guard(500, true, Some(&policy));
+        assert!(evaluate_request_guard_for_session(None, Some(&policy)).is_none());
+
+        record_api_response_for_guard(500, true, Some(&policy));
+        let decision = evaluate_request_guard_for_session(None, Some(&policy))
+            .expect("cooldown should block the next request");
+        let block = decision.block.expect("cooldown block metadata");
+
+        assert_eq!(block.rule_id, guard::RuleId::ApiErrorCircuitBreakerCooldown);
+        assert_eq!(block.cooldown_remaining_secs, Some(60));
+        assert_eq!(
+            block.configured_threshold_or_limit,
+            "2 consecutive API errors; cooldown 60s"
+        );
+        let response = make_guard_block_response(&block);
+        let body = match response.response.expect("immediate response") {
+            ExtProcResponse::ImmediateResponse(response) => response.body,
+            other => panic!("expected immediate response, got {other:?}"),
+        };
+        let json: serde_json::Value = serde_json::from_str(&body).expect("valid json block body");
+        assert_eq!(json["error"]["type"], "circuit_breaker");
+        assert_eq!(
+            json["error"]["rule_id"],
+            "api_error_circuit_breaker_cooldown"
+        );
+        assert_eq!(json["error"]["cooldown_remaining_secs"], 60);
+
+        reset_runtime_state_for_test();
+    }
+
+    #[test]
+    fn successful_api_response_resets_error_streak_and_cooldown() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
+        let mut policy = guard::GuardPolicy::default();
+        let api_rule = policy
+            .rules
+            .get_mut(&guard::RuleId::ApiErrorCircuitBreakerCooldown)
+            .expect("default api cooldown rule exists");
+        api_rule.threshold_count = Some(1);
+        api_rule.cooldown_secs = Some(60);
+
+        record_api_response_for_guard(500, true, Some(&policy));
+        assert!(evaluate_request_guard_for_session(None, Some(&policy)).is_some());
+
+        record_api_response_for_guard(200, true, Some(&policy));
+        assert!(evaluate_request_guard_for_session(None, Some(&policy)).is_none());
+
+        reset_runtime_state_for_test();
     }
 
     #[test]
@@ -12267,6 +13437,8 @@ mod tests {
             started_at: "2026-01-01T00:00:00Z".to_string(),
             model: "claude-sonnet".to_string(),
             initial_prompt: None,
+            working_dir: "/tmp/cc-blackbox-test".to_string(),
+            first_message_hash: "firstmsg_test".to_string(),
         })
         .expect("queue session insert");
 

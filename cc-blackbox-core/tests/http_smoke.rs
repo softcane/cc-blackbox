@@ -451,7 +451,10 @@ fn core_http_apis_render_fixture_backed_session_data() {
     assert_eq!(diagnosis["degradation_turn"], 2);
     assert_eq!(diagnosis["causes"][0]["cause_type"], "cache_miss_ttl");
 
-    let recall = http_get_json(&http_addr, "/api/recall?q=auth%20cache&limit=1&days=30");
+    let recall = http_get_json(
+        &http_addr,
+        "/api/recall?q=captured%20redacted&limit=1&days=30",
+    );
     let hits = json_array(&recall, "hits");
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0]["session_id"], "session_api");

@@ -7,6 +7,7 @@ use tokio::sync::broadcast;
 use tracing::warn;
 
 use crate::diagnosis::DiagnosisReport;
+use crate::guard::{EvidenceLevel, FindingSeverity, FindingSource, GuardAction, RuleId};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -113,6 +114,19 @@ pub enum WatchEvent {
         session_id: String,
         error_type: String,
         message: String,
+    },
+    GuardFinding {
+        session_id: String,
+        rule_id: RuleId,
+        severity: FindingSeverity,
+        action: GuardAction,
+        evidence_level: EvidenceLevel,
+        source: FindingSource,
+        confidence: f64,
+        timestamp: String,
+        detail: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        suggested_action: Option<String>,
     },
     /// Anthropic routed the request to a different model than the user asked
     /// for. This does not assert the cause unless separate quota evidence is

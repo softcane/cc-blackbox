@@ -90,8 +90,9 @@ pub fn parse_jsonl_str(raw: &str, source_id: &str) -> Option<JsonlDerivedSession
     let mut current_assistant_turn = 0u64;
 
     for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
+        let value = match serde_json::from_str::<Value>(line) {
+            Ok(value) => value,
+            Err(_) => return None,
         };
 
         if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
@@ -494,5 +495,17 @@ mod tests {
                 "raw content leaked: {derived}"
             );
         }
+    }
+
+    #[test]
+    fn parser_rejects_partially_corrupt_jsonl_instead_of_trusting_partial_match() {
+        let raw = r#"
+{"type":"user","sessionId":"jsonl-corrupt","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"RAW_CORRUPT_PROMPT"}]}}
+{"type":"assistant","sessionId":"jsonl-corrupt","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:10Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test -- RAW_CORRUPT_COMMAND"}}]}}
+this is not json
+{"type":"user","sessionId":"jsonl-corrupt","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:20Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":true,"content":"RAW_CORRUPT_OUTPUT"}]}}
+"#;
+
+        assert!(parse_jsonl_str(raw, "corrupt.jsonl").is_none());
     }
 }

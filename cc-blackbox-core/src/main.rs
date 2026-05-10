@@ -234,6 +234,7 @@ static SESSION_BUDGETS: LazyLock<DashMap<String, SessionBudgetState>> = LazyLock
 static FALLBACK_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 const GUARD_POLICY_PATH_ENV: &str = "CC_BLACKBOX_GUARD_POLICY_PATH";
 const JSONL_DIR_ENV: &str = "CC_BLACKBOX_JSONL_DIR";
+const GLOBAL_GUARD_SESSION_ID: &str = "guard_api_error_cooldown";
 
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard<'a, T> {
     match mutex.lock() {
@@ -291,7 +292,7 @@ fn api_cooldown_observation(
     let remaining = until.duration_since(now);
     let remaining_secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
     Ok(Some(guard::ApiCooldownObservation {
-        session_id: session_id.map(str::to_string),
+        session_id: Some(session_id.unwrap_or(GLOBAL_GUARD_SESSION_ID).to_string()),
         consecutive_errors: runtime.consecutive_errors,
         remaining_cooldown_secs: remaining_secs,
     }))
@@ -563,6 +564,27 @@ fn load_guard_findings_for_session(
     rows.filter_map(Result::ok).collect()
 }
 
+fn guard_finding_status_json(
+    finding: &guard::GuardFinding,
+    policy: Option<&guard::GuardPolicy>,
+) -> Value {
+    let rule_id = finding.rule_id.to_string();
+    let action = status_action_for_rule(policy, &rule_id)
+        .unwrap_or_else(|| serialized_label(finding.action));
+    serde_json::json!({
+        "rule_id": &rule_id,
+        "title": guard_finding_title(&rule_id),
+        "severity": serialized_label(finding.severity),
+        "action": action,
+        "source": serialized_label(finding.source),
+        "evidence_level": serialized_label(finding.evidence_level),
+        "confidence": finding.confidence,
+        "timestamp": &finding.timestamp,
+        "detail": &finding.detail,
+        "suggested_action": &finding.suggested_action,
+    })
+}
+
 fn guard_session_status_json(
     session_id: String,
     display_name: String,
@@ -636,6 +658,23 @@ fn load_ended_guard_sessions(
         .collect()
 }
 
+fn active_global_cooldown_status_json(policy: Option<&guard::GuardPolicy>) -> Option<Value> {
+    let timestamp = now_iso8601();
+    let decision = guard::evaluate_api_cooldown_for_request(
+        policy,
+        api_cooldown_observation(None),
+        &timestamp,
+    );
+    let finding = decision.finding?;
+    Some(guard_session_status_json(
+        GLOBAL_GUARD_SESSION_ID.to_string(),
+        "API error cooldown".to_string(),
+        "guard".to_string(),
+        "cooldown",
+        vec![guard_finding_status_json(&finding, policy)],
+    ))
+}
+
 fn build_guard_status_report_json(session_filter: Option<&str>) -> Value {
     let conn = Connection::open(db_path()).ok();
     let policy = request_guard_policy();
@@ -664,6 +703,15 @@ fn build_guard_status_report_json(session_filter: Option<&str>) -> Value {
             ))
         })
         .collect::<Vec<_>>();
+
+    if session_filter
+        .map(|wanted| wanted == GLOBAL_GUARD_SESSION_ID)
+        .unwrap_or(true)
+    {
+        if let Some(global_cooldown) = active_global_cooldown_status_json(policy.as_ref()) {
+            sessions.push(global_cooldown);
+        }
+    }
 
     sessions.sort_by(|a, b| {
         let a_id = a
@@ -1857,6 +1905,28 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 );
             }
             DbCommand::WriteGuardFinding { finding } => {
+                let session_id =
+                    if finding.session_id.trim().is_empty() || finding.session_id == "unknown" {
+                        GLOBAL_GUARD_SESSION_ID.to_string()
+                    } else {
+                        finding.session_id.clone()
+                    };
+                if session_id == GLOBAL_GUARD_SESSION_ID {
+                    let _ = conn.execute(
+                        "INSERT OR IGNORE INTO sessions (
+                            session_id, started_at, model, working_dir, first_message_hash,
+                            initial_prompt
+                        ) VALUES (?1,?2,?3,?4,?5,?6)",
+                        rusqlite::params![
+                            &session_id,
+                            &finding.timestamp,
+                            "guard",
+                            "",
+                            "guard_global",
+                            "guard-level finding (no prompt content).",
+                        ],
+                    );
+                }
                 let rule_id = finding.rule_id.to_string();
                 let severity = serialized_label(finding.severity);
                 let action = serialized_label(finding.action);
@@ -1868,7 +1938,7 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                         action, source, evidence_level, confidence, detail, suggested_action
                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                     rusqlite::params![
-                        finding.session_id,
+                        session_id,
                         finding.request_id,
                         finding.turn_number,
                         finding.timestamp,
@@ -8388,10 +8458,11 @@ async fn handle_diagnosis(
 }
 
 fn query_redact_enabled(params: &std::collections::HashMap<String, String>) -> bool {
-    params
-        .get("redact")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    match params.get("redact").map(|value| value.as_str()) {
+        Some("0" | "false" | "no" | "off") => false,
+        Some("1" | "true" | "yes" | "on") => true,
+        Some(_) | None => true,
+    }
 }
 
 async fn handle_postmortem(
@@ -9701,9 +9772,10 @@ mod tests {
         looks_like_machine_recall_line, looks_like_title_request, make_guard_block_response,
         metrics, model_requests_1m_context, normalize_search_text, now_epoch_secs,
         parse_latest_tool_results, parse_request_body, persist_billing_reconciliation,
-        persist_final_session_artifacts, pricing, query_historical_metrics, query_summary,
-        record_api_response_for_guard, redact_operational_text, repair_persisted_session_artifacts,
-        repair_turn_snapshot_context_windows, request_cache_ttl_evidence, request_cache_ttl_secs,
+        persist_final_session_artifacts, pricing, query_historical_metrics, query_redact_enabled,
+        query_summary, record_api_response_for_guard, redact_operational_text,
+        repair_persisted_session_artifacts, repair_turn_snapshot_context_windows,
+        request_cache_ttl_evidence, request_cache_ttl_secs,
         request_context_window_hint_from_headers, request_guard_policy, request_uses_1m_context,
         resolve_context_window_tokens, resolve_context_window_tokens_with_config,
         response_cache_ttl_secs, score_recall_doc, seed_live_metric_labels_from_db,
@@ -11102,6 +11174,57 @@ mod tests {
         assert!(!persisted.contains(raw_jsonl_text));
         assert!(!persisted.contains("RAW_JSONL_MESSAGE_TEXT_77"));
         assert!(!persisted.contains("RAW_TOOL_OUTPUT_78"));
+
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn global_cooldown_finding_persists_without_existing_session_row() {
+        let path = unique_test_db_path("global-cooldown-finding");
+        let (tx, rx) = std_mpsc::channel();
+        let writer_path = path.clone();
+        let handle = std::thread::spawn(move || db_writer_loop(&writer_path, rx));
+
+        tx.send(DbCommand::WriteGuardFinding {
+            finding: guard::GuardFinding {
+                rule_id: guard::RuleId::ApiErrorCircuitBreakerCooldown,
+                severity: guard::FindingSeverity::Critical,
+                action: guard::GuardAction::Cooldown,
+                evidence_level: guard::EvidenceLevel::DirectProxy,
+                source: guard::FindingSource::Proxy,
+                confidence: 1.0,
+                session_id: "unknown".to_string(),
+                request_id: None,
+                turn_number: None,
+                timestamp: "2026-01-01T00:02:00Z".to_string(),
+                detail: "2 consecutive API errors opened a 60s cooldown; 59s remain.".to_string(),
+                suggested_action: Some("Wait for the cooldown to expire.".to_string()),
+            },
+        })
+        .expect("queue global cooldown finding");
+        drop(tx);
+        handle.join().expect("db writer exits");
+
+        let conn = Connection::open(&path).expect("open test db");
+        let session_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE session_id = ?1",
+                rusqlite::params![super::GLOBAL_GUARD_SESSION_ID],
+                |row| row.get(0),
+            )
+            .expect("query synthetic session");
+        assert_eq!(session_count, 1);
+
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT session_id, rule_id, action FROM guard_findings",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("query global cooldown finding");
+        assert_eq!(row.0, super::GLOBAL_GUARD_SESSION_ID);
+        assert_eq!(row.1, "api_error_circuit_breaker_cooldown");
+        assert_eq!(row.2, "cooldown");
 
         cleanup_test_db(&path);
     }
@@ -14496,6 +14619,45 @@ action = "page_the_user"
     }
 
     #[test]
+    fn guard_status_reports_active_global_cooldown_without_known_session() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
+        let path = unique_test_db_path("guard-status-global-cooldown");
+        {
+            let conn = Connection::open(&path).expect("open test db");
+            conn.execute_batch(SCHEMA).expect("create schema");
+        }
+        let _db_path = EnvVarGuard::set("CC_BLACKBOX_DB_PATH", &path);
+        let _token_budget = EnvVarGuard::remove("CC_BLACKBOX_SESSION_BUDGET_TOKENS");
+        let _dollar_budget = EnvVarGuard::remove("CC_BLACKBOX_SESSION_BUDGET_DOLLARS");
+        let mut policy = guard::GuardPolicy::default();
+        let api_rule = policy
+            .rules
+            .get_mut(&guard::RuleId::ApiErrorCircuitBreakerCooldown)
+            .expect("default api cooldown rule exists");
+        api_rule.threshold_count = Some(1);
+        api_rule.cooldown_secs = Some(60);
+
+        record_api_response_for_guard(500, true, Some(&policy));
+
+        let report = build_guard_status_report_json(None);
+
+        assert_eq!(report["overall_state"], "cooldown");
+        assert_eq!(
+            report["sessions"][0]["session_id"],
+            "guard_api_error_cooldown"
+        );
+        assert_eq!(report["sessions"][0]["state"], "cooldown");
+        assert_eq!(
+            report["sessions"][0]["findings"][0]["rule_id"],
+            "api_error_circuit_breaker_cooldown"
+        );
+
+        reset_runtime_state_for_test();
+        cleanup_test_db(&path);
+    }
+
+    #[test]
     fn successful_api_response_resets_error_streak_and_cooldown() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
         reset_runtime_state_for_test();
@@ -14514,6 +14676,20 @@ action = "page_the_user"
         assert!(evaluate_request_guard_for_session(None, Some(&policy)).is_none());
 
         reset_runtime_state_for_test();
+    }
+
+    #[test]
+    fn postmortem_api_redacts_by_default_and_allows_explicit_opt_out() {
+        let default_params = std::collections::HashMap::new();
+        assert!(query_redact_enabled(&default_params));
+
+        let mut explicit_false = std::collections::HashMap::new();
+        explicit_false.insert("redact".to_string(), "false".to_string());
+        assert!(!query_redact_enabled(&explicit_false));
+
+        let mut explicit_true = std::collections::HashMap::new();
+        explicit_true.insert("redact".to_string(), "true".to_string());
+        assert!(query_redact_enabled(&explicit_true));
     }
 
     #[test]

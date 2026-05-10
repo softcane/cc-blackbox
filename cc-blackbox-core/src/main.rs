@@ -1597,6 +1597,9 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
         }
     };
     let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
+    if let Err(e) = configure_sqlite_storage_privacy(&conn) {
+        eprintln!("Failed to configure SQLite privacy pragmas: {e}");
+    }
     if let Err(e) = conn.execute_batch(SCHEMA) {
         eprintln!("Failed to create schema: {e}");
         return;
@@ -1624,6 +1627,9 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
     if let Err(e) = repair_legacy_raw_content_storage(&conn) {
         eprintln!("Failed to repair legacy raw content storage: {e}");
         return;
+    }
+    if let Err(e) = truncate_sqlite_wal(&conn) {
+        eprintln!("Failed to truncate SQLite WAL after privacy repair: {e}");
     }
     if let Err(e) = seed_live_metric_labels_from_db(&conn) {
         eprintln!("Failed to seed live metric labels from SQLite: {e}");
@@ -6035,6 +6041,24 @@ fn repair_legacy_content_metadata_column(
     Ok(repaired)
 }
 
+fn configure_sqlite_storage_privacy(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "PRAGMA secure_delete=ON;
+         PRAGMA journal_size_limit=0;",
+    )
+}
+
+fn truncate_sqlite_wal(conn: &Connection) -> rusqlite::Result<()> {
+    let (busy, _log_frames, _checkpointed_frames): (i64, i64, i64) =
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    if busy != 0 {
+        warn!(busy, "SQLite WAL checkpoint could not fully truncate");
+    }
+    Ok(())
+}
+
 fn legacy_api_error_detail_replacement(cause: &Value) -> String {
     let turn = cause
         .get("turn_first_noticed")
@@ -6133,12 +6157,14 @@ fn repair_legacy_raw_content_storage(conn: &Connection) -> rusqlite::Result<()> 
 }
 
 fn repair_persisted_session_artifacts(conn: &Connection) -> rusqlite::Result<()> {
+    let _ = configure_sqlite_storage_privacy(conn);
     let _ = ensure_turn_snapshot_model_columns(conn);
     let _ = ensure_session_columns(conn);
     let _ = ensure_request_cost_columns(conn);
     let _ = repair_turn_snapshot_context_windows(conn);
     let _ = repair_session_diagnosis_degradation_turns(conn);
     let _ = repair_legacy_raw_content_storage(conn);
+    let _ = truncate_sqlite_wal(conn);
     let cutoff = epoch_to_iso8601(now_epoch_secs().saturating_sub(session_timeout_secs()));
     let mut stmt = conn.prepare(
         "SELECT s.session_id, s.ended_at, s.initial_prompt, d.outcome, \
@@ -9762,9 +9788,10 @@ mod tests {
         build_guard_policy_report_json, build_guard_status_report_json,
         build_postmortem_response_from_db, build_session_summary_json,
         build_sessions_response_json, build_summary_response_json, canonical_telemetry_name,
-        classify_cache_event, clean_user_prompt, compact_response_summary, context_fill_percent,
-        context_fill_ratio, db_writer_loop, derive_display_name, diagnosis, end_session_with_db_tx,
-        ensure_session_columns, epoch_to_iso8601, estimated_rebuild_cost_for_cache_event,
+        classify_cache_event, clean_user_prompt, compact_response_summary,
+        content_metadata_for_storage, context_fill_percent, context_fill_ratio, db_writer_loop,
+        derive_display_name, diagnosis, end_session_with_db_tx, ensure_session_columns,
+        epoch_to_iso8601, estimated_rebuild_cost_for_cache_event,
         evaluate_request_guard_for_session, extract_explicit_skill_refs, extract_header,
         extract_headers, extract_working_dir, fallback_request_id, guard,
         guard_finding_watch_event, in_memory_postmortem_totals, infer_context_window_tokens,
@@ -10700,6 +10727,26 @@ mod tests {
         let _ = fs::remove_file(format!("{path}-shm"));
     }
 
+    fn sqlite_artifact_bytes(path: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for artifact in [
+            path.to_string(),
+            format!("{path}-wal"),
+            format!("{path}-shm"),
+        ] {
+            if let Ok(mut artifact_bytes) = fs::read(&artifact) {
+                bytes.append(&mut artifact_bytes);
+            }
+        }
+        bytes
+    }
+
+    fn bytes_contain(haystack: &[u8], needle: &str) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    }
+
     fn insert_session(
         conn: &Connection,
         session_id: &str,
@@ -11046,6 +11093,164 @@ mod tests {
                 "persisted raw content sample {forbidden}: {persisted_text}"
             );
         }
+
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn db_writer_startup_repair_removes_legacy_raw_content_from_sqlite_artifacts() {
+        let path = unique_test_db_path("legacy-privacy-artifacts");
+        let raw_prompt = "RAW_WAL_PROMPT_SECRET_1001";
+        let raw_error = "RAW_WAL_ERROR_SECRET_1002";
+        let raw_recall = "RAW_WAL_RECALL_SECRET_1003";
+        let before_repair = {
+            let conn = Connection::open(&path).expect("open legacy sqlite");
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=NORMAL;
+                 PRAGMA secure_delete=OFF;",
+            )
+            .expect("enable legacy wal");
+            conn.execute_batch(SCHEMA).expect("create schema");
+            let reader = Connection::open(&path).expect("open checkpoint-blocking reader");
+            reader
+                .execute_batch("PRAGMA journal_mode=WAL; BEGIN;")
+                .expect("start reader transaction");
+            let _: i64 = reader
+                .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+                .expect("establish reader snapshot");
+            conn.execute(
+                "INSERT INTO sessions (
+                    session_id, started_at, model, working_dir, first_message_hash,
+                    initial_prompt
+                ) VALUES (?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![
+                    "session-legacy-privacy-artifacts",
+                    "2026-01-01T00:00:00Z",
+                    "claude-sonnet",
+                    "/tmp/cc-blackbox-legacy",
+                    "firstmsg_legacy_privacy",
+                    raw_prompt,
+                ],
+            )
+            .expect("insert legacy session");
+            conn.execute(
+                "INSERT INTO requests (
+                    request_id, session_id, timestamp, model, outcome, error_message
+                ) VALUES (?1,?2,?3,?4,?5,?6)",
+                rusqlite::params![
+                    "req-legacy-privacy-artifacts",
+                    "session-legacy-privacy-artifacts",
+                    "2026-01-01T00:01:00Z",
+                    "claude-sonnet",
+                    "error",
+                    raw_error,
+                ],
+            )
+            .expect("insert legacy request");
+            conn.execute(
+                "INSERT INTO session_recall (
+                    session_id, initial_prompt, final_response_summary
+                ) VALUES (?1,?2,?3)",
+                rusqlite::params!["session-legacy-privacy-artifacts", raw_prompt, raw_recall,],
+            )
+            .expect("insert legacy recall");
+            let derived_prompt =
+                content_metadata_for_storage("initial prompt", raw_prompt).expect("derive prompt");
+            let derived_error =
+                content_metadata_for_storage("error message", raw_error).expect("derive error");
+            let derived_recall = content_metadata_for_storage("final response summary", raw_recall)
+                .expect("derive recall");
+            conn.execute(
+                "UPDATE sessions SET initial_prompt = ?1 WHERE session_id = ?2",
+                rusqlite::params![derived_prompt, "session-legacy-privacy-artifacts"],
+            )
+            .expect("derive legacy session");
+            conn.execute(
+                "UPDATE requests SET error_message = ?1 WHERE request_id = ?2",
+                rusqlite::params![derived_error, "req-legacy-privacy-artifacts"],
+            )
+            .expect("derive legacy request");
+            conn.execute(
+                "UPDATE session_recall SET initial_prompt = ?1, final_response_summary = ?2
+                 WHERE session_id = ?3",
+                rusqlite::params![
+                    content_metadata_for_storage("initial prompt", raw_prompt)
+                        .expect("derive recall prompt"),
+                    derived_recall,
+                    "session-legacy-privacy-artifacts",
+                ],
+            )
+            .expect("derive legacy recall");
+
+            drop(conn);
+            let bytes = sqlite_artifact_bytes(&path);
+            drop(reader);
+            bytes
+        };
+        assert!(
+            [raw_prompt, raw_error, raw_recall]
+                .iter()
+                .any(|needle| bytes_contain(&before_repair, needle)),
+            "legacy fixture did not write raw sentinel bytes"
+        );
+
+        let (tx, rx) = std_mpsc::channel();
+        let writer_path = path.clone();
+        let handle = std::thread::spawn(move || db_writer_loop(&writer_path, rx));
+        let (response_tx, response_rx) = std_mpsc::channel();
+        tx.send(DbCommand::FinalizeSession {
+            session_id: "session-legacy-privacy-artifacts".to_string(),
+            ended_at: "2026-01-01T00:02:00Z".to_string(),
+            diagnosis: PersistedDiagnosis {
+                completed_at: "2026-01-01T00:02:00Z".to_string(),
+                outcome: "Likely Completed".to_string(),
+                total_turns: 1,
+                total_cost: 0.0,
+                cache_hit_ratio: 0.0,
+                degraded: false,
+                degradation_turn: None,
+                causes_json: "[]".to_string(),
+                advice_json: "[]".to_string(),
+            },
+            recall: None,
+            response_tx,
+        })
+        .expect("queue startup barrier");
+        response_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("startup barrier response")
+            .expect("startup barrier finalization");
+
+        let conn = Connection::open(&path).expect("open repaired sqlite");
+        let persisted: String = conn
+            .query_row(
+                "SELECT COALESCE(s.initial_prompt, '') || ' ' ||
+                        COALESCE(req.error_message, '') || ' ' ||
+                        COALESCE(r.initial_prompt, '') || ' ' ||
+                        COALESCE(r.final_response_summary, '')
+                 FROM sessions s
+                 LEFT JOIN requests req ON req.session_id = s.session_id
+                 LEFT JOIN session_recall r ON r.session_id = s.session_id
+                 WHERE s.session_id = ?1",
+                rusqlite::params!["session-legacy-privacy-artifacts"],
+                |row| row.get(0),
+            )
+            .expect("query repaired content");
+        let artifacts = sqlite_artifact_bytes(&path);
+        for forbidden in [raw_prompt, raw_error, raw_recall] {
+            assert!(
+                !persisted.contains(forbidden),
+                "SQL-visible raw content remained: {persisted}"
+            );
+            assert!(
+                !bytes_contain(&artifacts, forbidden),
+                "SQLite artifact retained raw sentinel {forbidden}"
+            );
+        }
+        drop(conn);
+        drop(tx);
+        handle.join().expect("db writer exits");
 
         cleanup_test_db(&path);
     }

@@ -419,8 +419,8 @@ docker cp "$CORE_CID:/data/." "$DB_COPY" >/dev/null
 DB_FILE="$DB_COPY/cc-blackbox.db"
 [ -f "$DB_FILE" ] || fail "SQLite database not found at $DB_FILE"
 
-PROXY_SESSION_FILTER="SELECT session_id FROM sessions WHERE initial_prompt LIKE '%${RUN_ID}%'"
-assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM sessions WHERE initial_prompt LIKE '%${RUN_ID}%';" 2 "SQLite captured run-scoped proxy sessions"
+PROXY_SESSION_FILTER="SELECT session_id FROM sessions WHERE working_dir LIKE '/tmp/cc-blackbox-e2e/${RUN_ID}%'"
+assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM sessions WHERE working_dir LIKE '/tmp/cc-blackbox-e2e/${RUN_ID}%';" 2 "SQLite captured run-scoped proxy sessions"
 assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM requests WHERE session_id IN (${PROXY_SESSION_FILTER});" 2 "SQLite captured run-scoped requests"
 assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM turn_snapshots WHERE session_id IN (${PROXY_SESSION_FILTER});" 2 "SQLite captured run-scoped turn snapshots"
 assert_sql_ge "$DB_FILE" "SELECT COUNT(*) FROM tool_calls WHERE request_id IN (SELECT request_id FROM requests WHERE session_id IN (${PROXY_SESSION_FILTER})) AND lower(tool_name) = 'skill';" 2 "SQLite captured proxy Skill tool calls"

@@ -698,8 +698,10 @@ fn bundled_compose_yaml(stack_dir: &Path) -> String {
       - CC_BLACKBOX_SESSION_BUDGET_DOLLARS=0
       - CC_BLACKBOX_SESSION_BUDGET_TOKENS=0
       - CC_BLACKBOX_CIRCUIT_BREAKER_THRESHOLD=5
+      - CC_BLACKBOX_JSONL_DIR=/root/.claude/projects
     volumes:
       - cc_blackbox_data:/data
+      - "${{HOME}}/.claude/projects:/root/.claude/projects:ro"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/health"]
       interval: 5s
@@ -7886,5 +7888,7 @@ If failures recur, restart with a shorter prompt.\n\
         assert!(yaml.contains(
             "\"/tmp/cc-blackbox test/grafana/dashboards:/var/lib/grafana/dashboards:ro\""
         ));
+        assert!(yaml.contains("- CC_BLACKBOX_JSONL_DIR=/root/.claude/projects"));
+        assert!(yaml.contains("\"${HOME}/.claude/projects:/root/.claude/projects:ro\""));
     }
 }

@@ -1088,13 +1088,25 @@ async fn run_up(no_grafana: bool) -> i32 {
     match start_stack(no_grafana).await {
         Ok(()) => {
             println!();
-            println!("cc-blackbox is up.");
-            println!("  Envoy proxy:    {ENVOY_PROXY_URL}");
-            println!("  cc-blackbox core: {CC_BLACKBOX_CORE_URL}");
-            println!("  Grafana:        {GRAFANA_DASHBOARD_URL}");
+            println!("{}", "cc-blackbox is up.".green().bold());
+            println!(
+                "  {} {}",
+                "Envoy proxy:".bright_black().bold(),
+                ENVOY_PROXY_URL.cyan()
+            );
+            println!(
+                "  {} {}",
+                "cc-blackbox core:".bright_black().bold(),
+                CC_BLACKBOX_CORE_URL.cyan()
+            );
+            println!(
+                "  {} {}",
+                "Grafana:".bright_black().bold(),
+                GRAFANA_DASHBOARD_URL.cyan()
+            );
             println!();
-            println!("Next:");
-            println!("  cc-blackbox run claude --watch");
+            println!("{}", "Next:".bright_black().bold());
+            println!("  {}", "cc-blackbox run claude --watch".cyan());
             0
         }
         Err(err) => {
@@ -1153,15 +1165,23 @@ async fn probe_guard_stack_readiness() -> GuardStackReadiness {
 
 fn print_guard_running(already_running: bool) {
     if already_running {
-        println!("cc-blackbox guard is already running.");
+        println!("{}", "cc-blackbox guard is already running.".green().bold());
     } else {
-        println!("cc-blackbox guard is running.");
+        println!("{}", "cc-blackbox guard is running.".green().bold());
     }
-    println!("  Envoy proxy:      {}", envoy_proxy_url());
-    println!("  cc-blackbox core: {}", cc_blackbox_core_url());
-    println!("Next:");
-    println!("  cc-blackbox guard status");
-    println!("  cc-blackbox guard watch");
+    println!(
+        "  {} {}",
+        "Envoy proxy:".bright_black().bold(),
+        envoy_proxy_url().cyan()
+    );
+    println!(
+        "  {} {}",
+        "cc-blackbox core:".bright_black().bold(),
+        cc_blackbox_core_url().cyan()
+    );
+    println!("{}", "Next:".bright_black().bold());
+    println!("  {}", "cc-blackbox guard status".cyan());
+    println!("  {}", "cc-blackbox guard watch".cyan());
 }
 
 async fn run_guard_start_with_deps<Readiness, ReadinessFut, Start, StartFut>(
@@ -1540,24 +1560,37 @@ fn render_guard_policy_report(report: &serde_json::Value) -> String {
         .unwrap_or_default();
 
     let mut out = String::new();
-    out.push_str("Guard policy\n");
-    out.push_str(&format!("Config source: {source}\n"));
-    out.push_str(&format!("Fail open: {}\n", format_policy_bool(fail_open)));
+    out.push_str(&format!("{}\n", "Guard policy".cyan().bold()));
     out.push_str(&format!(
-        "Defaults: fail open {}\n",
-        format_policy_bool(defaults_fail_open)
+        "{} {}\n",
+        "Config source:".bright_black().bold(),
+        source.bright_white()
+    ));
+    out.push_str(&format!(
+        "{} {}\n",
+        "Fail open:".bright_black().bold(),
+        format_policy_bool(fail_open).green()
+    ));
+    out.push_str(&format!(
+        "{} fail open {}\n",
+        "Defaults:".bright_black().bold(),
+        format_policy_bool(defaults_fail_open).green()
     ));
 
     if warnings.is_empty() {
-        out.push_str("Policy warnings: none\n");
+        out.push_str(&format!(
+            "{} {}\n",
+            "Policy warnings:".bright_black().bold(),
+            "none".green()
+        ));
     } else {
-        out.push_str("Policy warnings:\n");
+        out.push_str(&format!("{}\n", "Policy warnings:".yellow().bold()));
         for warning in warnings {
-            out.push_str(&format!("  - {warning}\n"));
+            out.push_str(&format!("  - {}\n", warning.yellow()));
         }
     }
 
-    out.push_str("Rules:\n");
+    out.push_str(&format!("{}\n", "Rules:".bright_black().bold()));
     if let Some(rules) = report
         .pointer("/policy/rules")
         .and_then(|value| value.as_object())
@@ -1566,11 +1599,15 @@ fn render_guard_policy_report(report: &serde_json::Value) -> String {
         names.sort();
         for name in names {
             if let Some(rule) = rules.get(name) {
-                out.push_str(&format!("  {name}: {}\n", format_policy_rule(rule)));
+                out.push_str(&format!(
+                    "  {}: {}\n",
+                    name.cyan(),
+                    format_policy_rule(rule).bright_white()
+                ));
             }
         }
     } else {
-        out.push_str("  none\n");
+        out.push_str(&format!("  {}\n", "none".green()));
     }
 
     out
@@ -1586,6 +1623,29 @@ fn guard_state_label(state: &str) -> &'static str {
         "cooldown" => "Cooldown",
         "ended" => "Ended",
         _ => "Watching",
+    }
+}
+
+fn colored_guard_state_label(state: &str) -> String {
+    let label = guard_state_label(state);
+    match state {
+        "healthy" => label.green().bold().to_string(),
+        "watching" => label.cyan().bold().to_string(),
+        "warning" => label.yellow().bold().to_string(),
+        "critical" | "blocked" | "cooldown" => label.red().bold().to_string(),
+        "ended" => label.bright_black().bold().to_string(),
+        _ => label.cyan().bold().to_string(),
+    }
+}
+
+fn color_guard_watch_line(label: &str, line: String) -> String {
+    match label {
+        "Healthy" => line.green().to_string(),
+        "Watching" => line.cyan().to_string(),
+        "Warning" => line.yellow().to_string(),
+        "Critical" | "Blocked" | "Cooldown" => line.red().bold().to_string(),
+        "Ended" => line.bright_black().to_string(),
+        _ => line.bright_white().to_string(),
     }
 }
 
@@ -1628,31 +1688,53 @@ fn render_guard_finding(finding: &serde_json::Value, out: &mut String) {
 
     out.push_str(&format!(
         "    - {}: {}\n",
-        finding_title(finding),
-        finding_action_text(finding)
+        finding_title(finding).yellow().bold(),
+        finding_action_text(finding).bright_white()
     ));
     if !detail.trim().is_empty() {
-        out.push_str(&format!("      Detail: {}\n", table_cell(detail)));
+        out.push_str(&format!(
+            "      {} {}\n",
+            "Detail:".bright_black().bold(),
+            table_cell(detail).bright_white()
+        ));
     }
     let confidence_text = confidence
         .map(|value| format!(" · confidence {:.0}%", value * 100.0))
         .unwrap_or_default();
-    out.push_str(&format!("      Evidence: {evidence}{confidence_text}\n"));
+    out.push_str(&format!(
+        "      {} {}{}\n",
+        "Evidence:".bright_black().bold(),
+        evidence.cyan(),
+        confidence_text.bright_black()
+    ));
 
     let recovery = json_str(finding, "/suggested_action")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| default_recovery_for_action(action));
     if matches!(action, "block" | "cooldown") && !recovery.is_empty() {
-        out.push_str(&format!("      Recovery: {}\n", table_cell(recovery)));
+        out.push_str(&format!(
+            "      {} {}\n",
+            "Recovery:".red().bold(),
+            table_cell(recovery).bright_white()
+        ));
     }
 }
 
 fn render_guard_status_report(report: &serde_json::Value) -> String {
     let overall = json_str(report, "/overall_state").unwrap_or("healthy");
     let mut out = String::new();
-    out.push_str("Guard status\n");
-    out.push_str(&format!("Overall: {}\n", guard_state_label(overall)));
-    out.push_str("Postmortems: cc-blackbox postmortem latest; cc-blackbox postmortem SESSION_ID\n");
+    out.push_str(&format!("{}\n", "Guard status".cyan().bold()));
+    out.push_str(&format!(
+        "{} {}\n",
+        "Overall:".bright_black().bold(),
+        colored_guard_state_label(overall)
+    ));
+    out.push_str(&format!(
+        "{} {}  {}\n",
+        "Postmortems:".bright_black().bold(),
+        "cc-blackbox postmortem latest".cyan(),
+        "cc-blackbox postmortem SESSION_ID".cyan()
+    ));
 
     let sessions = report
         .get("sessions")
@@ -1660,18 +1742,25 @@ fn render_guard_status_report(report: &serde_json::Value) -> String {
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     if sessions.is_empty() {
-        out.push_str("\nNo active sessions. Guard is Healthy.\n");
+        out.push_str(&format!(
+            "\n{}\n",
+            "No active sessions. Guard is Healthy.".green()
+        ));
         return out;
     }
 
-    out.push_str("\nSessions:\n");
+    out.push_str(&format!("\n{}\n", "Sessions:".bright_black().bold()));
     for session in sessions {
         let session_id = json_str(session, "/session_id").unwrap_or("unknown");
         let display_name = json_str(session, "/display_name").unwrap_or(session_id);
         let model = json_str(session, "/model").unwrap_or("unknown model");
-        let state = guard_state_label(json_str(session, "/state").unwrap_or("watching"));
+        let state_raw = json_str(session, "/state").unwrap_or("watching");
         out.push_str(&format!(
-            "  {state}  {display_name}  {model}  {session_id}\n"
+            "  {}  {}  {}  {}\n",
+            colored_guard_state_label(state_raw),
+            display_name.bright_white().bold(),
+            model.bright_black(),
+            session_id.cyan()
         ));
 
         let findings = session
@@ -1680,7 +1769,7 @@ fn render_guard_status_report(report: &serde_json::Value) -> String {
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         if findings.is_empty() {
-            out.push_str("    - No active guard findings.\n");
+            out.push_str(&format!("    - {}\n", "No active guard findings.".green()));
         } else {
             for finding in findings.iter().take(3) {
                 render_guard_finding(finding, &mut out);
@@ -1724,6 +1813,15 @@ fn default_watch_recovery(action: &str) -> &'static str {
     }
 }
 
+fn quota_budget_source_note(source: Option<&str>) -> String {
+    match source {
+        Some("env") => " · cap from CC_BLACKBOX_WEEKLY_TOKEN_BUDGET".to_string(),
+        Some("auto_p95_4w") => " · auto cap from last 4 completed weeks".to_string(),
+        Some(other) => format!(" · cap source {other}"),
+        None => String::new(),
+    }
+}
+
 fn render_guard_watch_line(event: &WatchEvent) -> Option<String> {
     match event {
         WatchEvent::SessionStart {
@@ -1731,28 +1829,37 @@ fn render_guard_watch_line(event: &WatchEvent) -> Option<String> {
             display_name,
             model,
             ..
-        } => Some(format!(
-            "Watching {display_name} ({model}) · session {session_id}"
+        } => Some(color_guard_watch_line(
+            "Watching",
+            format!("Watching {display_name} ({model}) · session {session_id}"),
         )),
         WatchEvent::SessionEnd {
             session_id,
             outcome,
             total_tokens,
             total_turns,
-        } => Some(format!(
-            "Ended · {session_id} · {outcome} · {} tokens · {total_turns} turns · cc-blackbox postmortem {session_id}",
-            format_tokens(*total_tokens)
+        } => Some(color_guard_watch_line(
+            "Ended",
+            format!(
+                "Ended · {session_id} · {outcome} · {} tokens · {total_turns} turns · cc-blackbox postmortem {session_id}",
+                format_tokens(*total_tokens)
+            ),
         )),
         WatchEvent::PostmortemReady {
             session_id,
             idle_secs,
             total_tokens,
             total_turns,
-        } => Some(format!(
-            "Postmortem ready · {session_id} idle {} · {} tokens · {total_turns} turns · cc-blackbox postmortem {session_id} · cc-blackbox postmortem latest",
-            format_duration_coarse(*idle_secs),
-            format_tokens(*total_tokens)
-        )),
+        } => Some(
+            format!(
+                "Postmortem ready · {session_id} idle {} · {} tokens · {total_turns} turns · cc-blackbox postmortem {session_id} · cc-blackbox postmortem latest",
+                format_duration_coarse(*idle_secs),
+                format_tokens(*total_tokens)
+            )
+            .magenta()
+            .bold()
+            .to_string(),
+        ),
         WatchEvent::GuardFinding {
             session_id,
             rule_id,
@@ -1782,15 +1889,20 @@ fn render_guard_watch_line(event: &WatchEvent) -> Option<String> {
             if matches!(action.as_str(), "block" | "cooldown") && !recovery.is_empty() {
                 line.push_str(&format!(" · Recovery: {}", table_cell(recovery)));
             }
-            Some(line)
+            Some(color_guard_watch_line(state, line))
         }
         WatchEvent::ModelFallback {
             session_id,
             requested,
             actual,
-        } => Some(format!(
-            "Warning · {session_id} · model route differed: requested {requested}, got {actual}. This records a route mismatch only."
-        )),
+        } => Some(
+            format!(
+                "Warning · {session_id} · model route differed: requested {requested}, got {actual}. This records a route mismatch only."
+            )
+            .yellow()
+            .bold()
+            .to_string(),
+        ),
         WatchEvent::ContextStatus {
             session_id,
             fill_percent,
@@ -1807,9 +1919,12 @@ fn render_guard_watch_line(event: &WatchEvent) -> Option<String> {
                 Some(turns) => format!("about {turns} turns to auto-compaction"),
                 None => "auto-compaction estimate unknown".to_string(),
             };
-            Some(format!(
-                "{state} · {session_id} · context {:.0}% full · {runway}",
-                fill_percent
+            Some(color_guard_watch_line(
+                state,
+                format!(
+                    "{state} · {session_id} · context {:.0}% full · {runway}",
+                    fill_percent
+                ),
             ))
         }
         WatchEvent::CacheEvent {
@@ -1821,41 +1936,69 @@ fn render_guard_watch_line(event: &WatchEvent) -> Option<String> {
             let cost = estimated_rebuild_cost_dollars
                 .map(|value| format!(" · estimated rebuild ${value:.2}"))
                 .unwrap_or_default();
-            Some(format!(
-                "Warning · {session_id} · cache {}{cost}. Warning only; no request has been blocked.",
-                event_type.replace('_', " ")
-            ))
+            Some(
+                format!(
+                    "Warning · {session_id} · cache {}{cost}. Warning only; no request has been blocked.",
+                    event_type.replace('_', " ")
+                )
+                .yellow()
+                .to_string(),
+            )
         }
         WatchEvent::RateLimitStatus {
+            seconds_to_reset,
             tokens_used_this_week,
             tokens_limit,
             tokens_remaining,
+            budget_source,
             projected_exhaustion_secs,
             ..
         } => {
             let used = tokens_used_this_week.map(format_tokens);
             let limit = tokens_limit.map(format_tokens);
             let remaining = tokens_remaining.map(format_tokens);
-            if used.is_none() && remaining.is_none() {
+            if used.is_none() && limit.is_none() && remaining.is_none() {
                 return None;
             }
             let projected = projected_exhaustion_secs
                 .map(|secs| format!(" · projected exhaustion in {}", format_duration_coarse(secs)))
                 .unwrap_or_default();
-            Some(format!(
-                "Watching · quota · used {} of {} · remaining {}{projected}",
-                used.unwrap_or_else(|| "unknown".to_string()),
-                limit.unwrap_or_else(|| "unknown".to_string()),
-                remaining.unwrap_or_else(|| "unknown".to_string())
-            ))
+            let reset = seconds_to_reset
+                .map(|secs| format!(" · resets in {}", format_duration_coarse(secs)))
+                .unwrap_or_default();
+            let line = match (used, limit, remaining) {
+                (Some(used), Some(limit), Some(remaining)) => format!(
+                    "Watching · weekly quota · used {used} / {limit} · {remaining} left{}{}{projected}",
+                    quota_budget_source_note(budget_source.as_deref()),
+                    reset
+                ),
+                (Some(used), None, _) => format!(
+                    "Watching · weekly quota · used {used} this week · cap not set; set CC_BLACKBOX_WEEKLY_TOKEN_BUDGET to show remaining{reset}"
+                ),
+                (None, Some(limit), Some(remaining)) => format!(
+                    "Watching · weekly quota · {remaining} left of {limit}{}{}{projected}",
+                    quota_budget_source_note(budget_source.as_deref()),
+                    reset
+                ),
+                (None, _, Some(remaining)) => {
+                    format!("Watching · weekly quota · {remaining} left{reset}{projected}")
+                }
+                _ => return None,
+            };
+            Some(color_guard_watch_line("Warning", line))
         }
         WatchEvent::RequestError {
             session_id,
             error_type,
             ..
-        } => Some(format!(
-            "Warning · {session_id} · API error {error_type}. Details are redacted in guard output."
-        )),
+        } => Some(
+            format!(
+                "Warning · {session_id} · API error {error_type}. Details are redacted in guard output."
+            )
+            .red()
+            .bold()
+            .to_string(),
+        ),
         _ => None,
     }
 }
@@ -2453,9 +2596,12 @@ fn render_event(
                 });
             let source_is_auto = budget_source.as_deref() == Some("auto_p95_4w");
             let used_and_limit = tokens_used_this_week.zip(*tokens_limit);
-            let Some(remaining) = primary else {
+            let no_budget_cap =
+                tokens_used_this_week.is_some() && tokens_limit.is_none() && primary.is_none();
+            if !no_budget_cap && primary.is_none() {
                 return;
-            };
+            }
+            let remaining = primary.unwrap_or(0);
             let time = now_hms();
             let reset_str = seconds_to_reset
                 .map(|s| format!("resets in {}", format_duration_coarse(s)))
@@ -2473,7 +2619,13 @@ fn render_event(
             if !alarm && remaining > 1000 && !source_is_auto {
                 return;
             }
-            let mut line = if let Some((used, limit)) = used_and_limit {
+            let mut line = if no_budget_cap {
+                format!(
+                    "{}  QUOTA   used {} this week · cap not set · set CC_BLACKBOX_WEEKLY_TOKEN_BUDGET to show remaining",
+                    time,
+                    format_tokens(tokens_used_this_week.unwrap_or(0))
+                )
+            } else if let Some((used, limit)) = used_and_limit {
                 format!(
                     "{}  QUOTA   {} / {} tokens · {}",
                     time,
@@ -3513,7 +3665,7 @@ fn is_low_signal(label: &str, value: &str) -> bool {
         "Waste" => lower.contains("no likely wasted tokens") || lower.starts_with("0 tokens"),
         "Tools" | "Skills" | "MCP" => {
             lower.starts_with("no failed")
-                || lower.contains("0 failures")
+                || (lower.contains("0 failures") && !lower.contains("repeated"))
                 || lower == "no tool calls recorded"
         }
         "Cache" => lower.starts_with("healthy"),
@@ -3575,6 +3727,10 @@ fn finding_severity(
 }
 
 fn should_render_signal_card(label: &str, value: &str) -> bool {
+    is_postmortem_signal(label, value) && !is_low_signal(label, value)
+}
+
+fn is_postmortem_signal(label: &str, value: &str) -> bool {
     matches!(label, "Cause" | "Cache" | "Context" | "Waste" | "Tools")
         || (matches!(label, "Skills" | "MCP") && !is_low_signal(label, value))
 }
@@ -3646,28 +3802,28 @@ fn terminal_box(
         format!(" {title} ")
     };
     let fill = border_width.saturating_sub(title_label.chars().count());
-    out.push_str(&accent.paint(&format!("╭{}{}╮", title_label, "─".repeat(fill))));
+    out.push_str(&accent.paint(&format!("+{}{}+", title_label, "-".repeat(fill))));
     out.push('\n');
 
     for line in lines {
         let visible = line.raw.chars().count().min(inner_width);
         let pad = inner_width.saturating_sub(visible);
-        out.push_str(&accent.paint("│"));
+        out.push_str(&accent.paint("|"));
         out.push(' ');
         out.push_str(&line.painted);
         out.push_str(&" ".repeat(pad));
         out.push(' ');
-        out.push_str(&accent.paint("│"));
+        out.push_str(&accent.paint("|"));
         out.push('\n');
     }
 
-    out.push_str(&accent.paint(&format!("╰{}╯", "─".repeat(border_width))));
+    out.push_str(&accent.paint(&format!("+{}+", "-".repeat(border_width))));
     out.push('\n');
     out
 }
 
 fn postmortem_tabs_line(width: usize, state: Option<&str>) -> TerminalLine {
-    let left = "[ Postmortem ]  Snapshot  Signals  Evidence";
+    let left = "Postmortem";
     let right = state.unwrap_or("final postmortem");
     let raw = if left.chars().count() + right.chars().count() + 3 <= width {
         format!(
@@ -3679,10 +3835,10 @@ fn postmortem_tabs_line(width: usize, state: Option<&str>) -> TerminalLine {
     } else {
         truncate_for_box(left, width)
     };
-    let painted = if let Some(rest) = raw.strip_prefix("[ Postmortem ]") {
+    let painted = if let Some(rest) = raw.strip_prefix("Postmortem") {
         format!(
             "{}{}",
-            "[ Postmortem ]".truecolor(255, 145, 71).bold(),
+            "Postmortem".truecolor(255, 145, 71).bold(),
             rest.bright_black()
         )
     } else {
@@ -3691,8 +3847,17 @@ fn postmortem_tabs_line(width: usize, state: Option<&str>) -> TerminalLine {
     TerminalLine::styled(raw, painted)
 }
 
+fn human_state_summary(state: &str) -> &'static str {
+    let lower = state.to_ascii_lowercase();
+    if lower.contains("partial") {
+        "Session still running"
+    } else {
+        "Final session report"
+    }
+}
+
 fn summary_lines(
-    title: &str,
+    _title: &str,
     snapshot: &[(String, String)],
     signals: &[(String, String)],
     inner_width: usize,
@@ -3708,19 +3873,19 @@ fn summary_lines(
 
     let mut lines = Vec::new();
     lines.extend(wrapped_terminal_lines(
-        &format!("{title}  {state}  Outcome: {outcome}"),
+        &format!("{}: {outcome}", human_state_summary(state)),
         inner_width,
         |line| line.bright_white().bold().to_string(),
     ));
     lines.extend(wrapped_terminal_lines(
-        &format!("Session: {session}  Model: {model}  Duration: {duration}"),
-        inner_width,
-        |line| line.bright_white().to_string(),
-    ));
-    lines.extend(wrapped_terminal_lines(
-        &format!("Turns/tokens: {turns}  Cost: {cost}"),
+        &format!("{duration} · {turns} · {cost}"),
         inner_width,
         |line| line.truecolor(80, 220, 135).bold().to_string(),
+    ));
+    lines.extend(wrapped_terminal_lines(
+        &format!("{model} · {session}"),
+        inner_width,
+        |line| line.bright_white().to_string(),
     ));
     lines.extend(wrapped_terminal_lines(
         &format!("Impact: {waste}"),
@@ -3734,6 +3899,15 @@ fn summary_lines(
         },
     ));
     lines
+}
+
+fn signal_card_title(label: &str, severity: &str) -> String {
+    match severity {
+        "High" => format!("Needs attention: {label}"),
+        "Medium" => format!("Worth watching: {label}"),
+        "Low" => format!("Looks good: {label}"),
+        _ => label.to_string(),
+    }
 }
 
 fn evidence_matches_signal(evidence: &EvidenceRow, label: &str) -> bool {
@@ -3774,7 +3948,6 @@ fn evidence_terminal_line(evidence: &EvidenceRow, width: usize) -> TerminalLine 
 }
 
 fn signal_card_lines(
-    index: usize,
     label: &str,
     value: &str,
     severity: &str,
@@ -3784,11 +3957,32 @@ fn signal_card_lines(
     inner_width: usize,
 ) -> Vec<TerminalLine> {
     let mut lines = Vec::new();
-    let headline = format!("{index}. {label}: {value}  {severity}");
+    let headline = format!("{label}: {value}");
     let headline = truncate_for_box(&headline, inner_width);
     lines.push(TerminalLine::styled(
         headline.clone(),
         accent.paint_bold(&headline),
+    ));
+    lines.push(TerminalLine::styled(
+        format!("Priority: {severity}"),
+        match severity {
+            "High" => format!(
+                "{} {}",
+                "Priority:".bright_black().bold(),
+                severity.red().bold()
+            ),
+            "Medium" => format!(
+                "{} {}",
+                "Priority:".bright_black().bold(),
+                severity.yellow().bold()
+            ),
+            "Low" => format!(
+                "{} {}",
+                "Priority:".bright_black().bold(),
+                severity.green().bold()
+            ),
+            _ => format!("{} {severity}", "Priority:".bright_black().bold()),
+        },
     ));
 
     for evidence in evidence
@@ -3799,8 +3993,8 @@ fn signal_card_lines(
         lines.push(evidence_terminal_line(evidence, inner_width));
     }
 
-    if label == "Cause" {
-        if let Some(next_action) = next_action {
+    if matches!(severity, "High" | "Medium") || label == "Cause" {
+        if let Some(next_action) = next_action.filter(|value| !value.trim().is_empty()) {
             lines.extend(wrapped_terminal_lines(
                 &format!("Next: {next_action}"),
                 inner_width,
@@ -3809,6 +4003,24 @@ fn signal_card_lines(
         }
     }
 
+    lines
+}
+
+fn health_check_lines(rows: &[(&String, &String)], inner_width: usize) -> Vec<TerminalLine> {
+    let mut lines = Vec::new();
+    for (label, value) in rows {
+        lines.extend(wrapped_terminal_lines(
+            &format!("{label}: {value}"),
+            inner_width,
+            |line| line.truecolor(80, 220, 135).to_string(),
+        ));
+    }
+    if lines.is_empty() {
+        lines.push(TerminalLine::styled(
+            "No guard signals need attention.".to_string(),
+            "No guard signals need attention.".green().to_string(),
+        ));
+    }
     lines
 }
 
@@ -3900,18 +4112,17 @@ fn render_postmortem_terminal_for_width(markdown: &str, width: usize) -> String 
 
     let outcome = key_value(&snapshot, "Outcome");
     let next_action = key_value(&signals, "Next");
-    let mut rendered_findings = 0;
+    let mut rendered_signal_cards = 0;
     for (label, value) in signals
         .iter()
         .filter(|(label, value)| should_render_signal_card(label, value))
     {
-        rendered_findings += 1;
+        rendered_signal_cards += 1;
         let (severity, accent) = finding_severity(label, value, outcome);
         out.push('\n');
         out.push_str(&terminal_box(
-            &format!("Finding {rendered_findings}"),
+            &signal_card_title(label, severity),
             &signal_card_lines(
-                rendered_findings,
                 label,
                 value,
                 severity,
@@ -3922,6 +4133,29 @@ fn render_postmortem_terminal_for_width(markdown: &str, width: usize) -> String 
             ),
             width,
             accent,
+        ));
+    }
+
+    let healthy_checks = signals
+        .iter()
+        .filter(|(label, value)| is_postmortem_signal(label, value) && is_low_signal(label, value))
+        .map(|(label, value)| (label, value))
+        .collect::<Vec<_>>();
+    if !healthy_checks.is_empty() {
+        out.push('\n');
+        out.push_str(&terminal_box(
+            "Checks passed",
+            &health_check_lines(&healthy_checks, inner_width),
+            width,
+            PostmortemAccent::Good,
+        ));
+    } else if rendered_signal_cards == 0 {
+        out.push('\n');
+        out.push_str(&terminal_box(
+            "No action needed",
+            &health_check_lines(&[], inner_width),
+            width,
+            PostmortemAccent::Good,
         ));
     }
 
@@ -6585,6 +6819,29 @@ mod tests {
     }
 
     #[test]
+    fn guard_watch_quota_line_explains_missing_budget_cap() {
+        let quota = WatchEvent::RateLimitStatus {
+            seconds_to_reset: Some(3600),
+            requests_remaining: None,
+            requests_limit: None,
+            input_tokens_remaining: None,
+            output_tokens_remaining: None,
+            tokens_used_this_week: Some(826000),
+            tokens_limit: None,
+            tokens_remaining: None,
+            budget_source: None,
+            projected_exhaustion_secs: None,
+        };
+
+        let line = render_guard_watch_line(&quota).expect("quota line");
+
+        assert!(line.contains("used 826K this week"));
+        assert!(line.contains("cap not set"));
+        assert!(line.contains("CC_BLACKBOX_WEEKLY_TOKEN_BUDGET"));
+        assert!(!line.contains("unknown"));
+    }
+
+    #[test]
     fn postmortem_progress_message_is_single_combined_line() {
         assert_eq!(
             postmortem_progress_message("last", true, true),
@@ -7039,7 +7296,7 @@ If failures recur, restart with a shorter prompt.\n\
     }
 
     #[test]
-    fn postmortem_terminal_renderer_uses_boxed_ranked_cards() {
+    fn postmortem_terminal_renderer_uses_human_signal_cards() {
         let markdown = "# cc-blackbox Postmortem\n\
 \n\
 ## Snapshot\n\
@@ -7074,18 +7331,56 @@ If failures recur, restart with a shorter prompt.\n\
 
         let terminal = render_postmortem_terminal_for_width(markdown, 92);
 
-        assert!(terminal.contains("[ Postmortem ]"));
-        assert!(terminal.contains("╭ cc-blackbox Postmortem"));
-        assert!(terminal.contains("Finding 1"));
-        assert!(terminal.contains("1. Cause: Tool failure loop"));
-        assert!(terminal.contains("Finding 5"));
+        assert!(terminal.contains("Postmortem"));
+        assert!(terminal.contains("+ cc-blackbox Postmortem"));
+        assert!(terminal.contains("Needs attention: Cause"));
+        assert!(terminal.contains("Cause: Tool failure loop"));
+        assert!(terminal.contains("Needs attention: Tools"));
         assert!(terminal.contains("Impact: Likely waste: 76K tokens, $1.84"));
+        assert!(terminal.contains("Priority: High"));
         assert!(terminal.contains("Evidence"));
         assert!(terminal.contains("Claude Analysis"));
         assert!(terminal.contains("Restart: Continue from this summary"));
-        assert!(!terminal.contains("Finding 6"));
+        assert!(!terminal.contains("Finding 1"));
         assert!(!terminal.contains("## Snapshot"));
-        assert!(!terminal.contains("----------"));
+        assert!(!terminal.contains("Type        Signal"));
+    }
+
+    #[test]
+    fn postmortem_terminal_groups_low_risk_checks() {
+        let markdown = "# cc-blackbox Postmortem\n\
+\n\
+## Snapshot\n\
+  Session       `session_target`\n\
+  State         partial snapshot\n\
+  Outcome       In Progress\n\
+  Model         claude-haiku\n\
+  Duration      1m\n\
+  Turns/tokens  6 turns, 208K\n\
+  Cost          $0.08\n\
+\n\
+## Signals\n\
+  Cause   No degradation detected\n\
+  Cache   Mixed: 81% reusable prompt cache; 80% of input from cache\n\
+  Context Plenty of room: 20% full; about 143 turns before auto-compaction\n\
+  Waste   No likely wasted tokens detected\n\
+  Tools   10 calls, 2 failures; failing: Read (1), Glob (1)\n\
+  Next    Session is still partial; use this as a progress snapshot.\n\
+\n\
+## Evidence\n\
+  Type        Signal        Turn   Detail\n\
+  ----------  ------------  -----  ------\n\
+  direct      tools         -      10 tool calls, 2 failures\n";
+
+        let terminal = render_postmortem_terminal_for_width(markdown, 96);
+
+        assert!(terminal.contains("Session still running: In Progress"));
+        assert!(terminal.contains("Worth watching: Cache"));
+        assert!(terminal.contains("Needs attention: Tools"));
+        assert!(terminal.contains("Checks passed"));
+        assert!(terminal.contains("Cause: No degradation detected"));
+        assert!(!terminal.contains("Looks good: Cause"));
+        assert!(!terminal.contains("Finding"));
     }
 
     #[test]

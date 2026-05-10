@@ -33,6 +33,12 @@ enum Commands {
     /// Check local developer prerequisites and stack health
     Doctor,
 
+    /// Product-facing live guard commands
+    Guard {
+        #[command(subcommand)]
+        command: GuardCommands,
+    },
+
     /// Start the local cc-blackbox stack
     Up {
         /// Start without Grafana once compose profiles support it
@@ -116,7 +122,7 @@ enum Commands {
         #[arg(long, default_value = "http://localhost:9091")]
         url: String,
 
-        /// Session id, or "last" for the latest completed session
+        /// Session id, or "latest"/"last" for the latest completed session
         target: String,
 
         /// Deprecated: postmortems redact by default
@@ -180,6 +186,49 @@ enum Commands {
         /// Optional import timestamp in UTC ISO 8601
         #[arg(long)]
         imported_at: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GuardCommands {
+    /// Start or validate the local guard stack
+    Start {
+        /// Start without Grafana once compose profiles support it
+        #[arg(long)]
+        no_grafana: bool,
+    },
+
+    /// Show the effective guard policy
+    Policy {
+        /// Base URL of cc-blackbox-core
+        #[arg(long, default_value = "http://localhost:9091")]
+        url: String,
+    },
+
+    /// Show current guard state
+    Status {
+        /// Base URL of cc-blackbox-core
+        #[arg(long, default_value = "http://localhost:9091")]
+        url: String,
+
+        /// Filter to a specific session ID
+        #[arg(long)]
+        session: Option<String>,
+    },
+
+    /// Watch live guard findings in plain language
+    Watch {
+        /// Base URL of cc-blackbox-core
+        #[arg(long, default_value = "http://localhost:9091")]
+        url: String,
+
+        /// Filter to a specific session ID
+        #[arg(long)]
+        session: Option<String>,
+
+        /// Render redacted postmortems automatically in guard watch output
+        #[arg(long)]
+        postmortem: bool,
     },
 }
 
@@ -396,6 +445,13 @@ enum PortState {
     Available,
     CcBlackboxService(String),
     Busy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GuardStackReadiness {
+    Running,
+    NeedsStart,
+    Blocked(String),
 }
 
 #[derive(Debug)]
@@ -1046,6 +1102,120 @@ async fn run_up(no_grafana: bool) -> i32 {
     }
 }
 
+async fn guard_core_endpoint_ready(client: &reqwest::Client, base_url: &str, path: &str) -> bool {
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let Ok(resp) = client.get(url).send().await else {
+        return false;
+    };
+    resp.status().is_success() && resp.json::<serde_json::Value>().await.is_ok()
+}
+
+async fn guard_core_endpoints_ready(base_url: &str) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
+
+    guard_core_endpoint_ready(&client, base_url, "/api/guard/policy").await
+        && guard_core_endpoint_ready(&client, base_url, "/api/guard/status").await
+}
+
+fn guard_proxy_port_ready() -> Result<bool, String> {
+    match port_state(10000) {
+        PortState::Available => Ok(false),
+        PortState::CcBlackboxService(_) => Ok(true),
+        PortState::Busy => Err(
+            "port 10000 is in use, but it is not recognized as the cc-blackbox Envoy proxy. \
+Stop the conflicting process or free port 10000, then rerun `cc-blackbox guard start`."
+                .to_string(),
+        ),
+    }
+}
+
+async fn probe_guard_stack_readiness() -> GuardStackReadiness {
+    let proxy_ready = match guard_proxy_port_ready() {
+        Ok(ready) => ready,
+        Err(err) => return GuardStackReadiness::Blocked(err),
+    };
+    let core_url = cc_blackbox_core_url();
+    let core_ready = guard_core_endpoints_ready(&core_url).await;
+
+    if core_ready && proxy_ready {
+        GuardStackReadiness::Running
+    } else {
+        GuardStackReadiness::NeedsStart
+    }
+}
+
+fn print_guard_running(already_running: bool) {
+    if already_running {
+        println!("cc-blackbox guard is already running.");
+    } else {
+        println!("cc-blackbox guard is running.");
+    }
+    println!("  Envoy proxy:      {}", envoy_proxy_url());
+    println!("  cc-blackbox core: {}", cc_blackbox_core_url());
+    println!("Next:");
+    println!("  cc-blackbox guard status");
+    println!("  cc-blackbox guard watch");
+}
+
+async fn run_guard_start_with_deps<Readiness, ReadinessFut, Start, StartFut>(
+    no_grafana: bool,
+    mut guard_stack_readiness: Readiness,
+    start_existing_stack: Start,
+) -> i32
+where
+    Readiness: FnMut() -> ReadinessFut,
+    ReadinessFut: std::future::Future<Output = GuardStackReadiness>,
+    Start: FnOnce(bool) -> StartFut,
+    StartFut: std::future::Future<Output = Result<(), String>>,
+{
+    match guard_stack_readiness().await {
+        GuardStackReadiness::Running => {
+            print_guard_running(true);
+            return 0;
+        }
+        GuardStackReadiness::Blocked(err) => {
+            eprintln!("Error: {err}");
+            return 1;
+        }
+        GuardStackReadiness::NeedsStart => {}
+    }
+
+    match start_existing_stack(no_grafana).await {
+        Ok(()) => match guard_stack_readiness().await {
+            GuardStackReadiness::Running => {
+                println!();
+                print_guard_running(false);
+                0
+            }
+            GuardStackReadiness::NeedsStart => {
+                eprintln!(
+                    "Error: cc-blackbox guard start completed, but the guard endpoints or proxy \
+did not validate. Run `cc-blackbox doctor`, then rerun `cc-blackbox guard start`."
+                );
+                1
+            }
+            GuardStackReadiness::Blocked(err) => {
+                eprintln!("Error: cc-blackbox guard start completed, but validation failed: {err}");
+                1
+            }
+        },
+        Err(err) => {
+            println!();
+            eprintln!("Error: {err}");
+            1
+        }
+    }
+}
+
+async fn run_guard_start(no_grafana: bool) -> i32 {
+    run_guard_start_with_deps(no_grafana, probe_guard_stack_readiness, start_stack).await
+}
+
 fn extract_run_watch(watch_flag: bool, command: Vec<String>) -> (bool, Vec<String>) {
     let mut watch = watch_flag;
     let mut child_command = Vec::with_capacity(command.len());
@@ -1320,6 +1490,372 @@ fn truncate_for_box(s: &str, max_chars: usize) -> String {
 
 fn now_hms() -> String {
     Local::now().format("%H:%M:%S").to_string()
+}
+
+fn format_policy_bool(value: bool) -> &'static str {
+    if value {
+        "enabled"
+    } else {
+        "disabled"
+    }
+}
+
+fn format_policy_number(value: Option<u64>, suffix: &str) -> Option<String> {
+    value.map(|number| format!("{} {suffix}", format_tokens(number)))
+}
+
+fn format_policy_rule(rule: &serde_json::Value) -> String {
+    let action = json_str(rule, "/action").unwrap_or("allow");
+    let mut parts = vec![action.to_string()];
+    if let Some(value) = format_policy_number(json_u64(rule, "/limit_tokens"), "tokens") {
+        parts.push(format!("limit {value}"));
+    }
+    if let Some(value) = json_f64(rule, "/limit_dollars") {
+        parts.push(format!("limit ${value:.2}"));
+    }
+    if let Some(value) = json_u64(rule, "/threshold_count") {
+        parts.push(format!("threshold {value}"));
+    }
+    if let Some(value) = json_u64(rule, "/cooldown_secs") {
+        parts.push(format!("cooldown {}", format_duration_coarse(value)));
+    }
+    parts.join(" · ")
+}
+
+fn render_guard_policy_report(report: &serde_json::Value) -> String {
+    let source = json_str(report, "/source").unwrap_or("unknown");
+    let fail_open = json_bool(report, "/policy/fail_open").unwrap_or(true);
+    let defaults_fail_open = json_bool(report, "/defaults/fail_open").unwrap_or(true);
+    let warnings = report
+        .get("warnings")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut out = String::new();
+    out.push_str("Guard policy\n");
+    out.push_str(&format!("Config source: {source}\n"));
+    out.push_str(&format!("Fail open: {}\n", format_policy_bool(fail_open)));
+    out.push_str(&format!(
+        "Defaults: fail open {}\n",
+        format_policy_bool(defaults_fail_open)
+    ));
+
+    if warnings.is_empty() {
+        out.push_str("Policy warnings: none\n");
+    } else {
+        out.push_str("Policy warnings:\n");
+        for warning in warnings {
+            out.push_str(&format!("  - {warning}\n"));
+        }
+    }
+
+    out.push_str("Rules:\n");
+    if let Some(rules) = report
+        .pointer("/policy/rules")
+        .and_then(|value| value.as_object())
+    {
+        let mut names = rules.keys().collect::<Vec<_>>();
+        names.sort();
+        for name in names {
+            if let Some(rule) = rules.get(name) {
+                out.push_str(&format!("  {name}: {}\n", format_policy_rule(rule)));
+            }
+        }
+    } else {
+        out.push_str("  none\n");
+    }
+
+    out
+}
+
+fn guard_state_label(state: &str) -> &'static str {
+    match state {
+        "healthy" => "Healthy",
+        "watching" => "Watching",
+        "warning" => "Warning",
+        "critical" => "Critical",
+        "blocked" => "Blocked",
+        "cooldown" => "Cooldown",
+        "ended" => "Ended",
+        _ => "Watching",
+    }
+}
+
+fn finding_title(finding: &serde_json::Value) -> String {
+    json_str(finding, "/title")
+        .or_else(|| json_str(finding, "/rule_id"))
+        .unwrap_or("guard finding")
+        .replace('_', " ")
+}
+
+fn finding_action_text(finding: &serde_json::Value) -> String {
+    let action = json_str(finding, "/action").unwrap_or("warn");
+    match action {
+        "warn" => "Warning only; no request has been blocked.".to_string(),
+        "critical" => {
+            "Critical state; traffic is still allowed unless policy blocks later.".to_string()
+        }
+        "block" => "Blocked by guard policy.".to_string(),
+        "cooldown" => "Cooldown is active.".to_string(),
+        "diagnose_only" => "Diagnostic finding only.".to_string(),
+        _ => format!("Action: {action}"),
+    }
+}
+
+fn default_recovery_for_action(action: &str) -> &'static str {
+    match action {
+        "block" => {
+            "Start a fresh Claude Code session, narrow the task, or raise the guard policy limit."
+        }
+        "cooldown" => "Wait for the cooldown to expire, fix the API error cause, then retry.",
+        _ => "",
+    }
+}
+
+fn render_guard_finding(finding: &serde_json::Value, out: &mut String) {
+    let action = json_str(finding, "/action").unwrap_or("warn");
+    let detail = json_str(finding, "/detail").unwrap_or("");
+    let evidence = json_str(finding, "/evidence_level").unwrap_or("derived");
+    let confidence = json_f64(finding, "/confidence");
+
+    out.push_str(&format!(
+        "    - {}: {}\n",
+        finding_title(finding),
+        finding_action_text(finding)
+    ));
+    if !detail.trim().is_empty() {
+        out.push_str(&format!("      Detail: {}\n", table_cell(detail)));
+    }
+    let confidence_text = confidence
+        .map(|value| format!(" · confidence {:.0}%", value * 100.0))
+        .unwrap_or_default();
+    out.push_str(&format!("      Evidence: {evidence}{confidence_text}\n"));
+
+    let recovery = json_str(finding, "/suggested_action")
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default_recovery_for_action(action));
+    if matches!(action, "block" | "cooldown") && !recovery.is_empty() {
+        out.push_str(&format!("      Recovery: {}\n", table_cell(recovery)));
+    }
+}
+
+fn render_guard_status_report(report: &serde_json::Value) -> String {
+    let overall = json_str(report, "/overall_state").unwrap_or("healthy");
+    let mut out = String::new();
+    out.push_str("Guard status\n");
+    out.push_str(&format!("Overall: {}\n", guard_state_label(overall)));
+    out.push_str("Postmortems: cc-blackbox postmortem latest; cc-blackbox postmortem SESSION_ID\n");
+
+    let sessions = report
+        .get("sessions")
+        .and_then(|value| value.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if sessions.is_empty() {
+        out.push_str("\nNo active sessions. Guard is Healthy.\n");
+        return out;
+    }
+
+    out.push_str("\nSessions:\n");
+    for session in sessions {
+        let session_id = json_str(session, "/session_id").unwrap_or("unknown");
+        let display_name = json_str(session, "/display_name").unwrap_or(session_id);
+        let model = json_str(session, "/model").unwrap_or("unknown model");
+        let state = guard_state_label(json_str(session, "/state").unwrap_or("watching"));
+        out.push_str(&format!(
+            "  {state}  {display_name}  {model}  {session_id}\n"
+        ));
+
+        let findings = session
+            .get("findings")
+            .and_then(|value| value.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if findings.is_empty() {
+            out.push_str("    - No active guard findings.\n");
+        } else {
+            for finding in findings.iter().take(3) {
+                render_guard_finding(finding, &mut out);
+            }
+        }
+    }
+
+    out
+}
+
+fn guard_action_state_label(action: &str, severity: &str) -> &'static str {
+    match action {
+        "cooldown" => "Cooldown",
+        "block" => "Blocked",
+        "critical" => "Critical",
+        "warn" => "Warning",
+        _ if severity == "critical" => "Critical",
+        _ if severity == "warning" => "Warning",
+        _ => "Watching",
+    }
+}
+
+fn guard_watch_action_text(action: &str) -> &'static str {
+    match action {
+        "warn" => "Warning only; no request has been blocked.",
+        "critical" => "Critical state; traffic is still allowed unless policy blocks later.",
+        "block" => "Blocked by guard policy.",
+        "cooldown" => "Cooldown is active.",
+        "diagnose_only" => "Diagnostic finding only.",
+        _ => "Guard finding recorded.",
+    }
+}
+
+fn default_watch_recovery(action: &str) -> &'static str {
+    match action {
+        "block" => {
+            "Start a fresh Claude Code session, narrow the task, or raise the guard policy limit."
+        }
+        "cooldown" => "Wait for the cooldown to expire, fix the API error cause, then retry.",
+        _ => "",
+    }
+}
+
+fn render_guard_watch_line(event: &WatchEvent) -> Option<String> {
+    match event {
+        WatchEvent::SessionStart {
+            session_id,
+            display_name,
+            model,
+            ..
+        } => Some(format!(
+            "Watching {display_name} ({model}) · session {session_id}"
+        )),
+        WatchEvent::SessionEnd {
+            session_id,
+            outcome,
+            total_tokens,
+            total_turns,
+        } => Some(format!(
+            "Ended · {session_id} · {outcome} · {} tokens · {total_turns} turns · cc-blackbox postmortem {session_id}",
+            format_tokens(*total_tokens)
+        )),
+        WatchEvent::PostmortemReady {
+            session_id,
+            idle_secs,
+            total_tokens,
+            total_turns,
+        } => Some(format!(
+            "Postmortem ready · {session_id} idle {} · {} tokens · {total_turns} turns · cc-blackbox postmortem {session_id} · cc-blackbox postmortem latest",
+            format_duration_coarse(*idle_secs),
+            format_tokens(*total_tokens)
+        )),
+        WatchEvent::GuardFinding {
+            session_id,
+            rule_id,
+            severity,
+            action,
+            evidence_level,
+            source,
+            confidence,
+            detail,
+            suggested_action,
+            ..
+        } => {
+            let state = guard_action_state_label(action, severity);
+            let mut line = format!(
+                "{state} · {session_id} · {} · {} · {} · evidence {} from {} · confidence {:.0}%",
+                rule_id.replace('_', " "),
+                table_cell(detail),
+                guard_watch_action_text(action),
+                evidence_level,
+                source,
+                confidence * 100.0
+            );
+            let recovery = suggested_action
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| default_watch_recovery(action));
+            if matches!(action.as_str(), "block" | "cooldown") && !recovery.is_empty() {
+                line.push_str(&format!(" · Recovery: {}", table_cell(recovery)));
+            }
+            Some(line)
+        }
+        WatchEvent::ModelFallback {
+            session_id,
+            requested,
+            actual,
+        } => Some(format!(
+            "Warning · {session_id} · model route differed: requested {requested}, got {actual}. This records a route mismatch only."
+        )),
+        WatchEvent::ContextStatus {
+            session_id,
+            fill_percent,
+            turns_to_compact,
+            ..
+        } if *fill_percent >= 60.0 => {
+            let state = if *fill_percent >= 80.0 {
+                "Critical"
+            } else {
+                "Warning"
+            };
+            let runway = match turns_to_compact {
+                Some(0) => "auto-compaction may start now".to_string(),
+                Some(turns) => format!("about {turns} turns to auto-compaction"),
+                None => "auto-compaction estimate unknown".to_string(),
+            };
+            Some(format!(
+                "{state} · {session_id} · context {:.0}% full · {runway}",
+                fill_percent
+            ))
+        }
+        WatchEvent::CacheEvent {
+            session_id,
+            event_type,
+            estimated_rebuild_cost_dollars,
+            ..
+        } if matches!(event_type.as_str(), "miss_rebuild" | "miss_ttl" | "miss_thrash") => {
+            let cost = estimated_rebuild_cost_dollars
+                .map(|value| format!(" · estimated rebuild ${value:.2}"))
+                .unwrap_or_default();
+            Some(format!(
+                "Warning · {session_id} · cache {}{cost}. Warning only; no request has been blocked.",
+                event_type.replace('_', " ")
+            ))
+        }
+        WatchEvent::RateLimitStatus {
+            tokens_used_this_week,
+            tokens_limit,
+            tokens_remaining,
+            projected_exhaustion_secs,
+            ..
+        } => {
+            let used = tokens_used_this_week.map(format_tokens);
+            let limit = tokens_limit.map(format_tokens);
+            let remaining = tokens_remaining.map(format_tokens);
+            if used.is_none() && remaining.is_none() {
+                return None;
+            }
+            let projected = projected_exhaustion_secs
+                .map(|secs| format!(" · projected exhaustion in {}", format_duration_coarse(secs)))
+                .unwrap_or_default();
+            Some(format!(
+                "Watching · quota · used {} of {} · remaining {}{projected}",
+                used.unwrap_or_else(|| "unknown".to_string()),
+                limit.unwrap_or_else(|| "unknown".to_string()),
+                remaining.unwrap_or_else(|| "unknown".to_string())
+            ))
+        }
+        WatchEvent::RequestError {
+            session_id,
+            error_type,
+            ..
+        } => Some(format!(
+            "Warning · {session_id} · API error {error_type}. Details are redacted in guard output."
+        )),
+        _ => None,
+    }
 }
 
 /// Extract session_id from any WatchEvent variant. Returns None for global
@@ -3971,6 +4507,45 @@ async fn main() {
         Commands::Doctor => {
             std::process::exit(run_doctor().await);
         }
+        Commands::Guard { command } => {
+            let code = match command {
+                GuardCommands::Start { no_grafana } => run_guard_start(no_grafana).await,
+                GuardCommands::Policy { url } => run_guard_policy(&url).await,
+                GuardCommands::Status { url, session } => run_guard_status(&url, &session).await,
+                GuardCommands::Watch {
+                    url,
+                    session,
+                    postmortem,
+                } => {
+                    let watch_url = match &session {
+                        Some(sid) => format!("{}/watch?session={}", url.trim_end_matches('/'), sid),
+                        None => format!("{}/watch", url.trim_end_matches('/')),
+                    };
+                    println!("Connecting to guard stream at {}...", watch_url);
+                    let mut postmortem_state = WatchPostmortemState::new(postmortem, &url, false);
+                    loop {
+                        match connect_and_guard_stream(&watch_url, &session, &mut postmortem_state)
+                            .await
+                        {
+                            Ok(()) => {
+                                eprintln!(
+                                    "{}",
+                                    "Guard stream closed. Reconnecting in 3s...".dimmed()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "{}",
+                                    format!("Waiting for cc-blackbox-core... ({})", e).dimmed()
+                                );
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                }
+            };
+            std::process::exit(code);
+        }
         Commands::Up { no_grafana } => {
             std::process::exit(run_up(no_grafana).await);
         }
@@ -4146,6 +4721,7 @@ async fn fetch_postmortem_json(
     target: &str,
     redact: bool,
 ) -> Result<serde_json::Value, String> {
+    let target = normalize_postmortem_target(target);
     let url = format!(
         "{}/api/postmortem/{}",
         base_url.trim_end_matches('/'),
@@ -4170,6 +4746,77 @@ async fn fetch_postmortem_json(
     resp.json::<serde_json::Value>()
         .await
         .map_err(|err| err.to_string())
+}
+
+fn normalize_postmortem_target(target: &str) -> &str {
+    if target == "latest" {
+        "last"
+    } else {
+        target
+    }
+}
+
+async fn fetch_json_endpoint(base_url: &str, path: &str) -> Result<serde_json::Value, String> {
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let detail = body.trim();
+        return if detail.is_empty() {
+            Err(format!("HTTP {status}"))
+        } else {
+            Err(format!("HTTP {status}: {detail}"))
+        };
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+async fn fetch_guard_policy_report(base_url: &str) -> Result<serde_json::Value, String> {
+    fetch_json_endpoint(base_url, "/api/guard/policy").await
+}
+
+async fn fetch_guard_status_report(
+    base_url: &str,
+    session: &Option<String>,
+) -> Result<serde_json::Value, String> {
+    let path = match session {
+        Some(session_id) => format!("/api/guard/status?session={session_id}"),
+        None => "/api/guard/status".to_string(),
+    };
+    fetch_json_endpoint(base_url, &path).await
+}
+
+async fn run_guard_policy(base_url: &str) -> i32 {
+    match fetch_guard_policy_report(base_url).await {
+        Ok(report) => {
+            print!("{}", render_guard_policy_report(&report));
+            0
+        }
+        Err(err) => {
+            eprintln!("{}", format!("Error: {err}").red());
+            1
+        }
+    }
+}
+
+async fn run_guard_status(base_url: &str, session: &Option<String>) -> i32 {
+    match fetch_guard_status_report(base_url, session).await {
+        Ok(report) => {
+            print!("{}", render_guard_status_report(&report));
+            0
+        }
+        Err(err) => {
+            eprintln!("{}", format!("Error: {err}").red());
+            1
+        }
+    }
 }
 
 async fn fetch_postmortem_json_with_retry(
@@ -4576,6 +5223,111 @@ async fn connect_and_stream(
     Ok(())
 }
 
+async fn connect_and_guard_stream(
+    url: &str,
+    session_filter: &Option<String>,
+    postmortem: &mut WatchPostmortemState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = reqwest::Client::new()
+        .get(url)
+        .header("Accept", "text/event-stream")
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()).into());
+    }
+
+    eprintln!("{}", "Connected. Guard is watching...".green());
+
+    let mut stream = resp.bytes_stream();
+    use futures_util::StreamExt;
+
+    let mut line_buffer = Vec::new();
+    let mut data_buffer = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        line_buffer.extend_from_slice(&chunk);
+
+        while let Some(newline_pos) = line_buffer.iter().position(|byte| *byte == b'\n') {
+            let line_bytes = line_buffer[..newline_pos].to_vec();
+            line_buffer.drain(..=newline_pos);
+            let Ok(line) = std::str::from_utf8(&line_bytes) else {
+                continue;
+            };
+            let line = line.trim_end_matches('\r');
+
+            if let Some(data) = line.strip_prefix("data: ") {
+                data_buffer.push_str(data);
+            } else if line.starts_with(": ") || line.starts_with(':') {
+                continue;
+            } else if line.is_empty() && !data_buffer.is_empty() {
+                if let Ok(event) = serde_json::from_str::<WatchEvent>(&data_buffer) {
+                    if let Some(filter) = session_filter {
+                        if let Some(session_id) = event_session_id(&event) {
+                            if session_id != filter {
+                                data_buffer.clear();
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(line) = render_guard_watch_line(&event) {
+                        println!("{line}");
+                    }
+                    if postmortem.enabled {
+                        if let Some((session_id, dedupe_key)) = auto_postmortem_target(&event) {
+                            if postmortem.rendered.insert(dedupe_key) {
+                                print_postmortem_progress(
+                                    "",
+                                    &session_id,
+                                    postmortem.analyze_with_claude,
+                                );
+                                match fetch_postmortem_json_with_retry(
+                                    &postmortem.base_url,
+                                    &session_id,
+                                    true,
+                                    5,
+                                    Duration::from_millis(250),
+                                )
+                                .await
+                                {
+                                    Ok(report) => {
+                                        let (markdown, warning) =
+                                            render_watch_postmortem_markdown_with_optional_analysis(
+                                                &postmortem.base_url,
+                                                &session_id,
+                                                &report,
+                                                postmortem.analyze_with_claude,
+                                            )
+                                            .await;
+                                        if let Some(warning) = warning {
+                                            eprintln!("{}", warning.yellow());
+                                        }
+                                        print_postmortem_terminal_block(&markdown);
+                                    }
+                                    Err(err) => {
+                                        eprintln!(
+                                            "{}",
+                                            format!(
+                                                "Postmortem unavailable for {session_id}: {err}"
+                                            )
+                                            .yellow()
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                data_buffer.clear();
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn auto_postmortem_target(event: &WatchEvent) -> Option<(String, String)> {
     match event {
         WatchEvent::SessionEnd { session_id, .. } => {
@@ -4598,14 +5350,17 @@ mod tests {
     use super::{
         append_claude_analysis_section, auto_postmortem_target, build_claude_analysis_prompt,
         claude_analysis_enabled, colorize_postmortem_for_terminal, compact_datetime_from_iso,
-        event_session_id, extract_run_watch, fetch_run_final_postmortem_markdown,
+        connect_and_guard_stream, event_session_id, extract_run_watch, fetch_guard_policy_report,
+        fetch_guard_status_report, fetch_postmortem_json, fetch_run_final_postmortem_markdown,
         fetch_run_final_postmortem_markdown_with_retry, format_duration_coarse, format_tokens,
         local_time_from_iso, parse_mcp_tool_name, postmortem_progress_message,
-        postmortem_separator_line_for_width, push_unique, render_postmortem_markdown,
+        postmortem_separator_line_for_width, push_unique, render_guard_policy_report,
+        render_guard_status_report, render_guard_watch_line, render_postmortem_markdown,
         render_postmortem_markdown_with_optional_analysis, render_postmortem_terminal_for_width,
         run_child_command_with_deps, run_claude_postmortem_analysis_with_command,
-        run_claude_postmortem_analysis_with_lookup, shell_join, shell_quote, truncate_for_box,
-        watcher_args, yaml_quote, ActiveSessions, Cli, Commands, WatchEvent, WatchPostmortemState,
+        run_claude_postmortem_analysis_with_lookup, run_guard_start_with_deps, shell_join,
+        shell_quote, truncate_for_box, watcher_args, yaml_quote, ActiveSessions, Cli, Commands,
+        GuardCommands, GuardStackReadiness, WatchEvent, WatchPostmortemState,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
@@ -5102,6 +5857,122 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn guard_start_does_not_accept_an_unvalidated_busy_proxy_as_running() {
+        let started = Arc::new(Mutex::new(false));
+        let exit_code = run_guard_start_with_deps(
+            false,
+            || async {
+                GuardStackReadiness::Blocked(
+                    "port 10000 is in use by a non-cc-blackbox process".to_string(),
+                )
+            },
+            {
+                let started = started.clone();
+                move |_no_grafana| {
+                    let started = started.clone();
+                    async move {
+                        *started.lock().expect("started lock") = true;
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(exit_code, 1);
+        assert!(!*started.lock().expect("started lock"));
+    }
+
+    #[tokio::test]
+    async fn guard_start_validates_existing_guard_stack_without_starting_second_runtime() {
+        let started = Arc::new(Mutex::new(false));
+        let exit_code =
+            run_guard_start_with_deps(false, || async { GuardStackReadiness::Running }, {
+                let started = started.clone();
+                move |_no_grafana| {
+                    let started = started.clone();
+                    async move {
+                        *started.lock().expect("started lock") = true;
+                        Ok(())
+                    }
+                }
+            })
+            .await;
+
+        assert_eq!(exit_code, 0);
+        assert!(!*started.lock().expect("started lock"));
+    }
+
+    #[tokio::test]
+    async fn guard_start_reuses_existing_stack_start_when_guard_is_not_running() {
+        let started = Arc::new(Mutex::new(false));
+        let readiness = Arc::new(Mutex::new(vec![
+            GuardStackReadiness::NeedsStart,
+            GuardStackReadiness::Running,
+        ]));
+        let exit_code = run_guard_start_with_deps(
+            true,
+            {
+                let readiness = readiness.clone();
+                move || {
+                    let readiness = readiness.clone();
+                    async move { readiness.lock().expect("readiness lock").remove(0) }
+                }
+            },
+            {
+                let started = started.clone();
+                move |no_grafana| {
+                    let started = started.clone();
+                    async move {
+                        assert!(no_grafana);
+                        *started.lock().expect("started lock") = true;
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(exit_code, 0);
+        assert!(*started.lock().expect("started lock"));
+        assert!(readiness.lock().expect("readiness lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn guard_start_fails_if_stack_starts_but_guard_path_still_does_not_validate() {
+        let started = Arc::new(Mutex::new(false));
+        let readiness = Arc::new(Mutex::new(vec![
+            GuardStackReadiness::NeedsStart,
+            GuardStackReadiness::NeedsStart,
+        ]));
+        let exit_code = run_guard_start_with_deps(
+            false,
+            {
+                let readiness = readiness.clone();
+                move || {
+                    let readiness = readiness.clone();
+                    async move { readiness.lock().expect("readiness lock").remove(0) }
+                }
+            },
+            {
+                let started = started.clone();
+                move |_no_grafana| {
+                    let started = started.clone();
+                    async move {
+                        *started.lock().expect("started lock") = true;
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(exit_code, 1);
+        assert!(*started.lock().expect("started lock"));
+        assert!(readiness.lock().expect("readiness lock").is_empty());
+    }
+
     #[test]
     fn parser_applies_command_defaults() {
         let cli = Cli::try_parse_from(["cc-blackbox", "watch"]).expect("watch parses");
@@ -5259,6 +6130,295 @@ mod tests {
     }
 
     #[test]
+    fn parser_accepts_guard_namespace_commands() {
+        let cli =
+            Cli::try_parse_from(["cc-blackbox", "guard", "policy"]).expect("guard policy parses");
+        let Commands::Guard {
+            command: GuardCommands::Policy { url },
+        } = cli.command
+        else {
+            panic!("expected guard policy command");
+        };
+        assert_eq!(url, "http://localhost:9091");
+
+        let cli = Cli::try_parse_from(["cc-blackbox", "guard", "status", "--session", "s1"])
+            .expect("guard status parses");
+        let Commands::Guard {
+            command: GuardCommands::Status { url, session },
+        } = cli.command
+        else {
+            panic!("expected guard status command");
+        };
+        assert_eq!(url, "http://localhost:9091");
+        assert_eq!(session.as_deref(), Some("s1"));
+
+        let cli = Cli::try_parse_from(["cc-blackbox", "guard", "watch", "--session", "s1"])
+            .expect("guard watch parses");
+        let Commands::Guard {
+            command:
+                GuardCommands::Watch {
+                    url,
+                    session,
+                    postmortem,
+                },
+        } = cli.command
+        else {
+            panic!("expected guard watch command");
+        };
+        assert_eq!(url, "http://localhost:9091");
+        assert_eq!(session.as_deref(), Some("s1"));
+        assert!(!postmortem);
+
+        let cli =
+            Cli::try_parse_from(["cc-blackbox", "guard", "start"]).expect("guard start parses");
+        let Commands::Guard {
+            command: GuardCommands::Start { no_grafana },
+        } = cli.command
+        else {
+            panic!("expected guard start command");
+        };
+        assert!(!no_grafana);
+    }
+
+    #[test]
+    fn guard_policy_renderer_shows_effective_policy_defaults_source_and_warnings() {
+        let report = serde_json::json!({
+            "source": "/tmp/guard.toml",
+            "warnings": ["unknown guard policy rule `rules.old_rule` ignored"],
+            "defaults": {
+                "fail_open": true,
+                "rules": {
+                    "per_session_token_budget_exceeded": { "action": "block" },
+                    "repeated_cache_rebuilds": { "action": "warn" }
+                }
+            },
+            "policy": {
+                "fail_open": true,
+                "rules": {
+                    "per_session_token_budget_exceeded": {
+                        "action": "block",
+                        "limit_tokens": 200000
+                    },
+                    "api_error_circuit_breaker_cooldown": {
+                        "action": "cooldown",
+                        "threshold_count": 5,
+                        "cooldown_secs": 30
+                    },
+                    "repeated_cache_rebuilds": { "action": "warn" }
+                }
+            }
+        });
+
+        let rendered = render_guard_policy_report(&report);
+
+        assert!(rendered.contains("Guard policy"));
+        assert!(rendered.contains("Config source: /tmp/guard.toml"));
+        assert!(rendered.contains("Defaults: fail open enabled"));
+        assert!(rendered.contains("Policy warnings"));
+        assert!(rendered.contains("unknown guard policy rule"));
+        assert!(rendered.contains("per_session_token_budget_exceeded"));
+        assert!(rendered.contains("block"));
+        assert!(rendered.contains("200K tokens"));
+        assert!(rendered.contains("repeated_cache_rebuilds"));
+        assert!(rendered.contains("warn"));
+    }
+
+    #[tokio::test]
+    async fn guard_policy_fetches_policy_endpoint_and_renders_report() {
+        let body = serde_json::json!({
+            "source": "defaults",
+            "warnings": [],
+            "defaults": {
+                "fail_open": true,
+                "rules": {
+                    "per_session_token_budget_exceeded": { "action": "block" }
+                }
+            },
+            "policy": {
+                "fail_open": true,
+                "rules": {
+                    "per_session_token_budget_exceeded": {
+                        "action": "block",
+                        "limit_tokens": 100000
+                    }
+                }
+            }
+        })
+        .to_string();
+        let (url, request_rx) = serve_postmortem_response_once("200 OK", &body);
+
+        let report = fetch_guard_policy_report(&url)
+            .await
+            .expect("fetch guard policy report");
+        let rendered = render_guard_policy_report(&report);
+
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured guard policy request");
+        assert!(request.starts_with("GET /api/guard/policy "));
+        assert!(rendered.contains("Config source: defaults"));
+        assert!(rendered.contains("100K tokens"));
+    }
+
+    #[tokio::test]
+    async fn guard_status_fetches_status_endpoint_and_renders_report() {
+        let body = serde_json::json!({
+            "overall_state": "watching",
+            "sessions": [{
+                "session_id": "s1",
+                "display_name": "api",
+                "model": "sonnet",
+                "state": "watching",
+                "findings": []
+            }]
+        })
+        .to_string();
+        let (url, request_rx) = serve_postmortem_response_once("200 OK", &body);
+
+        let report = fetch_guard_status_report(&url, &Some("s1".to_string()))
+            .await
+            .expect("fetch guard status report");
+        let rendered = render_guard_status_report(&report);
+
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured guard status request");
+        assert!(request.starts_with("GET /api/guard/status?session=s1 "));
+        assert!(rendered.contains("Watching"));
+        assert!(rendered.contains("s1"));
+    }
+
+    #[test]
+    fn guard_status_renderer_covers_states_recovery_and_privacy() {
+        let report = serde_json::json!({
+            "overall_state": "critical",
+            "sessions": [
+                { "session_id": "session_healthy", "display_name": "api", "model": "sonnet", "state": "healthy", "findings": [] },
+                { "session_id": "session_watch", "display_name": "worker", "model": "sonnet", "state": "watching", "findings": [] },
+                {
+                    "session_id": "session_warn",
+                    "display_name": "cache",
+                    "model": "sonnet",
+                    "state": "warning",
+                    "findings": [{
+                        "rule_id": "repeated_cache_rebuilds",
+                        "title": "Repeated cache rebuilds",
+                        "action": "warn",
+                        "severity": "warning",
+                        "detail": "Cache was rebuilt more often than expected.",
+                        "raw_prompt": "DO_NOT_SHOW_PROMPT"
+                    }]
+                },
+                {
+                    "session_id": "session_critical",
+                    "display_name": "context",
+                    "model": "opus",
+                    "state": "critical",
+                    "findings": [{
+                        "rule_id": "context_near_warning_threshold",
+                        "title": "Context nearly full",
+                        "action": "critical",
+                        "severity": "critical",
+                        "detail": "Context is above the configured threshold."
+                    }]
+                },
+                {
+                    "session_id": "session_blocked",
+                    "display_name": "budget",
+                    "model": "opus",
+                    "state": "blocked",
+                    "findings": [{
+                        "rule_id": "per_session_token_budget_exceeded",
+                        "title": "Session token budget exceeded",
+                        "action": "block",
+                        "severity": "critical",
+                        "detail": "Session token budget exceeded.",
+                        "suggested_action": "Start a fresh Claude Code session with a narrower task."
+                    }]
+                },
+                {
+                    "session_id": "session_cooldown",
+                    "display_name": "api-errors",
+                    "model": "sonnet",
+                    "state": "cooldown",
+                    "findings": [{
+                        "rule_id": "api_error_circuit_breaker_cooldown",
+                        "title": "API error cooldown",
+                        "action": "cooldown",
+                        "severity": "critical",
+                        "detail": "Repeated API errors opened a cooldown.",
+                        "suggested_action": "Wait 30s, then retry."
+                    }]
+                },
+                { "session_id": "session_done", "display_name": "done", "model": "sonnet", "state": "ended", "findings": [] }
+            ]
+        });
+
+        let rendered = render_guard_status_report(&report);
+
+        for state in [
+            "Healthy", "Watching", "Warning", "Critical", "Blocked", "Cooldown", "Ended",
+        ] {
+            assert!(
+                rendered.contains(state),
+                "missing state {state}\n{rendered}"
+            );
+        }
+        assert!(rendered.contains("Warning only; no request has been blocked."));
+        assert!(rendered.contains("Recovery: Start a fresh Claude Code session"));
+        assert!(rendered.contains("Recovery: Wait 30s"));
+        assert!(rendered.contains("cc-blackbox postmortem latest"));
+        assert!(rendered.contains("cc-blackbox postmortem SESSION_ID"));
+        assert!(!rendered.contains("DO_NOT_SHOW_PROMPT"));
+    }
+
+    #[test]
+    fn guard_watch_renderer_uses_plain_language_and_recovery_text() {
+        let warning = WatchEvent::GuardFinding {
+            session_id: "session_warn".to_string(),
+            rule_id: "repeated_cache_rebuilds".to_string(),
+            severity: "warning".to_string(),
+            action: "warn".to_string(),
+            evidence_level: "direct_proxy".to_string(),
+            source: "proxy".to_string(),
+            confidence: 0.91,
+            timestamp: "2026-05-10T00:00:00Z".to_string(),
+            detail: "Cache was rebuilt more often than expected.".to_string(),
+            suggested_action: None,
+        };
+        let blocked = WatchEvent::GuardFinding {
+            session_id: "session_block".to_string(),
+            rule_id: "per_session_token_budget_exceeded".to_string(),
+            severity: "critical".to_string(),
+            action: "block".to_string(),
+            evidence_level: "direct_proxy".to_string(),
+            source: "proxy".to_string(),
+            confidence: 1.0,
+            timestamp: "2026-05-10T00:01:00Z".to_string(),
+            detail: "Session token budget exceeded.".to_string(),
+            suggested_action: Some("Start a fresh session.".to_string()),
+        };
+        let ready = WatchEvent::PostmortemReady {
+            session_id: "session_block".to_string(),
+            idle_secs: 90,
+            total_tokens: 120000,
+            total_turns: 8,
+        };
+
+        let warning_line = render_guard_watch_line(&warning).expect("warning line");
+        let blocked_line = render_guard_watch_line(&blocked).expect("blocked line");
+        let ready_line = render_guard_watch_line(&ready).expect("postmortem line");
+
+        assert!(warning_line.contains("Warning"));
+        assert!(warning_line.contains("Warning only; no request has been blocked."));
+        assert!(!warning_line.contains("Blocked"));
+        assert!(blocked_line.contains("Blocked"));
+        assert!(blocked_line.contains("Recovery: Start a fresh session."));
+        assert!(ready_line.contains("cc-blackbox postmortem session_block"));
+        assert!(ready_line.contains("cc-blackbox postmortem latest"));
+    }
+
+    #[test]
     fn postmortem_progress_message_is_single_combined_line() {
         assert_eq!(
             postmortem_progress_message("last", true, true),
@@ -5345,6 +6505,41 @@ mod tests {
         assert!(
             active.sessions.is_empty(),
             "target session should be removed after session_end"
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_watch_stream_uses_existing_watch_endpoint_with_session_filter() {
+        let chunks = vec![concat!(
+            "data: {\"type\":\"guard_finding\",\"session_id\":\"session_target\",",
+            "\"rule_id\":\"repeated_cache_rebuilds\",\"severity\":\"warning\",",
+            "\"action\":\"warn\",\"evidence_level\":\"direct_proxy\",",
+            "\"source\":\"proxy\",\"confidence\":0.9,",
+            "\"timestamp\":\"2026-05-10T00:00:00Z\",",
+            "\"detail\":\"Cache was rebuilt more often than expected.\"}\n\n"
+        )
+        .to_string()];
+        let (url, request_rx) = serve_sse_chunks_once(chunks);
+        let filter = Some("session_target".to_string());
+        let mut postmortem_state = WatchPostmortemState::new(false, &url, false);
+
+        connect_and_guard_stream(
+            &format!("{url}/watch?session=session_target"),
+            &filter,
+            &mut postmortem_state,
+        )
+        .await
+        .expect("guard watch stream closes cleanly");
+
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured guard watch request");
+        assert!(request.starts_with("GET /watch?session=session_target "));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("accept: text/event-stream"),
+            "missing SSE accept header:\n{request}"
         );
     }
 
@@ -6103,6 +7298,30 @@ If failures recur, restart with a shorter prompt.\n\
         let request = request_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("captured final postmortem request");
+        assert!(request.starts_with("GET /api/postmortem/last?redact=true "));
+    }
+
+    #[tokio::test]
+    async fn postmortem_latest_alias_fetches_existing_last_endpoint() {
+        let body = serde_json::json!({
+            "session_id": "session_latest",
+            "summary": {},
+            "diagnosis": {},
+            "impact": {},
+            "signals": {},
+            "evidence": []
+        })
+        .to_string();
+        let (url, request_rx) = serve_postmortem_response_once("200 OK", &body);
+
+        let report = fetch_postmortem_json(&url, "latest", true)
+            .await
+            .expect("fetch latest alias");
+
+        assert_eq!(report["session_id"], "session_latest");
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured postmortem request");
         assert!(request.starts_with("GET /api/postmortem/last?redact=true "));
     }
 

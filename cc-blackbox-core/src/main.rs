@@ -405,6 +405,264 @@ fn request_guard_policy() -> Option<guard::GuardPolicy> {
     Some(policy)
 }
 
+fn build_guard_policy_report_json() -> Value {
+    let defaults = guard::GuardPolicy::default();
+    let mut warnings = Vec::new();
+    let (mut policy, source) = match std::env::var(GUARD_POLICY_PATH_ENV) {
+        Ok(path) if !path.trim().is_empty() => {
+            match guard::GuardPolicy::load_effective_from_path(Path::new(&path)) {
+                Ok(loaded) => {
+                    warnings.extend(loaded.warnings);
+                    (loaded.policy, loaded.source)
+                }
+                Err(err) => {
+                    warnings.push(format!("{err}; guard request enforcement will fail open"));
+                    (guard::GuardPolicy::default(), path)
+                }
+            }
+        }
+        _ => (guard::GuardPolicy::default(), "defaults".to_string()),
+    };
+
+    let before_legacy_env = policy.clone();
+    apply_legacy_env_limits(&mut policy);
+    if policy != before_legacy_env {
+        warnings.push("legacy guard budget environment overrides applied".to_string());
+    }
+
+    serde_json::json!({
+        "source": source,
+        "warnings": warnings,
+        "defaults": defaults,
+        "policy": policy,
+    })
+}
+
+fn guard_state_rank(state: &str) -> u8 {
+    match state {
+        "cooldown" => 6,
+        "blocked" => 5,
+        "critical" => 4,
+        "warning" => 3,
+        "watching" => 2,
+        "healthy" => 1,
+        "ended" => 0,
+        _ => 1,
+    }
+}
+
+fn merge_guard_state(current: &str, candidate: &str) -> String {
+    if guard_state_rank(candidate) > guard_state_rank(current) {
+        candidate.to_string()
+    } else {
+        current.to_string()
+    }
+}
+
+fn guard_state_from_findings(base_state: &str, findings: &[Value]) -> String {
+    let mut state = base_state.to_string();
+    for finding in findings {
+        let action = finding
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let severity = finding
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let candidate = match action {
+            "cooldown" => "cooldown",
+            "block" => "blocked",
+            "critical" => "critical",
+            "warn" => "warning",
+            _ if severity == "critical" => "critical",
+            _ if severity == "warning" => "warning",
+            _ => base_state,
+        };
+        state = merge_guard_state(&state, candidate);
+    }
+    state
+}
+
+fn guard_finding_title(rule_id: &str) -> String {
+    match rule_id {
+        "per_session_token_budget_exceeded" => "Session token budget exceeded",
+        "per_session_trusted_dollar_budget_exceeded" => "Session dollar budget exceeded",
+        "api_error_circuit_breaker_cooldown" => "API error cooldown",
+        "repeated_cache_rebuilds" => "Repeated cache rebuilds",
+        "context_near_warning_threshold" => "Context near limit",
+        "model_mismatch" => "Model route mismatch",
+        "suspected_compaction_loop" => "Suspected compaction loop",
+        "tool_failure_streak" => "Tool failure streak",
+        "high_weekly_project_quota_burn" => "High quota burn",
+        other => other,
+    }
+    .to_string()
+}
+
+fn load_guard_findings_for_session(
+    conn: Option<&Connection>,
+    session_id: &str,
+    limit: usize,
+) -> Vec<Value> {
+    let Some(conn) = conn else {
+        return Vec::new();
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT rule_id, severity, action, source, evidence_level, confidence, \
+                timestamp, detail, suggested_action \
+         FROM guard_findings WHERE session_id = ?1 \
+         ORDER BY timestamp DESC, id DESC LIMIT ?2",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+
+    let rows = match stmt.query_map(rusqlite::params![session_id, limit as i64], |row| {
+        let rule_id: String = row.get(0)?;
+        Ok(serde_json::json!({
+            "rule_id": rule_id,
+            "title": guard_finding_title(&rule_id),
+            "severity": row.get::<_, String>(1)?,
+            "action": row.get::<_, String>(2)?,
+            "source": row.get::<_, String>(3)?,
+            "evidence_level": row.get::<_, String>(4)?,
+            "confidence": row.get::<_, f64>(5)?,
+            "timestamp": row.get::<_, String>(6)?,
+            "detail": row.get::<_, String>(7)?,
+            "suggested_action": row.get::<_, Option<String>>(8)?,
+        }))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+
+    rows.filter_map(Result::ok).collect()
+}
+
+fn guard_session_status_json(
+    session_id: String,
+    display_name: String,
+    model: String,
+    base_state: &str,
+    findings: Vec<Value>,
+) -> Value {
+    let state = guard_state_from_findings(base_state, &findings);
+    serde_json::json!({
+        "session_id": session_id,
+        "display_name": display_name,
+        "model": model,
+        "state": state,
+        "findings": findings,
+    })
+}
+
+fn ended_guard_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, String)> {
+    Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, String>(2)?,
+    ))
+}
+
+fn load_ended_guard_sessions(
+    conn: Option<&Connection>,
+    session_filter: Option<&str>,
+    limit: usize,
+) -> Vec<Value> {
+    let Some(conn) = conn else {
+        return Vec::new();
+    };
+    let sql = if session_filter.is_some() {
+        "SELECT s.session_id, COALESCE(s.model, ''), COALESCE(s.ended_at, d.completed_at, '') \
+         FROM sessions s LEFT JOIN session_diagnoses d ON s.session_id = d.session_id \
+         WHERE s.session_id = ?1 AND (s.ended_at IS NOT NULL OR d.completed_at IS NOT NULL) \
+         ORDER BY COALESCE(s.ended_at, d.completed_at, '') DESC LIMIT ?2"
+    } else {
+        "SELECT s.session_id, COALESCE(s.model, ''), COALESCE(s.ended_at, d.completed_at, '') \
+         FROM sessions s LEFT JOIN session_diagnoses d ON s.session_id = d.session_id \
+         WHERE s.ended_at IS NOT NULL OR d.completed_at IS NOT NULL \
+         ORDER BY COALESCE(s.ended_at, d.completed_at, '') DESC LIMIT ?2"
+    };
+    let mut stmt = match conn.prepare(sql) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+
+    let rows: Vec<(String, String, String)> = if let Some(session_id) = session_filter {
+        match stmt.query_map(
+            rusqlite::params![session_id, limit as i64],
+            ended_guard_session_row,
+        ) {
+            Ok(rows) => rows.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    } else {
+        match stmt.query_map(rusqlite::params![limit as i64], ended_guard_session_row) {
+            Ok(rows) => rows.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    };
+
+    rows.into_iter()
+        .map(|(session_id, model, _ended_at)| {
+            let findings = load_guard_findings_for_session(Some(conn), &session_id, 3);
+            guard_session_status_json(session_id.clone(), session_id, model, "ended", findings)
+        })
+        .collect()
+}
+
+fn build_guard_status_report_json(session_filter: Option<&str>) -> Value {
+    let conn = Connection::open(db_path()).ok();
+    let mut sessions = diagnosis::SESSIONS
+        .iter()
+        .filter_map(|entry| {
+            let session = entry.value();
+            if session_filter
+                .map(|wanted| wanted != session.session_id)
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            let findings = load_guard_findings_for_session(conn.as_ref(), &session.session_id, 3);
+            Some(guard_session_status_json(
+                session.session_id.clone(),
+                session.display_name.clone(),
+                session.model.clone(),
+                "watching",
+                findings,
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    sessions.sort_by(|a, b| {
+        let a_id = a
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let b_id = b
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        a_id.cmp(b_id)
+    });
+
+    if sessions.is_empty() {
+        sessions.extend(load_ended_guard_sessions(conn.as_ref(), session_filter, 5));
+    }
+
+    let overall_state = sessions
+        .iter()
+        .filter_map(|session| session.get("state").and_then(Value::as_str))
+        .max_by_key(|state| guard_state_rank(state))
+        .unwrap_or("healthy");
+
+    serde_json::json!({
+        "overall_state": overall_state,
+        "sessions": sessions,
+    })
+}
+
 fn evaluate_request_guard_for_session(
     session_id: Option<&str>,
     policy: Option<&guard::GuardPolicy>,
@@ -7288,6 +7546,30 @@ async fn handle_summary() -> impl IntoResponse {
     )
 }
 
+async fn handle_guard_policy() -> impl IntoResponse {
+    let report = build_guard_policy_report_json();
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        serde_json::to_string_pretty(&report).unwrap_or_default(),
+    )
+}
+
+async fn handle_guard_status(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let session = params.get("session").cloned();
+    let report =
+        tokio::task::spawn_blocking(move || build_guard_status_report_json(session.as_deref()))
+            .await
+            .unwrap_or_else(|_| serde_json::json!({"overall_state": "healthy", "sessions": []}));
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        serde_json::to_string_pretty(&report).unwrap_or_default(),
+    )
+}
+
 async fn handle_watch(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::sse::Sse<
@@ -8321,6 +8603,8 @@ async fn http_server() {
         .route("/metrics", get(handle_metrics))
         .route("/api/hooks/claude-code", post(handle_claude_code_hook))
         .route("/api/summary", get(handle_summary))
+        .route("/api/guard/policy", get(handle_guard_policy))
+        .route("/api/guard/status", get(handle_guard_status))
         .route("/api/recall", get(handle_recall))
         .route(
             "/api/billing-reconciliations",
@@ -8760,6 +9044,7 @@ mod tests {
 
     use super::{
         build_cache_rebuilds_response_from_db, build_diagnosis_response_json,
+        build_guard_policy_report_json, build_guard_status_report_json,
         build_postmortem_response_from_db, build_session_summary_json,
         build_sessions_response_json, build_summary_response_json, canonical_telemetry_name,
         classify_cache_event, clean_user_prompt, compact_response_summary, context_fill_percent,
@@ -12588,6 +12873,131 @@ mod tests {
         );
 
         SESSION_BUDGETS.remove(session_id);
+    }
+
+    #[test]
+    fn guard_policy_report_includes_defaults_source_effective_policy_and_warnings() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let path = unique_temp_path("guard-policy-report");
+        fs::write(
+            &path,
+            r#"
+unexpected_root = true
+
+[rules.per_session_token_budget_exceeded]
+limit_tokens = 321000
+
+[rules.repeated_cache_rebuilds]
+action = "warn"
+"#,
+        )
+        .expect("write policy fixture");
+        let _policy_path = EnvVarGuard::set(
+            "CC_BLACKBOX_GUARD_POLICY_PATH",
+            path.to_str().expect("temp path is utf-8"),
+        );
+        let _token_budget = EnvVarGuard::remove("CC_BLACKBOX_SESSION_BUDGET_TOKENS");
+        let _dollar_budget = EnvVarGuard::remove("CC_BLACKBOX_SESSION_BUDGET_DOLLARS");
+
+        let report = build_guard_policy_report_json();
+
+        assert_eq!(report["source"], path.to_string_lossy().as_ref());
+        assert_eq!(report["defaults"]["fail_open"], true);
+        assert_eq!(report["policy"]["fail_open"], true);
+        assert_eq!(
+            report["policy"]["rules"]["per_session_token_budget_exceeded"]["action"],
+            "block"
+        );
+        assert_eq!(
+            report["policy"]["rules"]["per_session_token_budget_exceeded"]["limit_tokens"],
+            321000
+        );
+        assert!(report["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .unwrap_or_default()
+                .contains("unexpected_root")));
+
+        fs::remove_file(path).expect("remove policy fixture");
+    }
+
+    #[test]
+    fn guard_status_report_derives_blocked_state_from_active_findings() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let path = unique_test_db_path("guard-status-report");
+        {
+            let conn = Connection::open(&path).expect("open test db");
+            conn.execute_batch(SCHEMA).expect("create schema");
+            conn.execute(
+                "INSERT INTO sessions (session_id, started_at, model, working_dir, first_message_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "session-status-block",
+                    "2026-05-10T00:00:00Z",
+                    "claude-sonnet",
+                    "/tmp/project",
+                    "hash-status"
+                ],
+            )
+            .expect("insert session");
+            conn.execute(
+                "INSERT INTO guard_findings (
+                    session_id, request_id, turn_number, timestamp, rule_id, severity,
+                    action, source, evidence_level, confidence, detail, suggested_action
+                ) VALUES (?1,NULL,NULL,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                rusqlite::params![
+                    "session-status-block",
+                    "2026-05-10T00:01:00Z",
+                    "per_session_token_budget_exceeded",
+                    "critical",
+                    "block",
+                    "proxy",
+                    "direct_proxy",
+                    1.0,
+                    "Session token budget exceeded.",
+                    "Start a fresh session."
+                ],
+            )
+            .expect("insert finding");
+        }
+        let _db_path = EnvVarGuard::set("CC_BLACKBOX_DB_PATH", &path);
+        diagnosis::SESSIONS.insert(
+            4242,
+            diagnosis::SessionState {
+                session_id: "session-status-block".to_string(),
+                display_name: "api".to_string(),
+                model: "claude-sonnet".to_string(),
+                initial_prompt: Some("redacted prompt excerpt".to_string()),
+                created_at: Instant::now(),
+                last_activity: Instant::now(),
+                session_inserted: true,
+                cache_warning_sent: false,
+                idle_postmortem_sent: false,
+            },
+        );
+
+        let report = build_guard_status_report_json(Some("session-status-block"));
+
+        assert_eq!(report["overall_state"], "blocked");
+        assert_eq!(report["sessions"][0]["session_id"], "session-status-block");
+        assert_eq!(report["sessions"][0]["state"], "blocked");
+        assert_eq!(
+            report["sessions"][0]["findings"][0]["rule_id"],
+            "per_session_token_budget_exceeded"
+        );
+        assert_eq!(report["sessions"][0]["findings"][0]["action"], "block");
+        assert!(report["sessions"][0]["findings"][0]
+            .get("raw_prompt")
+            .is_none());
+        assert!(report["sessions"][0]["findings"][0]
+            .get("raw_jsonl")
+            .is_none());
+
+        diagnosis::SESSIONS.remove(&4242);
+        cleanup_test_db(&path);
     }
 
     #[test]

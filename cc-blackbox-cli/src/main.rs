@@ -2593,6 +2593,7 @@ fn colorize_postmortem_value(label: &str, value: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn colorize_aligned_key_value_line(line: &str) -> Option<String> {
     let indent_len = line.len() - line.trim_start_matches(' ').len();
     if indent_len == 0 {
@@ -2632,6 +2633,7 @@ fn colorize_evidence_type(kind: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn colorize_evidence_line(line: &str) -> Option<String> {
     let indent_len = line.len() - line.trim_start_matches(' ').len();
     let indent = &line[..indent_len];
@@ -2649,6 +2651,7 @@ fn colorize_evidence_line(line: &str) -> Option<String> {
     ))
 }
 
+#[cfg(test)]
 fn colorize_postmortem_line(line: &str) -> String {
     let trimmed = line.trim_start();
     if line.starts_with("# ") {
@@ -2676,6 +2679,7 @@ fn colorize_postmortem_line(line: &str) -> String {
     line.to_string()
 }
 
+#[cfg(test)]
 fn colorize_postmortem_for_terminal(markdown: &str) -> String {
     let mut colored = markdown
         .lines()
@@ -2686,6 +2690,658 @@ fn colorize_postmortem_for_terminal(markdown: &str) -> String {
         colored.push('\n');
     }
     colored
+}
+
+#[derive(Clone, Copy)]
+enum PostmortemAccent {
+    Info,
+    Good,
+    Warning,
+    Danger,
+    Muted,
+}
+
+impl PostmortemAccent {
+    fn paint(self, text: &str) -> String {
+        match self {
+            PostmortemAccent::Info => text.truecolor(92, 230, 220).to_string(),
+            PostmortemAccent::Good => text.truecolor(80, 220, 135).to_string(),
+            PostmortemAccent::Warning => text.truecolor(246, 207, 68).to_string(),
+            PostmortemAccent::Danger => text.truecolor(255, 95, 105).to_string(),
+            PostmortemAccent::Muted => text.bright_black().to_string(),
+        }
+    }
+
+    fn paint_bold(self, text: &str) -> String {
+        match self {
+            PostmortemAccent::Info => text.truecolor(92, 230, 220).bold().to_string(),
+            PostmortemAccent::Good => text.truecolor(80, 220, 135).bold().to_string(),
+            PostmortemAccent::Warning => text.truecolor(246, 207, 68).bold().to_string(),
+            PostmortemAccent::Danger => text.truecolor(255, 95, 105).bold().to_string(),
+            PostmortemAccent::Muted => text.bright_black().bold().to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TerminalLine {
+    raw: String,
+    painted: String,
+}
+
+impl TerminalLine {
+    fn plain(raw: impl Into<String>) -> Self {
+        let raw = raw.into();
+        Self {
+            painted: raw.clone(),
+            raw,
+        }
+    }
+
+    fn styled(raw: impl Into<String>, painted: impl Into<String>) -> Self {
+        Self {
+            raw: raw.into(),
+            painted: painted.into(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ParsedPostmortem {
+    title: String,
+    order: Vec<String>,
+    sections: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct EvidenceRow {
+    kind: String,
+    label: String,
+    turn: String,
+    detail: String,
+}
+
+fn clean_terminal_cell(value: &str) -> String {
+    value
+        .replace('`', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn split_aligned_columns(line: &str) -> Vec<String> {
+    let line = line.trim();
+    let bytes = line.as_bytes();
+    let mut columns = Vec::new();
+    let mut start = 0;
+    let mut idx = 0;
+
+    while idx < bytes.len() {
+        if bytes[idx] == b' ' {
+            let mut end = idx + 1;
+            while end < bytes.len() && bytes[end] == b' ' {
+                end += 1;
+            }
+            if end - idx >= 2 {
+                let value = line[start..idx].trim();
+                if !value.is_empty() {
+                    columns.push(clean_terminal_cell(value));
+                }
+                start = end;
+            }
+            idx = end;
+        } else {
+            idx += 1;
+        }
+    }
+
+    let value = line[start..].trim();
+    if !value.is_empty() {
+        columns.push(clean_terminal_cell(value));
+    }
+    columns
+}
+
+fn parse_postmortem_markdown(markdown: &str) -> ParsedPostmortem {
+    let mut parsed = ParsedPostmortem {
+        title: "cc-blackbox Postmortem".to_string(),
+        ..ParsedPostmortem::default()
+    };
+    let mut current_section: Option<String> = None;
+
+    for line in markdown.lines() {
+        if let Some(title) = line.strip_prefix("# ") {
+            parsed.title = clean_terminal_cell(title);
+            continue;
+        }
+        if let Some(section) = line.strip_prefix("## ") {
+            let section = clean_terminal_cell(section);
+            if !parsed.sections.contains_key(&section) {
+                parsed.order.push(section.clone());
+            }
+            parsed.sections.entry(section.clone()).or_default();
+            current_section = Some(section);
+            continue;
+        }
+        if let Some(section) = current_section.as_ref() {
+            parsed
+                .sections
+                .entry(section.clone())
+                .or_default()
+                .push(line.to_string());
+        }
+    }
+
+    parsed
+}
+
+fn parse_key_value_section(lines: &[String]) -> Vec<(String, String)> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with("Type")
+                || trimmed.starts_with("----------")
+                || trimmed
+                    .chars()
+                    .all(|ch| ch == '-' || ch.is_ascii_whitespace())
+            {
+                return None;
+            }
+            let columns = split_aligned_columns(trimmed);
+            if columns.len() < 2 {
+                return None;
+            }
+            Some((columns[0].clone(), columns[1..].join("  ")))
+        })
+        .collect()
+}
+
+fn parse_evidence_section(lines: &[String]) -> Vec<EvidenceRow> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with("Type")
+                || trimmed.starts_with("----------")
+                || trimmed
+                    .chars()
+                    .all(|ch| ch == '-' || ch.is_ascii_whitespace())
+            {
+                return None;
+            }
+            let columns = split_aligned_columns(trimmed);
+            if columns.len() < 4 {
+                return None;
+            }
+            Some(EvidenceRow {
+                kind: columns[0].clone(),
+                label: columns[1].clone(),
+                turn: columns[2].clone(),
+                detail: columns[3..].join("  "),
+            })
+        })
+        .collect()
+}
+
+fn key_value<'a>(rows: &'a [(String, String)], label: &str) -> Option<&'a str> {
+    rows.iter()
+        .find(|(field, _)| field.eq_ignore_ascii_case(label))
+        .map(|(_, value)| value.as_str())
+}
+
+fn is_low_signal(label: &str, value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    match label {
+        "Cause" => lower == "none" || lower.contains("no degradation detected"),
+        "Waste" => lower.contains("no likely wasted tokens") || lower.starts_with("0 tokens"),
+        "Tools" | "Skills" | "MCP" => {
+            lower.starts_with("no failed")
+                || lower.contains("0 failures")
+                || lower == "no tool calls recorded"
+        }
+        "Cache" => lower.starts_with("healthy"),
+        "Context" => lower.starts_with("plenty of room"),
+        _ => false,
+    }
+}
+
+fn finding_severity(
+    label: &str,
+    value: &str,
+    outcome: Option<&str>,
+) -> (&'static str, PostmortemAccent) {
+    let lower = value.to_ascii_lowercase();
+    let outcome_lower = outcome.unwrap_or("").to_ascii_lowercase();
+    if is_low_signal(label, value) {
+        return ("Low", PostmortemAccent::Good);
+    }
+
+    match label {
+        "Cause" => {
+            if outcome_lower.contains("degraded")
+                || outcome_lower.contains("failed")
+                || outcome_lower.contains("error")
+            {
+                ("High", PostmortemAccent::Danger)
+            } else if lower.contains("heuristic") || lower.contains("suspected") {
+                ("Medium", PostmortemAccent::Warning)
+            } else {
+                ("High", PostmortemAccent::Danger)
+            }
+        }
+        "Cache" => {
+            if lower.starts_with("low") {
+                ("High", PostmortemAccent::Danger)
+            } else {
+                ("Medium", PostmortemAccent::Warning)
+            }
+        }
+        "Context" => {
+            if lower.starts_with("high") {
+                ("High", PostmortemAccent::Danger)
+            } else {
+                ("Medium", PostmortemAccent::Warning)
+            }
+        }
+        "Waste" => ("High", PostmortemAccent::Danger),
+        "Tools" | "Skills" | "MCP" => {
+            if lower.contains("fail") && !lower.contains("0 failures") {
+                ("High", PostmortemAccent::Danger)
+            } else if lower.contains("repeated") {
+                ("Medium", PostmortemAccent::Warning)
+            } else {
+                ("Low", PostmortemAccent::Good)
+            }
+        }
+        _ => ("Medium", PostmortemAccent::Warning),
+    }
+}
+
+fn should_render_signal_card(label: &str, value: &str) -> bool {
+    matches!(label, "Cause" | "Cache" | "Context" | "Waste" | "Tools")
+        || (matches!(label, "Skills" | "MCP") && !is_low_signal(label, value))
+}
+
+fn wrap_text_for_width(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if word_len > width {
+            if !current.is_empty() {
+                lines.push(current);
+                current = String::new();
+            }
+            lines.push(truncate_for_box(word, width));
+            continue;
+        }
+
+        let separator = usize::from(!current.is_empty());
+        if current.chars().count() + separator + word_len > width {
+            if !current.is_empty() {
+                lines.push(current);
+            }
+            current = word.to_string();
+        } else {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn wrapped_terminal_lines<F>(text: &str, width: usize, paint: F) -> Vec<TerminalLine>
+where
+    F: Fn(&str) -> String,
+{
+    wrap_text_for_width(text, width)
+        .into_iter()
+        .map(|line| TerminalLine::styled(line.clone(), paint(&line)))
+        .collect()
+}
+
+fn terminal_box(
+    title: &str,
+    lines: &[TerminalLine],
+    width: usize,
+    accent: PostmortemAccent,
+) -> String {
+    let width = width.clamp(20, 132);
+    let inner_width = width.saturating_sub(4).max(8);
+    let border_width = width.saturating_sub(2);
+    let mut out = String::new();
+
+    let title = truncate_for_box(title, border_width.saturating_sub(2).max(1));
+    let title_label = if title.is_empty() {
+        String::new()
+    } else {
+        format!(" {title} ")
+    };
+    let fill = border_width.saturating_sub(title_label.chars().count());
+    out.push_str(&accent.paint(&format!("╭{}{}╮", title_label, "─".repeat(fill))));
+    out.push('\n');
+
+    for line in lines {
+        let visible = line.raw.chars().count().min(inner_width);
+        let pad = inner_width.saturating_sub(visible);
+        out.push_str(&accent.paint("│"));
+        out.push(' ');
+        out.push_str(&line.painted);
+        out.push_str(&" ".repeat(pad));
+        out.push(' ');
+        out.push_str(&accent.paint("│"));
+        out.push('\n');
+    }
+
+    out.push_str(&accent.paint(&format!("╰{}╯", "─".repeat(border_width))));
+    out.push('\n');
+    out
+}
+
+fn postmortem_tabs_line(width: usize, state: Option<&str>) -> TerminalLine {
+    let left = "[ Postmortem ]  Snapshot  Signals  Evidence";
+    let right = state.unwrap_or("final postmortem");
+    let raw = if left.chars().count() + right.chars().count() + 3 <= width {
+        format!(
+            "{}{}| {}",
+            left,
+            " ".repeat(width - left.chars().count() - right.chars().count() - 3),
+            right
+        )
+    } else {
+        truncate_for_box(left, width)
+    };
+    let painted = if let Some(rest) = raw.strip_prefix("[ Postmortem ]") {
+        format!(
+            "{}{}",
+            "[ Postmortem ]".truecolor(255, 145, 71).bold(),
+            rest.bright_black()
+        )
+    } else {
+        raw.bright_black().to_string()
+    };
+    TerminalLine::styled(raw, painted)
+}
+
+fn summary_lines(
+    title: &str,
+    snapshot: &[(String, String)],
+    signals: &[(String, String)],
+    inner_width: usize,
+) -> Vec<TerminalLine> {
+    let state = key_value(snapshot, "State").unwrap_or("final postmortem");
+    let outcome = key_value(snapshot, "Outcome").unwrap_or("unknown");
+    let session = key_value(snapshot, "Session").unwrap_or("unknown");
+    let model = key_value(snapshot, "Model").unwrap_or("unknown");
+    let duration = key_value(snapshot, "Duration").unwrap_or("unknown");
+    let turns = key_value(snapshot, "Turns/tokens").unwrap_or("unknown");
+    let cost = key_value(snapshot, "Cost").unwrap_or("unknown");
+    let waste = key_value(signals, "Waste").unwrap_or("unknown");
+
+    let mut lines = Vec::new();
+    lines.extend(wrapped_terminal_lines(
+        &format!("{title}  {state}  Outcome: {outcome}"),
+        inner_width,
+        |line| line.bright_white().bold().to_string(),
+    ));
+    lines.extend(wrapped_terminal_lines(
+        &format!("Session: {session}  Model: {model}  Duration: {duration}"),
+        inner_width,
+        |line| line.bright_white().to_string(),
+    ));
+    lines.extend(wrapped_terminal_lines(
+        &format!("Turns/tokens: {turns}  Cost: {cost}"),
+        inner_width,
+        |line| line.truecolor(80, 220, 135).bold().to_string(),
+    ));
+    lines.extend(wrapped_terminal_lines(
+        &format!("Impact: {waste}"),
+        inner_width,
+        |line| {
+            if is_low_signal("Waste", waste) {
+                line.truecolor(80, 220, 135).to_string()
+            } else {
+                line.truecolor(246, 207, 68).bold().to_string()
+            }
+        },
+    ));
+    lines
+}
+
+fn evidence_matches_signal(evidence: &EvidenceRow, label: &str) -> bool {
+    let target = label.to_ascii_lowercase();
+    let evidence_label = evidence.label.to_ascii_lowercase();
+    match target.as_str() {
+        "cause" => true,
+        "tools" => evidence_label == "tools",
+        "skills" => evidence_label == "skills",
+        "mcp" => evidence_label == "mcp",
+        "cache" => evidence_label == "cache",
+        "context" => evidence_label == "context",
+        "waste" => {
+            evidence_label == "cost" || evidence_label == "tokens" || evidence_label == "tools"
+        }
+        _ => evidence_label == target,
+    }
+}
+
+fn evidence_terminal_line(evidence: &EvidenceRow, width: usize) -> TerminalLine {
+    let full_raw = format!(
+        "Evidence: {} {} turn {}: {}",
+        evidence.kind, evidence.label, evidence.turn, evidence.detail
+    );
+    let raw = truncate_for_box(&full_raw, width);
+    let painted = if raw == full_raw {
+        format!(
+            "{} {} {} {}",
+            "Evidence:".bright_black().bold(),
+            colorize_evidence_type(&evidence.kind),
+            format!("{} turn {}:", evidence.label, evidence.turn).bright_white(),
+            evidence.detail.bright_black()
+        )
+    } else {
+        raw.bright_black().to_string()
+    };
+    TerminalLine::styled(raw, painted)
+}
+
+fn signal_card_lines(
+    index: usize,
+    label: &str,
+    value: &str,
+    severity: &str,
+    accent: PostmortemAccent,
+    next_action: Option<&str>,
+    evidence: &[EvidenceRow],
+    inner_width: usize,
+) -> Vec<TerminalLine> {
+    let mut lines = Vec::new();
+    let headline = format!("{index}. {label}: {value}  {severity}");
+    let headline = truncate_for_box(&headline, inner_width);
+    lines.push(TerminalLine::styled(
+        headline.clone(),
+        accent.paint_bold(&headline),
+    ));
+
+    for evidence in evidence
+        .iter()
+        .filter(|row| evidence_matches_signal(row, label))
+        .take(1)
+    {
+        lines.push(evidence_terminal_line(evidence, inner_width));
+    }
+
+    if label == "Cause" {
+        if let Some(next_action) = next_action {
+            lines.extend(wrapped_terminal_lines(
+                &format!("Next: {next_action}"),
+                inner_width,
+                |line| line.truecolor(92, 230, 220).to_string(),
+            ));
+        }
+    }
+
+    lines
+}
+
+fn analysis_lines(
+    rows: &[(String, String)],
+    restart_prompt: Option<&str>,
+    inner_width: usize,
+) -> Vec<TerminalLine> {
+    let mut lines = Vec::new();
+    for (label, value) in rows {
+        lines.extend(wrapped_terminal_lines(
+            &format!("{label}: {value}"),
+            inner_width,
+            |line| {
+                if label.eq_ignore_ascii_case("Risk") {
+                    colorize_postmortem_value(label, line)
+                } else {
+                    line.bright_white().to_string()
+                }
+            },
+        ));
+    }
+    if let Some(prompt) = restart_prompt {
+        if !prompt.trim().is_empty() {
+            if !lines.is_empty() {
+                lines.push(TerminalLine::plain(""));
+            }
+            lines.extend(wrapped_terminal_lines(
+                &format!("Restart: {}", prompt.trim()),
+                inner_width,
+                |line| line.truecolor(92, 230, 220).bold().to_string(),
+            ));
+        }
+    }
+    lines
+}
+
+fn restart_prompt_from_section(lines: &[String]) -> Option<String> {
+    let prompt = lines
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .map(clean_terminal_cell)
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!prompt.is_empty()).then_some(prompt)
+}
+
+fn render_postmortem_terminal_for_width(markdown: &str, width: usize) -> String {
+    let width = width.clamp(20, 132);
+    let inner_width = width.saturating_sub(4).max(8);
+    let parsed = parse_postmortem_markdown(markdown);
+    let snapshot = parsed
+        .sections
+        .get("Snapshot")
+        .map(|lines| parse_key_value_section(lines))
+        .unwrap_or_default();
+    let signals = parsed
+        .sections
+        .get("Signals")
+        .map(|lines| parse_key_value_section(lines))
+        .unwrap_or_default();
+    let evidence = parsed
+        .sections
+        .get("Evidence")
+        .map(|lines| parse_evidence_section(lines))
+        .unwrap_or_default();
+    let analysis = parsed
+        .sections
+        .get("Claude Analysis")
+        .map(|lines| parse_key_value_section(lines))
+        .unwrap_or_default();
+    let restart_prompt = parsed
+        .sections
+        .get("Restart Prompt")
+        .and_then(|lines| restart_prompt_from_section(lines));
+
+    let mut out = String::new();
+    out.push('\n');
+    let tabs = postmortem_tabs_line(width, key_value(&snapshot, "State"));
+    out.push_str(&tabs.painted);
+    out.push('\n');
+    out.push_str(&terminal_box(
+        &parsed.title,
+        &summary_lines(&parsed.title, &snapshot, &signals, inner_width),
+        width,
+        PostmortemAccent::Info,
+    ));
+
+    let outcome = key_value(&snapshot, "Outcome");
+    let next_action = key_value(&signals, "Next");
+    let mut rendered_findings = 0;
+    for (label, value) in signals
+        .iter()
+        .filter(|(label, value)| should_render_signal_card(label, value))
+    {
+        rendered_findings += 1;
+        let (severity, accent) = finding_severity(label, value, outcome);
+        out.push('\n');
+        out.push_str(&terminal_box(
+            &format!("Finding {rendered_findings}"),
+            &signal_card_lines(
+                rendered_findings,
+                label,
+                value,
+                severity,
+                accent,
+                next_action,
+                &evidence,
+                inner_width,
+            ),
+            width,
+            accent,
+        ));
+    }
+
+    if !evidence.is_empty() {
+        let evidence_lines = evidence
+            .iter()
+            .take(3)
+            .map(|row| evidence_terminal_line(row, inner_width))
+            .collect::<Vec<_>>();
+        out.push('\n');
+        out.push_str(&terminal_box(
+            "Evidence",
+            &evidence_lines,
+            width,
+            PostmortemAccent::Muted,
+        ));
+    }
+
+    let analysis = analysis_lines(&analysis, restart_prompt.as_deref(), inner_width);
+    if !analysis.is_empty() {
+        out.push('\n');
+        out.push_str(&terminal_box(
+            "Claude Analysis",
+            &analysis,
+            width,
+            PostmortemAccent::Info,
+        ));
+    }
+
+    out
+}
+
+fn render_postmortem_terminal(markdown: &str) -> String {
+    render_postmortem_terminal_for_width(markdown, terminal_width())
 }
 
 #[cfg(unix)]
@@ -2754,22 +3410,17 @@ fn terminal_width() -> usize {
         .unwrap_or(100)
 }
 
+#[cfg(test)]
 fn postmortem_separator_line_for_width(width: usize) -> String {
     "\u{2501}".repeat(width.max(20))
 }
 
-fn postmortem_separator_line() -> String {
-    postmortem_separator_line_for_width(terminal_width())
-}
-
 fn print_postmortem_terminal_block(markdown: &str) {
-    println!();
-    println!("{}", postmortem_separator_line().dimmed());
-    print!("{}", colorize_postmortem_for_terminal(markdown));
-    if !markdown.ends_with('\n') {
+    let terminal = render_postmortem_terminal(markdown);
+    print!("{terminal}");
+    if !terminal.ends_with('\n') {
         println!();
     }
-    println!("{}", postmortem_separator_line().dimmed());
 }
 
 fn render_postmortem_markdown(report: &serde_json::Value) -> String {
@@ -3895,10 +4546,10 @@ mod tests {
         fetch_run_final_postmortem_markdown_with_retry, format_duration_coarse, format_tokens,
         local_time_from_iso, parse_mcp_tool_name, postmortem_progress_message,
         postmortem_separator_line_for_width, push_unique, render_postmortem_markdown,
-        render_postmortem_markdown_with_optional_analysis, run_child_command_with_deps,
-        run_claude_postmortem_analysis_with_command, run_claude_postmortem_analysis_with_lookup,
-        shell_join, shell_quote, truncate_for_box, watcher_args, yaml_quote, ActiveSessions, Cli,
-        Commands, WatchEvent, WatchPostmortemState,
+        render_postmortem_markdown_with_optional_analysis, render_postmortem_terminal_for_width,
+        run_child_command_with_deps, run_claude_postmortem_analysis_with_command,
+        run_claude_postmortem_analysis_with_lookup, shell_join, shell_quote, truncate_for_box,
+        watcher_args, yaml_quote, ActiveSessions, Cli, Commands, WatchEvent, WatchPostmortemState,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
@@ -4892,6 +5543,56 @@ If failures recur, restart with a shorter prompt.\n\
         assert!(terminal.contains("cc-blackbox Postmortem"));
         assert!(terminal.contains("heuristic"));
         assert!(!markdown.contains("\u{1b}["));
+    }
+
+    #[test]
+    fn postmortem_terminal_renderer_uses_boxed_ranked_cards() {
+        let markdown = "# cc-blackbox Postmortem\n\
+\n\
+## Snapshot\n\
+  Session       `session_target`\n\
+  State         final postmortem\n\
+  Outcome       Degraded\n\
+  Model         claude-sonnet\n\
+  Duration      18m\n\
+  Turns/tokens  7 turns, 214K\n\
+  Cost          $4.91\n\
+\n\
+## Signals\n\
+  Cause   Tool failure loop\n\
+  Cache   Low: 42% reusable prompt cache; 36% of input from cache\n\
+  Context  High: 87% full; about 1 turn before auto-compaction\n\
+  Waste   Likely waste: 76K tokens, $1.84\n\
+  Tools   14 calls, 3 failures; failing: Bash (3)\n\
+  Next    Restart with a shorter prompt and inspect the failing command first.\n\
+\n\
+## Evidence\n\
+  Type        Signal        Turn   Detail\n\
+  ----------  ------------  -----  ------\n\
+  direct      tools         7      14 Read/Edit calls against the same redacted path\n\
+\n\
+## Claude Analysis\n\
+  Status       Final - session degraded after repeated failures\n\
+  Main signal  Tool failure loop\n\
+  Risk         High - restart is cheaper\n\
+  Next action  Restart with the summary\n\
+## Restart Prompt\n\
+  Continue from this summary and inspect the failing command before editing.\n";
+
+        let terminal = render_postmortem_terminal_for_width(markdown, 92);
+
+        assert!(terminal.contains("[ Postmortem ]"));
+        assert!(terminal.contains("╭ cc-blackbox Postmortem"));
+        assert!(terminal.contains("Finding 1"));
+        assert!(terminal.contains("1. Cause: Tool failure loop"));
+        assert!(terminal.contains("Finding 5"));
+        assert!(terminal.contains("Impact: Likely waste: 76K tokens, $1.84"));
+        assert!(terminal.contains("Evidence"));
+        assert!(terminal.contains("Claude Analysis"));
+        assert!(terminal.contains("Restart: Continue from this summary"));
+        assert!(!terminal.contains("Finding 6"));
+        assert!(!terminal.contains("## Snapshot"));
+        assert!(!terminal.contains("----------"));
     }
 
     #[test]

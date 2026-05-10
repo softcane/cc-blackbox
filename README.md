@@ -67,19 +67,21 @@ cc-blackbox fails open by default. If policy cannot load, a detector fails, or t
 
 By default, blocking is conservative:
 
-- **Configured session token budget:** blocks the next request after the session crosses the token limit.
-- **Configured trusted dollar budget:** blocks the next request only when the pricing source is trusted for enforcement.
-- **API error cooldown:** repeated API errors open a short cooldown window.
-- **Explicit policy blocks:** known rules can be made stricter in policy, but there is no custom rule DSL.
+| Signal | Default action | Can block? | When a request is blocked |
+| --- | --- | --- | --- |
+| Session token budget | Block | Yes | The next request after the session exceeds `CC_BLACKBOX_SESSION_BUDGET_TOKENS` or the policy token limit. |
+| Trusted session dollar budget | Block | Yes | The next request after trusted estimated spend exceeds `CC_BLACKBOX_SESSION_BUDGET_DOLLARS` or the policy dollar limit. |
+| API error streak | Cooldown | Yes | Requests during the cooldown window after the configured number of consecutive API errors. |
+| Repeated cache rebuilds | Warn | Only if explicitly configured | Not blocked by default. |
+| Context pressure / near compaction | Warn | Only if explicitly configured | Not blocked by default. |
+| Suspected compaction loop | Warn | Only if explicitly configured | Not blocked by default. |
+| Model route mismatch | Warn | Only if explicitly configured | Not blocked by default. |
+| Tool failure streak | Warn | Only if explicitly configured | Not blocked by default. |
+| Weekly/project quota burn | Warn | No by default | Not blocked by default. |
+| No-progress / task abandonment inference | Diagnose only | No by default | Not blocked by default. |
+| Missing or ambiguous JSONL | Diagnose only | No | Never blocks live traffic. |
 
-These are warning-first by default, not hard stops:
-
-- repeated cache rebuilds;
-- context pressure and near-compaction;
-- suspected compaction loops;
-- model route mismatch;
-- tool failure streaks;
-- weekly/project quota burn.
+Blocking happens on the next request, not by stopping a response already in flight. Response-side analysis updates guard state after the stream continues, and request-side policy enforcement decides whether the next call is forwarded upstream.
 
 That split matters. A false warning is annoying. A false block interrupts work. cc-blackbox should only block when the policy is explicit and the signal is strong enough.
 

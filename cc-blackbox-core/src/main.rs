@@ -54,6 +54,7 @@ pub mod envoy {
 }
 
 pub mod diagnosis;
+pub mod guard;
 pub mod metrics;
 pub mod pricing;
 pub mod watch;

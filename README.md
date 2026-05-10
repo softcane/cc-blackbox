@@ -47,7 +47,7 @@ cc-blackbox postmortem latest
 
 ## Guard Mode
 
-Guard mode is the day-to-day interface. It does not replace the proxy; it is the product-facing view over the existing local stack.
+Guard mode is the day-to-day interface. It is the product-facing view over the existing local stack.
 
 ```bash
 cc-blackbox guard start     # start or validate the local proxy/core stack
@@ -56,9 +56,10 @@ cc-blackbox guard status    # show current sessions and guard state
 cc-blackbox guard watch     # stream live findings in plain language
 ```
 
-The states are intentionally boring: Healthy, Watching, Warning, Critical, Blocked, Cooldown, and Ended. A warning means "pay attention." Critical means the next request may be blocked if policy says so. Blocked and Cooldown mean cc-blackbox already returned a policy response instead of forwarding that request.
+The states are: `Healthy`, `Watching`, `Warning`, `Critical`, `Blocked`, `Cooldown`, and `Ended`.
+A warning means "pay attention." Critical means the next request may be blocked if policy says so. Blocked and Cooldown mean cc-blackbox already returned a policy response instead of forwarding that request.
 
-Guard findings are evidence-labeled. A model mismatch is reported as a route mismatch, not as a guessed provider cause. Context runway and compaction risk are marked as heuristics. Tool and JSONL findings say where the evidence came from.
+Guard findings are evidence-labeled. A model mismatch is reported as a route mismatch. Context runway and compaction risk are marked as heuristics. Tool and JSONL findings say where the evidence came from.
 
 ## What Can Block
 
@@ -170,7 +171,7 @@ cc-blackbox is designed to be safe to try because it stays local and is easy to 
 - **Guard:** current state, active findings, policy, warnings, blocks, and cooldowns.
 - **Watch:** lower-level live activity for tools, cache, context, model route mismatch, quota burn, and sessions.
 - **Postmortems:** redacted reports with likely cause, direct/proxy/JSONL/heuristic evidence, confidence, token/cost impact, and the next action.
-- **Advanced views:** recent sessions, lightweight recall, local `/metrics`, and Grafana trends.
+- **Advanced views:** recent sessions, local `/metrics`, and Grafana trends.
 
 ## Reference
 
@@ -195,7 +196,6 @@ Guard mode is the normal live workflow. Watch mode, APIs, and Grafana are still 
 - **Open the local session API:** `curl -s 'http://127.0.0.1:9091/api/sessions?limit=5'`
 - **Read the current local summary:** `curl -s http://127.0.0.1:9091/api/summary`
 - **Inspect one session diagnosis:** `curl -s http://127.0.0.1:9091/api/diagnosis/<session_id>`
-- **Recall where you left off:** `cc-blackbox recall "auth middleware"`
 - **Advanced hook setup:** [Claude Code hook telemetry](docs/reference/advanced.md#claude-code-hook-telemetry)
 
 Open Grafana at [http://127.0.0.1:3000/d/cc-blackbox-main](http://127.0.0.1:3000/d/cc-blackbox-main) when you want longer-running trends. Anonymous viewer mode is enabled, and the local admin login is `admin` / `admin`.

@@ -46,10 +46,16 @@ command -v sha256sum >/dev/null || command -v shasum >/dev/null || {
 For guard mode setup, also check Docker:
 
 ```sh
-docker compose version
+if docker compose version >/dev/null 2>&1; then
+  echo "docker compose is available"
+elif docker-compose version >/dev/null 2>&1; then
+  echo "docker-compose is available"
+else
+  echo "Docker Compose is not available"
+fi
 ```
 
-If Docker is missing, the CLI can still be installed, but `cc-blackbox guard start` will not be able to start the local proxy stack.
+If Docker or Docker Compose is missing, the CLI can still be installed, but `cc-blackbox guard start` will not be able to start the local proxy stack.
 
 ## Inputs
 
@@ -209,7 +215,7 @@ Run:
 "$cc_blackbox_bin" doctor
 ```
 
-If Docker is available and the user wants the local proxy stack started, run:
+If Docker and Docker Compose are available and the user wants the local proxy stack started, run:
 
 ```sh
 "$cc_blackbox_bin" guard start

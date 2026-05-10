@@ -772,11 +772,25 @@ fn evaluate_request_guard_for_session(
     None
 }
 
+fn guard_block_user_message(block: &guard::GuardBlock) -> String {
+    let mut parts = vec![
+        format!("cc-blackbox blocked this request: {}", block.reason),
+        format!("rule: {}", block.rule_id),
+        format!("limit/threshold: {}", block.configured_threshold_or_limit),
+        format!("current: {}", block.current_observed_value),
+    ];
+    if let Some(session_id) = block.session_id.as_deref() {
+        parts.push(format!("session: {session_id}"));
+    }
+    if let Some(remaining) = block.cooldown_remaining_secs {
+        parts.push(format!("cooldown remaining: {remaining}s"));
+    }
+    parts.push(format!("recovery: {}", block.suggested_next_action));
+    parts.join("; ")
+}
+
 fn make_guard_block_response(block: &guard::GuardBlock) -> ProcessingResponse {
-    let message = format!(
-        "cc-blackbox blocked this request: {} {}",
-        block.reason, block.suggested_next_action
-    );
+    let message = guard_block_user_message(block);
     let body = serde_json::json!({
         "type": "error",
         "error": {
@@ -798,7 +812,7 @@ fn make_guard_block_response(block: &guard::GuardBlock) -> ProcessingResponse {
     ProcessingResponse {
         response: Some(ExtProcResponse::ImmediateResponse(ImmediateResponse {
             status: Some(envoy::r#type::v3::HttpStatus {
-                code: envoy::r#type::v3::StatusCode::TooManyRequests.into(),
+                code: envoy::r#type::v3::StatusCode::PaymentRequired.into(),
             }),
             headers: Some(HeaderMutation {
                 set_headers: vec![ProtoHeaderValueOption {
@@ -14412,13 +14426,19 @@ mod tests {
         let decision = evaluate_request_guard_for_session(Some(session_id), Some(&policy))
             .expect("request should block");
         let response = make_guard_block_response(decision.block.as_ref().expect("block metadata"));
-        let body = match response.response.expect("immediate response") {
-            ExtProcResponse::ImmediateResponse(response) => response.body,
+        let immediate = match response.response.expect("immediate response") {
+            ExtProcResponse::ImmediateResponse(response) => response,
             other => panic!("expected immediate response, got {other:?}"),
         };
+        assert_eq!(
+            immediate.status.expect("status").code,
+            crate::envoy::r#type::v3::StatusCode::PaymentRequired as i32
+        );
+        let body = immediate.body;
         let json: serde_json::Value = serde_json::from_str(&body).expect("valid json block body");
 
         assert_eq!(json["error"]["type"], "budget_exceeded");
+        let message = json["error"]["message"].as_str().expect("message");
         assert_eq!(
             json["error"]["rule_id"],
             "per_session_token_budget_exceeded"
@@ -14431,6 +14451,10 @@ mod tests {
             .as_str()
             .expect("suggested action")
             .contains("fresh session"));
+        assert!(message.contains("per_session_token_budget_exceeded"));
+        assert!(message.contains("100 tokens"));
+        assert!(message.contains(session_id));
+        assert!(message.contains("recovery:"));
 
         for forbidden in [
             "raw_prompt",

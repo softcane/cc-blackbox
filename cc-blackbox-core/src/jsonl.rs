@@ -20,6 +20,7 @@ pub struct JsonlDerivedSession {
     pub started_at_epoch_secs: u64,
     pub last_activity_at_epoch_secs: u64,
     pub first_message_hash: String,
+    pub prompt_correlation_hash: String,
     pub user_turn_count: u64,
     pub assistant_turn_count: u64,
     pub request_count: u64,
@@ -42,6 +43,7 @@ impl JsonlDerivedSession {
             started_at_epoch_secs: self.started_at_epoch_secs,
             last_activity_at_epoch_secs: self.last_activity_at_epoch_secs,
             first_message_hash: self.first_message_hash.clone(),
+            prompt_correlation_hash: self.prompt_correlation_hash.clone(),
             request_count: self.request_count,
             turn_count: self.assistant_turn_count,
         }
@@ -87,6 +89,7 @@ pub fn parse_jsonl_str(raw: &str, source_id: &str) -> Option<JsonlDerivedSession
         ..JsonlDerivedSession::default()
     };
     let mut tool_ids = BTreeMap::<String, String>::new();
+    let mut assistant_request_turns = BTreeMap::<String, u64>::new();
     let mut current_assistant_turn = 0u64;
 
     for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -139,6 +142,8 @@ pub fn parse_jsonl_str(raw: &str, source_id: &str) -> Option<JsonlDerivedSession
                 if let Some(text) = user_text_content(message.get("content")) {
                     if session.first_message_hash.is_empty() {
                         session.first_message_hash = hash_text_hex(&text);
+                        session.prompt_correlation_hash =
+                            crate::correlation::prompt_correlation_hash(&text);
                     }
                     session.user_turn_count += 1;
                 }
@@ -150,8 +155,8 @@ pub fn parse_jsonl_str(raw: &str, source_id: &str) -> Option<JsonlDerivedSession
                 );
             }
             "assistant" => {
-                session.assistant_turn_count += 1;
-                current_assistant_turn = session.assistant_turn_count;
+                current_assistant_turn =
+                    logical_assistant_turn(&value, &mut assistant_request_turns, &mut session);
                 collect_usage(message.get("usage"), &mut session.usage);
                 collect_tool_uses(
                     message.get("content"),
@@ -162,8 +167,8 @@ pub fn parse_jsonl_str(raw: &str, source_id: &str) -> Option<JsonlDerivedSession
             }
             _ => {
                 if top_type == Some("assistant") {
-                    session.assistant_turn_count += 1;
-                    current_assistant_turn = session.assistant_turn_count;
+                    current_assistant_turn =
+                        logical_assistant_turn(&value, &mut assistant_request_turns, &mut session);
                     collect_usage(message.get("usage"), &mut session.usage);
                     collect_tool_uses(
                         message.get("content"),
@@ -202,6 +207,25 @@ fn hash_text_hex(raw: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     raw.hash(&mut hasher);
     format!("firstmsg_{:016x}", hasher.finish())
+}
+
+fn logical_assistant_turn(
+    value: &Value,
+    assistant_request_turns: &mut BTreeMap<String, u64>,
+    session: &mut JsonlDerivedSession,
+) -> u64 {
+    if let Some(request_id) = value.get("requestId").and_then(Value::as_str) {
+        if let Some(turn) = assistant_request_turns.get(request_id) {
+            return *turn;
+        }
+        session.assistant_turn_count += 1;
+        let turn = session.assistant_turn_count;
+        assistant_request_turns.insert(request_id.to_string(), turn);
+        return turn;
+    }
+
+    session.assistant_turn_count += 1;
+    session.assistant_turn_count
 }
 
 fn parse_epoch_secs(raw: &str) -> Option<u64> {
@@ -507,5 +531,26 @@ this is not json
 "#;
 
         assert!(parse_jsonl_str(raw, "corrupt.jsonl").is_none());
+    }
+
+    #[test]
+    fn parser_counts_current_claude_code_request_ids_as_logical_turns() {
+        let raw = r#"
+{"type":"user","sessionId":"jsonl-current","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"Read-only architecture audit"}}
+{"type":"assistant","sessionId":"jsonl-current","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:01Z","requestId":"req_1","message":{"role":"assistant","content":[{"type":"thinking","thinking":"plan"}],"usage":{"input_tokens":10,"output_tokens":10}}}
+{"type":"assistant","sessionId":"jsonl-current","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:02Z","requestId":"req_1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/tmp/RAW_PATH"}}],"usage":{"input_tokens":10,"output_tokens":10}}}
+{"type":"user","sessionId":"jsonl-current","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:03Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"RAW_RESULT"}]}}
+{"type":"assistant","sessionId":"jsonl-current","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:04Z","requestId":"req_2","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":5,"output_tokens":5}}}
+"#;
+
+        let parsed = parse_jsonl_str(raw, "current.jsonl").expect("parsed jsonl");
+
+        assert_eq!(parsed.assistant_turn_count, 2);
+        assert_eq!(parsed.request_count, 2);
+        assert_eq!(parsed.tool_calls.get("Read"), Some(&1));
+        assert_eq!(
+            parsed.prompt_correlation_hash,
+            crate::correlation::prompt_correlation_hash("Read-only architecture audit")
+        );
     }
 }

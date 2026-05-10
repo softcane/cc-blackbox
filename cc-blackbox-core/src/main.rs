@@ -863,6 +863,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     model TEXT,
     working_dir TEXT,
     first_message_hash TEXT,
+    prompt_correlation_hash TEXT,
     initial_prompt TEXT
 );
 
@@ -1030,6 +1031,7 @@ enum DbCommand {
         initial_prompt: Option<String>,
         working_dir: String,
         first_message_hash: String,
+        prompt_correlation_hash: String,
     },
     RecordRequest {
         request_id: String,
@@ -1240,6 +1242,12 @@ fn ensure_session_columns(conn: &Connection) -> rusqlite::Result<()> {
     if !columns.contains("first_message_hash") {
         conn.execute(
             "ALTER TABLE sessions ADD COLUMN first_message_hash TEXT",
+            [],
+        )?;
+    }
+    if !columns.contains("prompt_correlation_hash") {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN prompt_correlation_hash TEXT",
             [],
         )?;
     }
@@ -1645,6 +1653,7 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 initial_prompt,
                 working_dir,
                 first_message_hash,
+                prompt_correlation_hash,
             } => {
                 let initial_prompt =
                     derived_optional_content_metadata("initial prompt", initial_prompt);
@@ -1652,14 +1661,15 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 let _ = conn.execute(
                     "INSERT OR IGNORE INTO sessions \
                      (session_id, started_at, last_activity_at, model, working_dir, \
-                      first_message_hash, initial_prompt) \
-                     VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6)",
+                      first_message_hash, prompt_correlation_hash, initial_prompt) \
+                     VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7)",
                     rusqlite::params![
                         session_id,
                         started_at,
                         model,
                         working_dir,
                         first_message_hash,
+                        prompt_correlation_hash,
                         initial_prompt
                     ],
                 );
@@ -1921,14 +1931,17 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                     let _ = conn.execute(
                         "INSERT OR IGNORE INTO sessions (
                             session_id, started_at, model, working_dir, first_message_hash,
-                            initial_prompt
-                        ) VALUES (?1,?2,?3,?4,?5,?6)",
+                            prompt_correlation_hash, initial_prompt
+                        ) VALUES (?1,?2,?3,?4,?5,?6,?7)",
                         rusqlite::params![
                             &session_id,
                             &finding.timestamp,
                             "guard",
                             "",
                             "guard_global",
+                            correlation::prompt_correlation_hash(
+                                "guard-level finding (no prompt content)."
+                            ),
                             "guard-level finding (no prompt content).",
                         ],
                     );
@@ -2462,6 +2475,7 @@ struct PostmortemSessionRow {
     model: Option<String>,
     working_dir: String,
     first_message_hash: String,
+    prompt_correlation_hash: String,
     initial_prompt: Option<String>,
     total_input_tokens: u64,
     total_output_tokens: u64,
@@ -2635,7 +2649,8 @@ fn load_postmortem_session(
                 CAST(strftime('%s', started_at) AS INTEGER), \
                 last_activity_at, \
                 CAST(strftime('%s', COALESCE(last_activity_at, ended_at, started_at)) AS INTEGER), \
-                ended_at, model, COALESCE(working_dir, ''), COALESCE(first_message_hash, ''), initial_prompt, \
+                ended_at, model, COALESCE(working_dir, ''), COALESCE(first_message_hash, ''), \
+                COALESCE(prompt_correlation_hash, ''), initial_prompt, \
                 total_input_tokens, total_output_tokens, total_cache_read_tokens, \
                 total_cache_creation_tokens, request_count, \
                 CASE WHEN ended_at IS NOT NULL \
@@ -2657,16 +2672,17 @@ fn load_postmortem_session(
                 model: row.get(6)?,
                 working_dir: row.get(7)?,
                 first_message_hash: row.get(8)?,
-                initial_prompt: row.get(9)?,
-                total_input_tokens: row.get::<_, Option<i64>>(10)?.unwrap_or(0).max(0) as u64,
-                total_output_tokens: row.get::<_, Option<i64>>(11)?.unwrap_or(0).max(0) as u64,
-                total_cache_read_tokens: row.get::<_, Option<i64>>(12)?.unwrap_or(0).max(0)
+                prompt_correlation_hash: row.get(9)?,
+                initial_prompt: row.get(10)?,
+                total_input_tokens: row.get::<_, Option<i64>>(11)?.unwrap_or(0).max(0) as u64,
+                total_output_tokens: row.get::<_, Option<i64>>(12)?.unwrap_or(0).max(0) as u64,
+                total_cache_read_tokens: row.get::<_, Option<i64>>(13)?.unwrap_or(0).max(0)
                     as u64,
-                total_cache_creation_tokens: row.get::<_, Option<i64>>(13)?.unwrap_or(0).max(0)
+                total_cache_creation_tokens: row.get::<_, Option<i64>>(14)?.unwrap_or(0).max(0)
                     as u64,
-                request_count: row.get::<_, Option<i64>>(14)?.unwrap_or(0).max(0) as u64,
+                request_count: row.get::<_, Option<i64>>(15)?.unwrap_or(0).max(0) as u64,
                 duration_secs: row
-                    .get::<_, Option<i64>>(15)?
+                    .get::<_, Option<i64>>(16)?
                     .map(|value| value.max(0) as u64),
             })
         },
@@ -3300,6 +3316,7 @@ fn proxy_correlation_for_postmortem_session(
         started_at_epoch_secs: session.started_at_epoch_secs,
         last_activity_at_epoch_secs: session.last_activity_at_epoch_secs,
         first_message_hash: session.first_message_hash.clone(),
+        prompt_correlation_hash: session.prompt_correlation_hash.clone(),
         request_count: session.request_count,
         turn_count,
     }
@@ -3631,6 +3648,7 @@ fn jsonl_signal_json(summary: Option<&jsonl::JsonlDerivedSession>) -> Value {
         "session_id": summary.jsonl_session_id,
         "user_turn_count": summary.user_turn_count,
         "assistant_turn_count": summary.assistant_turn_count,
+        "request_count": summary.request_count,
         "tool_calls": count_map_json(&summary.tool_calls, "tool_name"),
         "tool_failures": count_map_json(&summary.tool_failures, "tool_name"),
         "mcp_tool_names": string_set_json(&summary.mcp_tool_names),
@@ -5223,6 +5241,11 @@ fn ensure_session_inserted(
             initial_prompt: initial_prompt.clone(),
             working_dir: working_dir.to_string(),
             first_message_hash: first_message_hash.to_string(),
+            prompt_correlation_hash: if user_prompt_excerpt.is_empty() {
+                String::new()
+            } else {
+                correlation::prompt_correlation_hash(user_prompt_excerpt)
+            },
         });
         watch::BROADCASTER.broadcast(watch::WatchEvent::SessionStart {
             session_id: session_id.to_string(),
@@ -9789,9 +9812,9 @@ mod tests {
         build_postmortem_response_from_db, build_session_summary_json,
         build_sessions_response_json, build_summary_response_json, canonical_telemetry_name,
         classify_cache_event, clean_user_prompt, compact_response_summary,
-        content_metadata_for_storage, context_fill_percent, context_fill_ratio, db_writer_loop,
-        derive_display_name, diagnosis, end_session_with_db_tx, ensure_session_columns,
-        epoch_to_iso8601, estimated_rebuild_cost_for_cache_event,
+        content_metadata_for_storage, context_fill_percent, context_fill_ratio, correlation,
+        db_writer_loop, derive_display_name, diagnosis, end_session_with_db_tx,
+        ensure_session_columns, epoch_to_iso8601, estimated_rebuild_cost_for_cache_event,
         evaluate_request_guard_for_session, extract_explicit_skill_refs, extract_header,
         extract_headers, extract_working_dir, fallback_request_id, guard,
         guard_finding_watch_event, in_memory_postmortem_totals, infer_context_window_tokens,
@@ -10962,6 +10985,7 @@ mod tests {
             initial_prompt: Some(raw_prompt.to_string()),
             working_dir: "/tmp/privacy".to_string(),
             first_message_hash: "firstmsg_privacy".to_string(),
+            prompt_correlation_hash: correlation::prompt_correlation_hash(raw_prompt),
         })
         .expect("queue session insert");
         let mut request = test_record_request_command(
@@ -11269,6 +11293,9 @@ mod tests {
             initial_prompt: Some("RAW_FIRST_MESSAGE_HASH_INPUT".to_string()),
             working_dir: "/Users/pradeepsingh/code/cc-blackbox/".to_string(),
             first_message_hash: "firstmsg_8f14e45fceea".to_string(),
+            prompt_correlation_hash: correlation::prompt_correlation_hash(
+                "RAW_FIRST_MESSAGE_HASH_INPUT",
+            ),
         })
         .expect("queue session insert");
         tx.send(test_record_request_command(
@@ -11330,6 +11357,7 @@ mod tests {
             initial_prompt: None,
             working_dir: "/tmp/cc-blackbox-test".to_string(),
             first_message_hash: "firstmsg_jsonl".to_string(),
+            prompt_correlation_hash: String::new(),
         })
         .expect("queue session insert");
         tx.send(DbCommand::WriteGuardFinding {
@@ -12965,6 +12993,116 @@ mod tests {
     }
 
     #[test]
+    fn current_claude_code_jsonl_shape_matches_postmortem_by_prompt_correlation_hash() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let jsonl_dir = std::env::temp_dir().join(format!(
+            "cc-blackbox-current-jsonl-match-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&jsonl_dir).expect("create jsonl dir");
+        let _jsonl_dir = EnvVarGuard::set(
+            "CC_BLACKBOX_JSONL_DIR",
+            jsonl_dir.to_str().expect("jsonl dir is utf-8"),
+        );
+        let conn = create_full_test_db();
+        let visible_prompt = "Read-only architecture audit for this repository";
+        let full_api_prompt = format!(
+            "<system-reminder>Claude Code injected instructions</system-reminder>\n{visible_prompt}"
+        );
+        conn.execute(
+            "INSERT INTO sessions (
+                session_id, started_at, last_activity_at, ended_at, model, working_dir,
+                first_message_hash, prompt_correlation_hash, initial_prompt
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+            rusqlite::params![
+                "session-current-jsonl-match",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:04Z",
+                "2026-01-01T00:00:05Z",
+                "claude-haiku-4-5-20251001",
+                "/tmp/cc-blackbox-jsonl",
+                super::hash_text_hex(&full_api_prompt),
+                correlation::prompt_correlation_hash(visible_prompt),
+            ],
+        )
+        .expect("insert session");
+        for turn in 1..=2 {
+            insert_request(
+                &conn,
+                &format!("req-current-jsonl-{turn}"),
+                "session-current-jsonl-match",
+                &format!("2026-01-01T00:00:0{turn}Z"),
+                "claude-haiku-4-5-20251001",
+                1_000,
+                100,
+                0,
+                0,
+            );
+            insert_turn_snapshot(
+                &conn,
+                "session-current-jsonl-match",
+                turn,
+                &format!("2026-01-01T00:00:0{turn}Z"),
+                0,
+                0,
+                100,
+                0.0,
+                0.02,
+                None,
+            );
+        }
+
+        let jsonl = format!(
+            r#"{{"type":"custom-title","customTitle":"phase7-real","sessionId":"jsonl-current-shape"}}
+{{"type":"user","sessionId":"jsonl-current-shape","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:00Z","message":{{"role":"user","content":"{visible_prompt}"}}}}
+{{"type":"assistant","sessionId":"jsonl-current-shape","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:01Z","requestId":"req_current_1","message":{{"role":"assistant","content":[{{"type":"thinking","thinking":"RAW_THINKING_TEXT"}}],"usage":{{"input_tokens":10,"output_tokens":10}}}}}}
+{{"type":"assistant","sessionId":"jsonl-current-shape","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:02Z","requestId":"req_current_1","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"Read","input":{{"file_path":"/tmp/RAW_FILE_SECRET"}}}}],"usage":{{"input_tokens":10,"output_tokens":10}}}}}}
+{{"type":"user","sessionId":"jsonl-current-shape","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:03Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_1","content":"RAW_TOOL_RESULT_SECRET"}}]}}}}
+{{"type":"assistant","sessionId":"jsonl-current-shape","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:04Z","requestId":"req_current_2","message":{{"role":"assistant","content":[{{"type":"text","text":"RAW_FINAL_TEXT"}}],"usage":{{"input_tokens":5,"output_tokens":5}}}}}}
+"#
+        );
+        fs::write(jsonl_dir.join("current.jsonl"), jsonl).expect("write current jsonl fixture");
+
+        let json = build_postmortem_response_from_db(&conn, "session-current-jsonl-match", true)
+            .expect("postmortem");
+
+        assert_eq!(
+            json.pointer("/enrichment_status/status")
+                .and_then(|value| value.as_str()),
+            Some("matched")
+        );
+        assert_eq!(
+            json.pointer("/enrichment_status/jsonl_session_id")
+                .and_then(|value| value.as_str()),
+            Some("jsonl-current-shape")
+        );
+        assert_eq!(
+            json.pointer("/signals/jsonl/request_count")
+                .and_then(|value| value.as_u64()),
+            Some(2)
+        );
+        let rendered = serde_json::to_string(&json).expect("serialize postmortem");
+        for forbidden in [
+            visible_prompt,
+            "RAW_THINKING_TEXT",
+            "RAW_FILE_SECRET",
+            "RAW_TOOL_RESULT_SECRET",
+            "RAW_FINAL_TEXT",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "raw JSONL leaked: {rendered}"
+            );
+        }
+
+        fs::remove_dir_all(jsonl_dir).expect("remove jsonl dir");
+    }
+
+    #[test]
     fn ambiguous_jsonl_match_stays_proxy_only_without_jsonl_findings() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
         let jsonl_dir = std::env::temp_dir().join(format!(
@@ -13277,6 +13415,7 @@ mod tests {
             initial_prompt: Some("Keep working".to_string()),
             working_dir: "/tmp/cc-blackbox-test".to_string(),
             first_message_hash: "firstmsg_test".to_string(),
+            prompt_correlation_hash: correlation::prompt_correlation_hash("Keep working"),
         })
         .expect("queue session insert");
         tx.send(test_record_request_command(
@@ -13620,6 +13759,7 @@ mod tests {
             initial_prompt: Some("Summarize final state".to_string()),
             working_dir: "/tmp/cc-blackbox-test".to_string(),
             first_message_hash: "firstmsg_test".to_string(),
+            prompt_correlation_hash: correlation::prompt_correlation_hash("Summarize final state"),
         })
         .expect("queue session insert");
         tx.send(test_record_request_command(
@@ -13808,6 +13948,7 @@ mod tests {
             initial_prompt: Some("Finish cleanly".to_string()),
             working_dir: "/tmp/cc-blackbox-test".to_string(),
             first_message_hash: "firstmsg_test".to_string(),
+            prompt_correlation_hash: correlation::prompt_correlation_hash("Finish cleanly"),
         })
         .expect("queue session insert");
         diagnosis::SESSIONS.insert(
@@ -15639,6 +15780,7 @@ action = "page_the_user"
             initial_prompt: None,
             working_dir: "/tmp/cc-blackbox-test".to_string(),
             first_message_hash: "firstmsg_test".to_string(),
+            prompt_correlation_hash: String::new(),
         })
         .expect("queue session insert");
 

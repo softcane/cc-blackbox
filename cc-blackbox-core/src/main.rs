@@ -460,6 +460,10 @@ fn merge_guard_state(current: &str, candidate: &str) -> String {
 }
 
 fn guard_state_from_findings(base_state: &str, findings: &[Value]) -> String {
+    if base_state == "ended" {
+        return "ended".to_string();
+    }
+
     let mut state = base_state.to_string();
     for finding in findings {
         let action = finding
@@ -475,6 +479,7 @@ fn guard_state_from_findings(base_state: &str, findings: &[Value]) -> String {
             "block" => "blocked",
             "critical" => "critical",
             "warn" => "warning",
+            "allow" | "diagnose_only" => base_state,
             _ if severity == "critical" => "critical",
             _ if severity == "warning" => "warning",
             _ => base_state,
@@ -500,10 +505,21 @@ fn guard_finding_title(rule_id: &str) -> String {
     .to_string()
 }
 
+const ACTIVE_GUARD_FINDING_TTL_SECS: u64 = 30 * 60;
+
+fn status_action_for_rule(policy: Option<&guard::GuardPolicy>, rule_id: &str) -> Option<String> {
+    guard::RuleId::from_policy_key(rule_id).map(|rule_id| {
+        serialized_label(policy.map_or(guard::GuardAction::Allow, |policy| {
+            policy.rule_action(rule_id)
+        }))
+    })
+}
+
 fn load_guard_findings_for_session(
     conn: Option<&Connection>,
     session_id: &str,
     limit: usize,
+    policy: Option<&guard::GuardPolicy>,
 ) -> Vec<Value> {
     let Some(conn) = conn else {
         return Vec::new();
@@ -512,19 +528,23 @@ fn load_guard_findings_for_session(
         "SELECT rule_id, severity, action, source, evidence_level, confidence, \
                 timestamp, detail, suggested_action \
          FROM guard_findings WHERE session_id = ?1 \
-         ORDER BY timestamp DESC, id DESC LIMIT ?2",
+           AND timestamp >= ?2 \
+         ORDER BY timestamp DESC, id DESC LIMIT ?3",
     ) {
         Ok(stmt) => stmt,
         Err(_) => return Vec::new(),
     };
+    let cutoff = epoch_to_iso8601(now_epoch_secs().saturating_sub(ACTIVE_GUARD_FINDING_TTL_SECS));
 
-    let rows = match stmt.query_map(rusqlite::params![session_id, limit as i64], |row| {
+    let rows = match stmt.query_map(rusqlite::params![session_id, cutoff, limit as i64], |row| {
         let rule_id: String = row.get(0)?;
+        let stored_action: String = row.get(2)?;
+        let action = status_action_for_rule(policy, &rule_id).unwrap_or(stored_action);
         Ok(serde_json::json!({
             "rule_id": rule_id,
             "title": guard_finding_title(&rule_id),
             "severity": row.get::<_, String>(1)?,
-            "action": row.get::<_, String>(2)?,
+            "action": action,
             "source": row.get::<_, String>(3)?,
             "evidence_level": row.get::<_, String>(4)?,
             "confidence": row.get::<_, f64>(5)?,
@@ -569,6 +589,7 @@ fn load_ended_guard_sessions(
     conn: Option<&Connection>,
     session_filter: Option<&str>,
     limit: usize,
+    policy: Option<&guard::GuardPolicy>,
 ) -> Vec<Value> {
     let Some(conn) = conn else {
         return Vec::new();
@@ -606,7 +627,7 @@ fn load_ended_guard_sessions(
 
     rows.into_iter()
         .map(|(session_id, model, _ended_at)| {
-            let findings = load_guard_findings_for_session(Some(conn), &session_id, 3);
+            let findings = load_guard_findings_for_session(Some(conn), &session_id, 3, policy);
             guard_session_status_json(session_id.clone(), session_id, model, "ended", findings)
         })
         .collect()
@@ -614,6 +635,7 @@ fn load_ended_guard_sessions(
 
 fn build_guard_status_report_json(session_filter: Option<&str>) -> Value {
     let conn = Connection::open(db_path()).ok();
+    let policy = request_guard_policy();
     let mut sessions = diagnosis::SESSIONS
         .iter()
         .filter_map(|entry| {
@@ -624,7 +646,12 @@ fn build_guard_status_report_json(session_filter: Option<&str>) -> Value {
             {
                 return None;
             }
-            let findings = load_guard_findings_for_session(conn.as_ref(), &session.session_id, 3);
+            let findings = load_guard_findings_for_session(
+                conn.as_ref(),
+                &session.session_id,
+                3,
+                policy.as_ref(),
+            );
             Some(guard_session_status_json(
                 session.session_id.clone(),
                 session.display_name.clone(),
@@ -648,7 +675,12 @@ fn build_guard_status_report_json(session_filter: Option<&str>) -> Value {
     });
 
     if sessions.is_empty() {
-        sessions.extend(load_ended_guard_sessions(conn.as_ref(), session_filter, 5));
+        sessions.extend(load_ended_guard_sessions(
+            conn.as_ref(),
+            session_filter,
+            5,
+            policy.as_ref(),
+        ));
     }
 
     let overall_state = sessions
@@ -4509,6 +4541,27 @@ fn project_turns_to_compact(session_id: &str, current_fill_percent: f64) -> Opti
     project_turns_until_compaction(prev_fill, current_fill_percent)
 }
 
+fn proxy_visible_tool_failure_streak(turns: &[diagnosis::TurnSnapshot]) -> Option<(u32, u32)> {
+    let mut consecutive = 0u32;
+    let mut failed_tool_calls = 0u32;
+    for turn in turns.iter().rev() {
+        let total_tools = turn.tool_calls.len() as u32;
+        let failure_ratio = if total_tools > 0 {
+            turn.tool_results_failed as f64 / total_tools as f64
+        } else {
+            0.0
+        };
+        if turn.tool_results_failed > 0 && failure_ratio > 0.5 {
+            consecutive += 1;
+            failed_tool_calls += turn.tool_results_failed;
+        } else {
+            break;
+        }
+    }
+
+    (consecutive > 0).then_some((consecutive, failed_tool_calls))
+}
+
 fn ensure_session_state(
     sys_prompt_hash: u64,
     working_dir_str: &str,
@@ -4718,12 +4771,11 @@ fn finalize_response(
         (acc.http_status >= 400 && !acc.error_body.is_empty())
             .then(|| String::from_utf8_lossy(&acc.error_body).to_string())
     });
+    let guard_policy = request_guard_policy();
     if acc.stream_error_type.is_some() {
-        let policy = request_guard_policy();
-        record_api_response_for_guard(500, !model.is_empty(), policy.as_ref());
+        record_api_response_for_guard(500, !model.is_empty(), guard_policy.as_ref());
     } else if acc.http_status > 0 && acc.http_status < 400 {
-        let policy = request_guard_policy();
-        record_api_response_for_guard(acc.http_status, !model.is_empty(), policy.as_ref());
+        record_api_response_for_guard(acc.http_status, !model.is_empty(), guard_policy.as_ref());
     }
     let cache_event = if is_internal_request || acc.has_response_error() {
         "none"
@@ -4904,7 +4956,7 @@ fn finalize_response(
         });
 
         // Build and store TurnSnapshot.
-        let (turn_number, compaction_loop_signal) = {
+        let (turn_number, compaction_loop_signal, tool_failure_streak) = {
             let mut entry = diagnosis::SESSION_TURNS
                 .entry(session_id.clone())
                 .or_default();
@@ -4948,8 +5000,76 @@ fn finalize_response(
                 entry.as_slice(),
                 entry.len().saturating_sub(1),
             );
-            (n, signal)
+            let tool_failure_streak = proxy_visible_tool_failure_streak(entry.as_slice());
+            (n, signal, tool_failure_streak)
         };
+
+        if cache_event != "none" && !acc.has_response_error() {
+            let rebuild_cost =
+                estimated_rebuild_cost_for_cache_event(acc, &billing_model, &cache_ttl);
+            if let Some(finding) = guard::detect_cache_rebuild_finding(
+                guard_policy.as_ref(),
+                guard::CacheRebuildObservation {
+                    session_id: session_id.clone(),
+                    request_id: Some(request_id.to_string()),
+                    turn_number: Some(turn_number),
+                    timestamp: now_iso8601(),
+                    event_type: cache_event.to_string(),
+                    estimated_rebuild_cost_dollars: Some(rebuild_cost),
+                    cache_creation_tokens: acc.cache_creation_tokens,
+                },
+            ) {
+                broadcast_guard_finding(finding);
+            }
+        }
+
+        if let Some(actual) = acc.response_model.as_ref() {
+            if let Some(finding) = guard::detect_model_mismatch_finding(
+                guard_policy.as_ref(),
+                guard::ModelMismatchObservation {
+                    session_id: session_id.clone(),
+                    request_id: Some(request_id.to_string()),
+                    turn_number: Some(turn_number),
+                    timestamp: now_iso8601(),
+                    requested_model: model.to_string(),
+                    reported_model: actual.clone(),
+                },
+            ) {
+                broadcast_guard_finding(finding);
+            }
+        }
+
+        if let Some(finding) = guard::detect_context_finding(
+            guard_policy.as_ref(),
+            guard::ContextObservation {
+                session_id: session_id.clone(),
+                request_id: Some(request_id.to_string()),
+                turn_number: Some(turn_number),
+                timestamp: now_iso8601(),
+                fill_percent,
+                context_window_tokens: Some(context_window_tokens),
+                turns_to_compact,
+            },
+        ) {
+            broadcast_guard_finding(finding);
+        }
+
+        if let Some((consecutive_failure_turns, failed_tool_calls)) = tool_failure_streak {
+            if let Some(finding) = guard::detect_tool_failure_finding(
+                guard_policy.as_ref(),
+                guard::ToolFailureObservation {
+                    session_id: session_id.clone(),
+                    request_id: Some(request_id.to_string()),
+                    turn_number: Some(turn_number),
+                    timestamp: now_iso8601(),
+                    consecutive_failure_turns,
+                    failed_tool_calls,
+                    source: guard::FindingSource::Proxy,
+                },
+            ) {
+                broadcast_guard_finding(finding);
+            }
+        }
 
         if let Some(signal) = compaction_loop_signal {
             // Emit once when the heuristic first crosses the detection threshold.
@@ -4959,6 +5079,19 @@ fn finalize_response(
                     consecutive: signal.consecutive_turns,
                     wasted_tokens: signal.wasted_tokens,
                 });
+                if let Some(finding) = guard::detect_compaction_loop_finding(
+                    guard_policy.as_ref(),
+                    guard::CompactionLoopObservation {
+                        session_id: session_id.clone(),
+                        request_id: Some(request_id.to_string()),
+                        turn_number: Some(turn_number),
+                        timestamp: now_iso8601(),
+                        consecutive_turns: signal.consecutive_turns,
+                        wasted_tokens: signal.wasted_tokens,
+                    },
+                ) {
+                    broadcast_guard_finding(finding);
+                }
             }
         }
 
@@ -12931,6 +13064,7 @@ action = "warn"
         {
             let conn = Connection::open(&path).expect("open test db");
             conn.execute_batch(SCHEMA).expect("create schema");
+            let finding_ts = epoch_to_iso8601(now_epoch_secs());
             conn.execute(
                 "INSERT INTO sessions (session_id, started_at, model, working_dir, first_message_hash) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -12950,7 +13084,7 @@ action = "warn"
                 ) VALUES (?1,NULL,NULL,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 rusqlite::params![
                     "session-status-block",
-                    "2026-05-10T00:01:00Z",
+                    finding_ts,
                     "per_session_token_budget_exceeded",
                     "critical",
                     "block",
@@ -12997,6 +13131,203 @@ action = "warn"
             .is_none());
 
         diagnosis::SESSIONS.remove(&4242);
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn guard_status_report_ignores_expired_findings_for_active_state() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let path = unique_test_db_path("guard-status-expired-finding");
+        {
+            let conn = Connection::open(&path).expect("open test db");
+            conn.execute_batch(SCHEMA).expect("create schema");
+            conn.execute(
+                "INSERT INTO sessions (session_id, started_at, model, working_dir, first_message_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "session-status-expired",
+                    "2000-01-01T00:00:00Z",
+                    "claude-sonnet",
+                    "/tmp/project",
+                    "hash-expired"
+                ],
+            )
+            .expect("insert session");
+            conn.execute(
+                "INSERT INTO guard_findings (
+                    session_id, request_id, turn_number, timestamp, rule_id, severity,
+                    action, source, evidence_level, confidence, detail, suggested_action
+                ) VALUES (?1,NULL,NULL,?2,?3,?4,?5,?6,?7,?8,?9,NULL)",
+                rusqlite::params![
+                    "session-status-expired",
+                    "2000-01-01T00:01:00Z",
+                    "repeated_cache_rebuilds",
+                    "warning",
+                    "warn",
+                    "proxy",
+                    "direct_proxy",
+                    0.9,
+                    "Old cache rebuild warning."
+                ],
+            )
+            .expect("insert old finding");
+        }
+        let _db_path = EnvVarGuard::set("CC_BLACKBOX_DB_PATH", &path);
+        diagnosis::SESSIONS.insert(
+            4343,
+            diagnosis::SessionState {
+                session_id: "session-status-expired".to_string(),
+                display_name: "api".to_string(),
+                model: "claude-sonnet".to_string(),
+                initial_prompt: None,
+                created_at: Instant::now(),
+                last_activity: Instant::now(),
+                session_inserted: true,
+                cache_warning_sent: false,
+                idle_postmortem_sent: false,
+            },
+        );
+
+        let report = build_guard_status_report_json(Some("session-status-expired"));
+
+        assert_eq!(report["sessions"][0]["state"], "watching");
+        assert_eq!(
+            report["sessions"][0]["findings"]
+                .as_array()
+                .expect("findings")
+                .len(),
+            0
+        );
+
+        diagnosis::SESSIONS.remove(&4343);
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn guard_status_report_resolves_active_findings_with_current_policy() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let path = unique_test_db_path("guard-status-policy-change");
+        let policy_path = unique_temp_path("guard-status-policy-change");
+        {
+            let conn = Connection::open(&path).expect("open test db");
+            conn.execute_batch(SCHEMA).expect("create schema");
+            let finding_ts = epoch_to_iso8601(now_epoch_secs());
+            conn.execute(
+                "INSERT INTO sessions (session_id, started_at, model, working_dir, first_message_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "session-status-policy-change",
+                    finding_ts,
+                    "claude-sonnet",
+                    "/tmp/project",
+                    "hash-policy-change"
+                ],
+            )
+            .expect("insert session");
+            conn.execute(
+                "INSERT INTO guard_findings (
+                    session_id, request_id, turn_number, timestamp, rule_id, severity,
+                    action, source, evidence_level, confidence, detail, suggested_action
+                ) VALUES (?1,NULL,NULL,?2,?3,?4,?5,?6,?7,?8,?9,NULL)",
+                rusqlite::params![
+                    "session-status-policy-change",
+                    finding_ts,
+                    "repeated_cache_rebuilds",
+                    "warning",
+                    "warn",
+                    "proxy",
+                    "direct_proxy",
+                    0.9,
+                    "Cache rebuild warning."
+                ],
+            )
+            .expect("insert finding");
+        }
+        fs::write(
+            &policy_path,
+            r#"
+[rules.repeated_cache_rebuilds]
+action = "diagnose_only"
+"#,
+        )
+        .expect("write policy fixture");
+
+        let _db_path = EnvVarGuard::set("CC_BLACKBOX_DB_PATH", &path);
+        let _policy_path = EnvVarGuard::set(
+            "CC_BLACKBOX_GUARD_POLICY_PATH",
+            policy_path.to_str().expect("temp path is utf-8"),
+        );
+        diagnosis::SESSIONS.insert(
+            4444,
+            diagnosis::SessionState {
+                session_id: "session-status-policy-change".to_string(),
+                display_name: "api".to_string(),
+                model: "claude-sonnet".to_string(),
+                initial_prompt: None,
+                created_at: Instant::now(),
+                last_activity: Instant::now(),
+                session_inserted: true,
+                cache_warning_sent: false,
+                idle_postmortem_sent: false,
+            },
+        );
+
+        let report = build_guard_status_report_json(Some("session-status-policy-change"));
+
+        assert_eq!(report["sessions"][0]["state"], "watching");
+        assert_eq!(
+            report["sessions"][0]["findings"][0]["action"],
+            "diagnose_only"
+        );
+
+        diagnosis::SESSIONS.remove(&4444);
+        fs::remove_file(policy_path).expect("remove policy fixture");
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn guard_status_report_keeps_ended_state_with_recent_findings() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let path = unique_test_db_path("guard-status-ended-finding");
+        {
+            let conn = Connection::open(&path).expect("open test db");
+            conn.execute_batch(SCHEMA).expect("create schema");
+            let finding_ts = epoch_to_iso8601(now_epoch_secs());
+            insert_session(
+                &conn,
+                "session-status-ended",
+                &finding_ts,
+                Some(&finding_ts),
+                "claude-sonnet",
+                None,
+            );
+            conn.execute(
+                "INSERT INTO guard_findings (
+                    session_id, request_id, turn_number, timestamp, rule_id, severity,
+                    action, source, evidence_level, confidence, detail, suggested_action
+                ) VALUES (?1,NULL,NULL,?2,?3,?4,?5,?6,?7,?8,?9,NULL)",
+                rusqlite::params![
+                    "session-status-ended",
+                    finding_ts,
+                    "per_session_token_budget_exceeded",
+                    "critical",
+                    "block",
+                    "proxy",
+                    "direct_proxy",
+                    1.0,
+                    "Session token budget exceeded."
+                ],
+            )
+            .expect("insert finding");
+        }
+        let _db_path = EnvVarGuard::set("CC_BLACKBOX_DB_PATH", &path);
+
+        let report = build_guard_status_report_json(Some("session-status-ended"));
+
+        assert_eq!(report["overall_state"], "ended");
+        assert_eq!(report["sessions"][0]["state"], "ended");
+        assert_eq!(report["sessions"][0]["findings"][0]["action"], "block");
+
         cleanup_test_db(&path);
     }
 

@@ -16,6 +16,50 @@ pub enum GuardAction {
     Cooldown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardState {
+    Healthy,
+    Watching,
+    Warning,
+    Critical,
+    Blocked,
+    Cooldown,
+    Ended,
+}
+
+impl GuardState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Watching => "watching",
+            Self::Warning => "warning",
+            Self::Critical => "critical",
+            Self::Blocked => "blocked",
+            Self::Cooldown => "cooldown",
+            Self::Ended => "ended",
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Ended => 0,
+            Self::Healthy => 1,
+            Self::Watching => 2,
+            Self::Warning => 3,
+            Self::Critical => 4,
+            Self::Blocked => 5,
+            Self::Cooldown => 6,
+        }
+    }
+}
+
+impl fmt::Display for GuardState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FindingSeverity {
@@ -86,7 +130,7 @@ impl fmt::Display for RuleId {
 }
 
 impl RuleId {
-    fn from_policy_key(key: &str) -> Option<Self> {
+    pub fn from_policy_key(key: &str) -> Option<Self> {
         match key {
             "per_session_token_budget_exceeded" => Some(Self::PerSessionTokenBudgetExceeded),
             "per_session_trusted_dollar_budget_exceeded" => {
@@ -184,6 +228,59 @@ pub struct ApiCooldownObservation {
     pub session_id: Option<String>,
     pub consecutive_errors: u64,
     pub remaining_cooldown_secs: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CacheRebuildObservation {
+    pub session_id: String,
+    pub request_id: Option<String>,
+    pub turn_number: Option<u32>,
+    pub timestamp: String,
+    pub event_type: String,
+    pub estimated_rebuild_cost_dollars: Option<f64>,
+    pub cache_creation_tokens: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextObservation {
+    pub session_id: String,
+    pub request_id: Option<String>,
+    pub turn_number: Option<u32>,
+    pub timestamp: String,
+    pub fill_percent: f64,
+    pub context_window_tokens: Option<u64>,
+    pub turns_to_compact: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelMismatchObservation {
+    pub session_id: String,
+    pub request_id: Option<String>,
+    pub turn_number: Option<u32>,
+    pub timestamp: String,
+    pub requested_model: String,
+    pub reported_model: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompactionLoopObservation {
+    pub session_id: String,
+    pub request_id: Option<String>,
+    pub turn_number: Option<u32>,
+    pub timestamp: String,
+    pub consecutive_turns: u32,
+    pub wasted_tokens: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolFailureObservation {
+    pub session_id: String,
+    pub request_id: Option<String>,
+    pub turn_number: Option<u32>,
+    pub timestamp: String,
+    pub consecutive_failure_turns: u32,
+    pub failed_tool_calls: u32,
+    pub source: FindingSource,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -497,6 +594,222 @@ pub fn evaluate_api_cooldown_for_request(
     }
 }
 
+pub fn detect_cache_rebuild_finding(
+    policy: Option<&GuardPolicy>,
+    observation: CacheRebuildObservation,
+) -> Option<GuardFinding> {
+    if !matches!(
+        observation.event_type.as_str(),
+        "miss_rebuild" | "miss_ttl" | "miss_thrash"
+    ) {
+        return None;
+    }
+
+    let cost = observation
+        .estimated_rebuild_cost_dollars
+        .map(|value| format!(" Estimated rebuild cost is ${value:.2}."))
+        .unwrap_or_default();
+    let detail = format!(
+        "Cache rebuild event {} created {} input tokens.{}",
+        observation.event_type, observation.cache_creation_tokens, cost
+    );
+    let mut draft = FindingDraft::new(
+        RuleId::RepeatedCacheRebuilds,
+        FindingSeverity::Warning,
+        EvidenceLevel::DirectProxy,
+        FindingSource::Proxy,
+        0.9,
+        observation.session_id,
+        observation.timestamp,
+        detail,
+    )
+    .with_suggested_action(
+        "Keep the session warm before expensive follow-up turns or restart with a smaller prompt.",
+    );
+    draft.request_id = observation.request_id;
+    draft.turn_number = observation.turn_number;
+
+    Some(evaluate_finding(policy, draft))
+}
+
+pub fn detect_context_finding(
+    policy: Option<&GuardPolicy>,
+    observation: ContextObservation,
+) -> Option<GuardFinding> {
+    let threshold = policy
+        .and_then(|policy| policy.rules.get(&RuleId::ContextNearWarningThreshold))
+        .and_then(|rule| rule.threshold_count)
+        .unwrap_or(80) as f64;
+    let near_compaction = matches!(observation.turns_to_compact, Some(turns) if turns <= 2);
+    if observation.fill_percent < threshold && !near_compaction {
+        return None;
+    }
+
+    let runway = match observation.turns_to_compact {
+        Some(0) => "auto-compaction threshold reached".to_string(),
+        Some(1) => "about 1 turn to auto-compaction".to_string(),
+        Some(turns) => format!("about {turns} turns to auto-compaction"),
+        None => "auto-compaction estimate unavailable".to_string(),
+    };
+    let window = observation
+        .context_window_tokens
+        .map(|tokens| format!(" using a {tokens} token window"))
+        .unwrap_or_default();
+    let detail = format!(
+        "Context is {:.0}% full{window}; {runway}.",
+        observation.fill_percent
+    );
+    let mut draft = FindingDraft::new(
+        RuleId::ContextNearWarningThreshold,
+        FindingSeverity::Warning,
+        EvidenceLevel::Derived,
+        FindingSource::Proxy,
+        0.82,
+        observation.session_id,
+        observation.timestamp,
+        detail,
+    )
+    .with_suggested_action("Narrow the next request or start a fresh session before compaction.");
+    draft.request_id = observation.request_id;
+    draft.turn_number = observation.turn_number;
+
+    Some(evaluate_finding(policy, draft))
+}
+
+pub fn detect_model_mismatch_finding(
+    policy: Option<&GuardPolicy>,
+    observation: ModelMismatchObservation,
+) -> Option<GuardFinding> {
+    if crate::model_matches(&observation.requested_model, &observation.reported_model) {
+        return None;
+    }
+
+    let detail = format!(
+        "Requested model {}; response reported model {}. This records a model-route mismatch and does not prove why routing changed.",
+        observation.requested_model, observation.reported_model
+    );
+    let mut draft = FindingDraft::new(
+        RuleId::ModelMismatch,
+        FindingSeverity::Warning,
+        EvidenceLevel::DirectProxy,
+        FindingSource::Proxy,
+        0.98,
+        observation.session_id,
+        observation.timestamp,
+        detail,
+    )
+    .with_suggested_action(
+        "Retry or explicitly choose the intended model if this changed results.",
+    );
+    draft.request_id = observation.request_id;
+    draft.turn_number = observation.turn_number;
+
+    Some(evaluate_finding(policy, draft))
+}
+
+pub fn detect_compaction_loop_finding(
+    policy: Option<&GuardPolicy>,
+    observation: CompactionLoopObservation,
+) -> Option<GuardFinding> {
+    if observation.consecutive_turns < 3 {
+        return None;
+    }
+
+    let detail = format!(
+        "Suspected compaction loop: heuristic detected {} rapid turns with stable high token usage; estimated wasted tokens {}.",
+        observation.consecutive_turns, observation.wasted_tokens
+    );
+    let mut draft = FindingDraft::new(
+        RuleId::SuspectedCompactionLoop,
+        FindingSeverity::Warning,
+        EvidenceLevel::Inferred,
+        FindingSource::Heuristic,
+        0.72,
+        observation.session_id,
+        observation.timestamp,
+        detail,
+    )
+    .with_suggested_action("Interrupt and restart from a short state summary if progress stalls.");
+    draft.request_id = observation.request_id;
+    draft.turn_number = observation.turn_number;
+
+    Some(evaluate_finding(policy, draft))
+}
+
+pub fn detect_tool_failure_finding(
+    policy: Option<&GuardPolicy>,
+    observation: ToolFailureObservation,
+) -> Option<GuardFinding> {
+    let rule_id = match observation.source {
+        FindingSource::Proxy => RuleId::ToolFailureStreak,
+        FindingSource::Jsonl => RuleId::JsonlOnlyToolFailureStreak,
+        _ => return None,
+    };
+    let threshold = policy
+        .and_then(|policy| policy.rules.get(&rule_id))
+        .and_then(|rule| rule.threshold_count)
+        .unwrap_or(5) as u32;
+    if observation.consecutive_failure_turns < threshold {
+        return None;
+    }
+
+    let (evidence_level, source, detail_prefix, confidence) = match observation.source {
+        FindingSource::Proxy => (
+            EvidenceLevel::DirectProxy,
+            FindingSource::Proxy,
+            "Proxy-visible tool failure streak",
+            0.92,
+        ),
+        FindingSource::Jsonl => (
+            EvidenceLevel::DirectJsonl,
+            FindingSource::Jsonl,
+            "JSONL-only tool failure streak",
+            0.9,
+        ),
+        _ => return None,
+    };
+    let detail = format!(
+        "{detail_prefix}: {} consecutive turns included {} failed tool calls.",
+        observation.consecutive_failure_turns, observation.failed_tool_calls
+    );
+    let mut draft = FindingDraft::new(
+        rule_id,
+        FindingSeverity::Warning,
+        evidence_level,
+        source,
+        confidence,
+        observation.session_id,
+        observation.timestamp,
+        detail,
+    )
+    .with_suggested_action("Fix the failing tool precondition or redirect the session.");
+    draft.request_id = observation.request_id;
+    draft.turn_number = observation.turn_number;
+
+    Some(evaluate_finding(policy, draft))
+}
+
+pub fn derive_guard_state(base_state: GuardState, findings: &[GuardFinding]) -> GuardState {
+    if base_state == GuardState::Ended {
+        return GuardState::Ended;
+    }
+
+    let mut state = base_state;
+    for finding in findings {
+        let candidate = match finding.action {
+            GuardAction::Cooldown => GuardState::Cooldown,
+            GuardAction::Block => GuardState::Blocked,
+            GuardAction::Critical => GuardState::Critical,
+            GuardAction::Warn => GuardState::Warning,
+            GuardAction::Allow | GuardAction::DiagnoseOnly => base_state,
+        };
+        if candidate.rank() > state.rank() {
+            state = candidate;
+        }
+    }
+    state
+}
+
 impl PolicyManager {
     pub fn active_policy(&self) -> &GuardPolicy {
         &self.active
@@ -734,9 +1047,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        evaluate_api_cooldown_for_request, evaluate_finding, evaluate_session_budget_for_request,
-        ApiCooldownObservation, EvidenceLevel, FindingDraft, FindingSeverity, FindingSource,
-        GuardAction, GuardPolicy, PolicyManager, RequestGuardDecision, RuleId,
+        detect_cache_rebuild_finding, detect_context_finding, evaluate_api_cooldown_for_request,
+        evaluate_finding, evaluate_session_budget_for_request, ApiCooldownObservation,
+        CacheRebuildObservation, CompactionLoopObservation, ContextObservation, EvidenceLevel,
+        FindingDraft, FindingSeverity, FindingSource, GuardAction, GuardFinding, GuardPolicy,
+        GuardState, ModelMismatchObservation, PolicyManager, RequestGuardDecision, RuleId,
         SessionBudgetObservation,
     };
 
@@ -1279,5 +1594,258 @@ action = "page_the_user"
         assert_eq!(labels[1]["evidence_level"], "direct_jsonl");
         assert_eq!(labels[2]["source"], "heuristic");
         assert_eq!(labels[2]["evidence_level"], "inferred");
+    }
+
+    #[test]
+    fn cache_rebuild_detector_emits_warning_finding_under_default_policy() {
+        let finding = detect_cache_rebuild_finding(
+            Some(&GuardPolicy::default()),
+            CacheRebuildObservation {
+                session_id: "session-cache-warning".to_string(),
+                request_id: Some("req-cache-warning".to_string()),
+                turn_number: Some(3),
+                timestamp: "2026-05-10T00:00:00Z".to_string(),
+                event_type: "miss_ttl".to_string(),
+                estimated_rebuild_cost_dollars: Some(0.24),
+                cache_creation_tokens: 12_000,
+            },
+        )
+        .expect("cache rebuild finding");
+
+        assert_eq!(finding.rule_id, RuleId::RepeatedCacheRebuilds);
+        assert_eq!(finding.severity, FindingSeverity::Warning);
+        assert_eq!(finding.action, GuardAction::Warn);
+        assert_eq!(finding.source, FindingSource::Proxy);
+        assert_eq!(finding.evidence_level, EvidenceLevel::DirectProxy);
+        assert_eq!(finding.session_id, "session-cache-warning");
+        assert_eq!(finding.request_id.as_deref(), Some("req-cache-warning"));
+        assert_eq!(finding.turn_number, Some(3));
+        assert!(finding.detail.contains("miss_ttl"));
+        assert!(finding.detail.contains("$0.24"));
+    }
+
+    #[test]
+    fn context_detector_emits_fill_percent_and_compaction_runway() {
+        let finding = detect_context_finding(
+            Some(&GuardPolicy::default()),
+            ContextObservation {
+                session_id: "session-context-warning".to_string(),
+                request_id: Some("req-context-warning".to_string()),
+                turn_number: Some(5),
+                timestamp: "2026-05-10T00:00:00Z".to_string(),
+                fill_percent: 82.4,
+                context_window_tokens: Some(200_000),
+                turns_to_compact: Some(2),
+            },
+        )
+        .expect("context finding");
+
+        assert_eq!(finding.rule_id, RuleId::ContextNearWarningThreshold);
+        assert_eq!(finding.severity, FindingSeverity::Warning);
+        assert_eq!(finding.action, GuardAction::Warn);
+        assert_eq!(finding.source, FindingSource::Proxy);
+        assert_eq!(finding.evidence_level, EvidenceLevel::Derived);
+        assert_eq!(finding.session_id, "session-context-warning");
+        assert!(finding.detail.contains("82%"));
+        assert!(finding.detail.contains("2 turns"));
+        assert!(finding.detail.contains("200000 token window"));
+    }
+
+    #[test]
+    fn model_mismatch_detector_warns_without_overclaiming_cause() {
+        let finding = super::detect_model_mismatch_finding(
+            Some(&GuardPolicy::default()),
+            ModelMismatchObservation {
+                session_id: "session-model-warning".to_string(),
+                request_id: Some("req-model-warning".to_string()),
+                turn_number: Some(2),
+                timestamp: "2026-05-10T00:00:00Z".to_string(),
+                requested_model: "claude-sonnet-4-5".to_string(),
+                reported_model: "claude-haiku-4-5".to_string(),
+            },
+        )
+        .expect("model mismatch finding");
+
+        assert_eq!(finding.rule_id, RuleId::ModelMismatch);
+        assert_eq!(finding.severity, FindingSeverity::Warning);
+        assert_eq!(finding.action, GuardAction::Warn);
+        assert_eq!(finding.source, FindingSource::Proxy);
+        assert_eq!(finding.evidence_level, EvidenceLevel::DirectProxy);
+        assert!(finding.detail.contains("claude-sonnet-4-5"));
+        assert!(finding.detail.contains("claude-haiku-4-5"));
+        assert!(finding
+            .detail
+            .contains("does not prove why routing changed"));
+        assert!(!finding.detail.to_ascii_lowercase().contains("quota"));
+    }
+
+    #[test]
+    fn compaction_loop_detector_emits_heuristic_warning_finding() {
+        let finding = super::detect_compaction_loop_finding(
+            Some(&GuardPolicy::default()),
+            CompactionLoopObservation {
+                session_id: "session-compaction-warning".to_string(),
+                request_id: Some("req-compaction-warning".to_string()),
+                turn_number: Some(7),
+                timestamp: "2026-05-10T00:00:00Z".to_string(),
+                consecutive_turns: 3,
+                wasted_tokens: 42_000,
+            },
+        )
+        .expect("compaction finding");
+
+        assert_eq!(finding.rule_id, RuleId::SuspectedCompactionLoop);
+        assert_eq!(finding.severity, FindingSeverity::Warning);
+        assert_eq!(finding.action, GuardAction::Warn);
+        assert_eq!(finding.source, FindingSource::Heuristic);
+        assert_eq!(finding.evidence_level, EvidenceLevel::Inferred);
+        assert!(finding.detail.contains("heuristic"));
+        assert!(finding.detail.contains("3 rapid turns"));
+        assert!(finding.detail.contains("42000"));
+    }
+
+    #[test]
+    fn tool_failure_detector_emits_live_finding_only_from_proxy_visible_data() {
+        let finding = super::detect_tool_failure_finding(
+            Some(&GuardPolicy::default()),
+            super::ToolFailureObservation {
+                session_id: "session-tool-warning".to_string(),
+                request_id: Some("req-tool-warning".to_string()),
+                turn_number: Some(9),
+                timestamp: "2026-05-10T00:00:00Z".to_string(),
+                consecutive_failure_turns: 5,
+                failed_tool_calls: 7,
+                source: FindingSource::Proxy,
+            },
+        )
+        .expect("proxy-visible tool failure finding");
+
+        assert_eq!(finding.rule_id, RuleId::ToolFailureStreak);
+        assert_eq!(finding.severity, FindingSeverity::Warning);
+        assert_eq!(finding.action, GuardAction::Warn);
+        assert_eq!(finding.source, FindingSource::Proxy);
+        assert_eq!(finding.evidence_level, EvidenceLevel::DirectProxy);
+        assert!(finding.detail.contains("5 consecutive turns"));
+        assert!(finding.detail.contains("7 failed tool calls"));
+
+        let jsonl_only = super::detect_tool_failure_finding(
+            Some(&GuardPolicy::default()),
+            super::ToolFailureObservation {
+                session_id: "session-tool-jsonl".to_string(),
+                request_id: None,
+                turn_number: Some(9),
+                timestamp: "2026-05-10T00:00:00Z".to_string(),
+                consecutive_failure_turns: 5,
+                failed_tool_calls: 7,
+                source: FindingSource::Jsonl,
+            },
+        )
+        .expect("jsonl-only tool failure finding");
+        assert_eq!(jsonl_only.rule_id, RuleId::JsonlOnlyToolFailureStreak);
+        assert_eq!(jsonl_only.action, GuardAction::DiagnoseOnly);
+        assert_eq!(jsonl_only.source, FindingSource::Jsonl);
+        assert_eq!(jsonl_only.evidence_level, EvidenceLevel::DirectJsonl);
+    }
+
+    #[test]
+    fn no_progress_detection_remains_postmortem_first_by_default() {
+        let finding = GuardPolicy::default().resolve_finding(FindingDraft::new(
+            RuleId::NoProgressTurns,
+            FindingSeverity::Warning,
+            EvidenceLevel::Inferred,
+            FindingSource::Heuristic,
+            0.45,
+            "session-no-progress",
+            "2026-05-10T00:00:00Z",
+            "Postmortem-only no-progress signal.",
+        ));
+
+        assert_eq!(finding.rule_id, RuleId::NoProgressTurns);
+        assert_eq!(finding.action, GuardAction::DiagnoseOnly);
+        assert_eq!(finding.source, FindingSource::Heuristic);
+        assert_eq!(finding.evidence_level, EvidenceLevel::Inferred);
+    }
+
+    fn state_finding(action: GuardAction, severity: FindingSeverity) -> GuardFinding {
+        GuardFinding {
+            rule_id: RuleId::RepeatedCacheRebuilds,
+            severity,
+            action,
+            evidence_level: EvidenceLevel::DirectProxy,
+            source: FindingSource::Proxy,
+            confidence: 0.9,
+            session_id: "session-state".to_string(),
+            request_id: None,
+            turn_number: None,
+            timestamp: "2026-05-10T00:00:00Z".to_string(),
+            detail: "Derived state fixture.".to_string(),
+            suggested_action: None,
+        }
+    }
+
+    #[test]
+    fn guard_state_derives_from_active_findings_and_lifecycle() {
+        assert_eq!(
+            super::derive_guard_state(GuardState::Healthy, &[]),
+            GuardState::Healthy
+        );
+        assert_eq!(
+            super::derive_guard_state(GuardState::Watching, &[]),
+            GuardState::Watching
+        );
+        assert_eq!(
+            super::derive_guard_state(
+                GuardState::Healthy,
+                &[state_finding(GuardAction::Warn, FindingSeverity::Warning)]
+            ),
+            GuardState::Warning
+        );
+        assert_eq!(
+            super::derive_guard_state(
+                GuardState::Healthy,
+                &[state_finding(
+                    GuardAction::Critical,
+                    FindingSeverity::Critical
+                )]
+            ),
+            GuardState::Critical
+        );
+        assert_eq!(
+            super::derive_guard_state(
+                GuardState::Healthy,
+                &[state_finding(GuardAction::Block, FindingSeverity::Critical)]
+            ),
+            GuardState::Blocked
+        );
+        assert_eq!(
+            super::derive_guard_state(
+                GuardState::Healthy,
+                &[state_finding(
+                    GuardAction::Cooldown,
+                    FindingSeverity::Critical
+                )]
+            ),
+            GuardState::Cooldown
+        );
+        assert_eq!(
+            super::derive_guard_state(
+                GuardState::Ended,
+                &[state_finding(
+                    GuardAction::Cooldown,
+                    FindingSeverity::Critical
+                )]
+            ),
+            GuardState::Ended
+        );
+        assert_eq!(
+            super::derive_guard_state(
+                GuardState::Watching,
+                &[state_finding(
+                    GuardAction::DiagnoseOnly,
+                    FindingSeverity::Warning
+                )]
+            ),
+            GuardState::Watching
+        );
     }
 }

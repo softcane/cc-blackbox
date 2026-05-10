@@ -268,11 +268,11 @@ impl GuardPolicy {
         match std::fs::read_to_string(path) {
             Ok(contents) => {
                 let source = path.display().to_string();
-                let policy = Self::from_toml_overlay(&contents, &source)?;
+                let (policy, warnings) = Self::from_toml_overlay(&contents, &source)?;
                 Ok(LoadedPolicy {
                     policy,
                     source,
-                    warnings: Vec::new(),
+                    warnings,
                 })
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(LoadedPolicy {
@@ -284,12 +284,23 @@ impl GuardPolicy {
         }
     }
 
-    fn from_toml_overlay(contents: &str, source: &str) -> Result<Self, PolicyLoadError> {
-        let raw: PolicyToml =
+    fn from_toml_overlay(
+        contents: &str,
+        source: &str,
+    ) -> Result<(Self, Vec<String>), PolicyLoadError> {
+        let document: toml::Value =
             toml::from_str(contents).map_err(|err| PolicyLoadError::InvalidToml {
                 path: source.to_string(),
                 message: err.to_string(),
             })?;
+        let warnings = unknown_policy_key_warnings(&document);
+        let raw: PolicyToml =
+            document
+                .try_into()
+                .map_err(|err: toml::de::Error| PolicyLoadError::InvalidToml {
+                    path: source.to_string(),
+                    message: err.to_string(),
+                })?;
         let mut policy = Self::default();
 
         if let Some(fail_open) = raw.fail_open {
@@ -315,7 +326,7 @@ impl GuardPolicy {
             }
         }
 
-        Ok(policy)
+        Ok((policy, warnings))
     }
 
     pub fn rule_action(&self, rule_id: RuleId) -> GuardAction {
@@ -328,6 +339,45 @@ impl GuardPolicy {
     pub fn resolve_finding(&self, draft: FindingDraft) -> GuardFinding {
         evaluate_finding(Some(self), draft)
     }
+}
+
+fn unknown_policy_key_warnings(document: &toml::Value) -> Vec<String> {
+    let Some(root) = document.as_table() else {
+        return Vec::new();
+    };
+
+    let mut warnings = Vec::new();
+    for key in root.keys() {
+        if !matches!(key.as_str(), "fail_open" | "rules") {
+            warnings.push(format!("unknown guard policy key `{key}` ignored"));
+        }
+    }
+
+    let Some(rules) = root.get("rules").and_then(toml::Value::as_table) else {
+        return warnings;
+    };
+
+    for (rule_key, value) in rules {
+        if RuleId::from_policy_key(rule_key).is_none() {
+            warnings.push(format!(
+                "unknown guard policy rule `rules.{rule_key}` ignored"
+            ));
+            continue;
+        }
+
+        let Some(rule_table) = value.as_table() else {
+            continue;
+        };
+        for field_key in rule_table.keys() {
+            if field_key != "action" {
+                warnings.push(format!(
+                    "unknown guard policy key `rules.{rule_key}.{field_key}` ignored"
+                ));
+            }
+        }
+    }
+
+    warnings
 }
 
 impl Default for GuardPolicy {
@@ -477,6 +527,41 @@ action = "block"
                 .rule_action(RuleId::JsonlOnlyToolFailureStreak),
             GuardAction::DiagnoseOnly
         );
+
+        fs::remove_file(path).expect("remove policy fixture");
+    }
+
+    #[test]
+    fn unknown_policy_keys_generate_warnings_without_rejecting_config() {
+        let path = unique_policy_path("unknown-keys");
+        fs::write(
+            &path,
+            r#"
+unexpected_top_level = true
+
+[rules.not_a_real_rule]
+action = "block"
+
+[rules.repeated_cache_rebuilds]
+action = "warn"
+"#,
+        )
+        .expect("write policy fixture");
+
+        let loaded = GuardPolicy::load_effective_from_path(&path).expect("policy loads");
+
+        assert_eq!(
+            loaded.policy.rule_action(RuleId::RepeatedCacheRebuilds),
+            GuardAction::Warn
+        );
+        assert!(loaded
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("unexpected_top_level")));
+        assert!(loaded
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("not_a_real_rule")));
 
         fs::remove_file(path).expect("remove policy fixture");
     }

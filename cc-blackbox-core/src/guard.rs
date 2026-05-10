@@ -303,7 +303,7 @@ pub struct RequestGuardDecision {
     pub finding: Option<GuardFinding>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PolicyManager {
     active: GuardPolicy,
 }
@@ -354,7 +354,6 @@ impl FindingDraft {
         confidence: f64,
         session_id: impl Into<String>,
         timestamp: impl Into<String>,
-        detail: impl Into<String>,
     ) -> Self {
         Self {
             rule_id,
@@ -366,9 +365,14 @@ impl FindingDraft {
             request_id: None,
             turn_number: None,
             timestamp: timestamp.into(),
-            detail: detail.into(),
+            detail: String::new(),
             suggested_action: None,
         }
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = detail.into();
+        self
     }
 
     pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
@@ -458,8 +462,8 @@ pub fn evaluate_session_budget_for_request(
                 1.0,
                 observation.session_id.clone(),
                 timestamp,
-                detail,
             )
+            .with_detail(detail)
             .with_suggested_action(suggested.clone());
 
             return RequestGuardDecision {
@@ -505,8 +509,8 @@ pub fn evaluate_session_budget_for_request(
                 1.0,
                 observation.session_id.clone(),
                 timestamp,
-                detail,
             )
+            .with_detail(detail)
             .with_suggested_action(suggested.clone());
 
             return RequestGuardDecision {
@@ -570,8 +574,8 @@ pub fn evaluate_api_cooldown_for_request(
         1.0,
         session_id,
         timestamp,
-        detail,
     )
+    .with_detail(detail)
     .with_suggested_action(suggested.clone());
 
     RequestGuardDecision {
@@ -621,8 +625,8 @@ pub fn detect_cache_rebuild_finding(
         0.9,
         observation.session_id,
         observation.timestamp,
-        detail,
     )
+    .with_detail(detail)
     .with_suggested_action(
         "Keep the session warm before expensive follow-up turns or restart with a smaller prompt.",
     );
@@ -667,8 +671,8 @@ pub fn detect_context_finding(
         0.82,
         observation.session_id,
         observation.timestamp,
-        detail,
     )
+    .with_detail(detail)
     .with_suggested_action("Narrow the next request or start a fresh session before compaction.");
     draft.request_id = observation.request_id;
     draft.turn_number = observation.turn_number;
@@ -696,8 +700,8 @@ pub fn detect_model_mismatch_finding(
         0.98,
         observation.session_id,
         observation.timestamp,
-        detail,
     )
+    .with_detail(detail)
     .with_suggested_action(
         "Retry or explicitly choose the intended model if this changed results.",
     );
@@ -727,8 +731,8 @@ pub fn detect_compaction_loop_finding(
         0.72,
         observation.session_id,
         observation.timestamp,
-        detail,
     )
+    .with_detail(detail)
     .with_suggested_action("Interrupt and restart from a short state summary if progress stalls.");
     draft.request_id = observation.request_id;
     draft.turn_number = observation.turn_number;
@@ -780,8 +784,8 @@ pub fn detect_tool_failure_finding(
         confidence,
         observation.session_id,
         observation.timestamp,
-        detail,
     )
+    .with_detail(detail)
     .with_suggested_action("Fix the failing tool precondition or redirect the session.");
     draft.request_id = observation.request_id;
     draft.turn_number = observation.turn_number;
@@ -819,14 +823,6 @@ impl PolicyManager {
         let loaded = GuardPolicy::load_effective_from_path(path)?;
         self.active = loaded.policy.clone();
         Ok(loaded)
-    }
-}
-
-impl Default for PolicyManager {
-    fn default() -> Self {
-        Self {
-            active: GuardPolicy::default(),
-        }
     }
 }
 
@@ -1275,8 +1271,8 @@ action = "page_the_user"
             0.99,
             "session-budget",
             "2026-05-10T00:00:00Z",
-            "This session exceeded the configured token budget.",
-        );
+        )
+        .with_detail("This session exceeded the configured token budget.");
 
         let finding = GuardPolicy::default().resolve_finding(draft);
 
@@ -1295,8 +1291,8 @@ action = "page_the_user"
             0.82,
             "session-cache",
             "2026-05-10T00:00:00Z",
-            "Repeated cache rebuilds are increasing the estimated turn cost.",
         )
+        .with_detail("Repeated cache rebuilds are increasing the estimated turn cost.")
         .with_turn_number(4);
 
         let finding = GuardPolicy::default().resolve_finding(draft);
@@ -1316,8 +1312,8 @@ action = "page_the_user"
             0.99,
             "session-open",
             "2026-05-10T00:00:00Z",
-            "A budget detector fired but no valid policy is available.",
-        );
+        )
+        .with_detail("A budget detector fired but no valid policy is available.");
 
         let finding = evaluate_finding(None, draft);
 
@@ -1516,8 +1512,8 @@ action = "page_the_user"
             0.76,
             "session-schema",
             "2026-05-10T00:00:00Z",
-            "The response reported a different model than the request asked for.",
         )
+        .with_detail("The response reported a different model than the request asked for.")
         .with_request_id("req-schema")
         .with_turn_number(3);
 
@@ -1749,16 +1745,18 @@ action = "page_the_user"
 
     #[test]
     fn no_progress_detection_remains_postmortem_first_by_default() {
-        let finding = GuardPolicy::default().resolve_finding(FindingDraft::new(
-            RuleId::NoProgressTurns,
-            FindingSeverity::Warning,
-            EvidenceLevel::Inferred,
-            FindingSource::Heuristic,
-            0.45,
-            "session-no-progress",
-            "2026-05-10T00:00:00Z",
-            "Postmortem-only no-progress signal.",
-        ));
+        let finding = GuardPolicy::default().resolve_finding(
+            FindingDraft::new(
+                RuleId::NoProgressTurns,
+                FindingSeverity::Warning,
+                EvidenceLevel::Inferred,
+                FindingSource::Heuristic,
+                0.45,
+                "session-no-progress",
+                "2026-05-10T00:00:00Z",
+            )
+            .with_detail("Postmortem-only no-progress signal."),
+        );
 
         assert_eq!(finding.rule_id, RuleId::NoProgressTurns);
         assert_eq!(finding.action, GuardAction::DiagnoseOnly);

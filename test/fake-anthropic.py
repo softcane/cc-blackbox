@@ -24,23 +24,23 @@ def _has_context_1m_beta(headers) -> bool:
 
 def _scenario(body: dict) -> tuple[str, list[tuple[str, dict]], str]:
     text = _request_text(body)
-    if "kubernetes-cicd" in text:
+    if "pipeline-review" in text:
         return (
-            "platform-engineering:kubernetes-cicd",
+            "fixture-skills:pipeline-review",
             [
-                ("Skill", {"skill_name": "platform-engineering:kubernetes-cicd"}),
+                ("Skill", {"skill_name": "fixture-skills:pipeline-review"}),
                 ("Glob", {"pattern": ".github/workflows/*.yaml"}),
             ],
-            "fake kubernetes-cicd review complete",
+            "fake pipeline review complete",
         )
 
     return (
-        "platform-engineering:kustomize-helm-charts",
+        "fixture-skills:config-review",
         [
-            ("Skill", {"skill_name": "platform-engineering:kustomize-helm-charts"}),
-            ("Read", {"file_path": "clusters/base/kustomization.yaml"}),
+            ("Skill", {"skill_name": "fixture-skills:config-review"}),
+            ("Read", {"file_path": "fixtures/service/config.yaml"}),
         ],
-        "fake kustomize helm chart review complete",
+        "fake config review complete",
     )
 
 

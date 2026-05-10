@@ -3529,7 +3529,7 @@ fn diagnosis_cause_finding(session_id: &str, completed_at: &str, cause: &Value) 
     Some(serde_json::json!({
         "rule_id": rule_id,
         "title": guard_finding_title(rule_id),
-        "severity": if source == "heuristic" { "warning" } else { "warning" },
+        "severity": "warning",
         "action": "diagnose_only",
         "source": source,
         "evidence_level": evidence_level,

@@ -8,6 +8,8 @@ Install the `cc-blackbox` CLI from the GitHub release artifact, verify the check
 
 Do not edit project source files for a normal user install. Use the release artifact unless the user explicitly asks for a source build.
 
+Run shell snippets in a POSIX-compatible shell. When using the manual path, keep the commands in the same shell session so variables such as `archive`, `artifact_url`, and `tmp_dir` remain available.
+
 ## Supported Targets
 
 `install.sh` supports these targets:
@@ -26,13 +28,19 @@ Stop and report the exact unsupported OS or architecture if the machine is not o
 Check these commands before installing:
 
 ```sh
-command -v uname
-command -v tar
-command -v mktemp
-command -v install
-command -v awk
-command -v curl || command -v wget
-command -v sha256sum || command -v shasum
+for cmd in uname tar mktemp install awk; do
+  command -v "$cmd" >/dev/null || { echo "missing required command: $cmd"; exit 1; }
+done
+
+command -v curl >/dev/null || command -v wget >/dev/null || {
+  echo "missing required command: curl or wget"
+  exit 1
+}
+
+command -v sha256sum >/dev/null || command -v shasum >/dev/null || {
+  echo "missing required command: sha256sum or shasum"
+  exit 1
+}
 ```
 
 For guard mode setup, also check Docker:
@@ -56,7 +64,7 @@ export CC_BLACKBOX_VERSION="${CC_BLACKBOX_VERSION:-latest}"
 
 ## Fast Path
 
-If the user approves running the official installer, run:
+The official installer is the preferred release install path. Run:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/softcane/cc-blackbox/main/install.sh | sh
@@ -71,6 +79,8 @@ Use this path when the user wants the steps performed explicitly or when you nee
 1. Detect the release target:
 
 ```sh
+set -eu
+
 os="$(uname -s)"
 arch="$(uname -m)"
 
@@ -114,13 +124,18 @@ fi
 
 ```sh
 tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT INT TERM
+
 download_with_curl_or_wget() {
   url="$1"
   out="$2"
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL "$url" -o "$out"
-  else
+  elif command -v wget >/dev/null 2>&1; then
     wget -q "$url" -O "$out"
+  else
+    echo "curl or wget is required"
+    exit 1
   fi
 }
 
@@ -153,15 +168,26 @@ install_dir="${CC_BLACKBOX_INSTALL_DIR:-$HOME/.local/bin}"
 mkdir -p "$install_dir"
 tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"
 install -m 0755 "$tmp_dir/cc-blackbox" "$install_dir/cc-blackbox"
-rm -rf "$tmp_dir"
 ```
 
 ## Verify the Install
 
+Resolve the installed binary. Prefer `cc-blackbox` on `PATH`, otherwise use the absolute install path:
+
+```sh
+install_dir="${CC_BLACKBOX_INSTALL_DIR:-$HOME/.local/bin}"
+if command -v cc-blackbox >/dev/null 2>&1; then
+  cc_blackbox_bin="cc-blackbox"
+else
+  cc_blackbox_bin="$install_dir/cc-blackbox"
+fi
+```
+
 Check that the binary exists and can run:
 
 ```sh
-"${CC_BLACKBOX_INSTALL_DIR:-$HOME/.local/bin}/cc-blackbox" --help
+"$cc_blackbox_bin" --version
+"$cc_blackbox_bin" --help
 ```
 
 If `cc-blackbox` is not available by name, check whether the install directory is on `PATH`:
@@ -180,15 +206,15 @@ Do not silently edit shell startup files unless the user asked you to. If you do
 Run:
 
 ```sh
-cc-blackbox doctor
+"$cc_blackbox_bin" doctor
 ```
 
 If Docker is available and the user wants the local proxy stack started, run:
 
 ```sh
-cc-blackbox guard start
-cc-blackbox guard policy
-cc-blackbox guard status
+"$cc_blackbox_bin" guard start
+"$cc_blackbox_bin" guard policy
+"$cc_blackbox_bin" guard status
 ```
 
 The local services bind to `127.0.0.1` by default. Useful checks:
@@ -203,19 +229,19 @@ curl -s http://127.0.0.1:9091/metrics | head
 When the guard stack is running, start Claude Code through the proxy:
 
 ```sh
-cc-blackbox run claude
+"$cc_blackbox_bin" run claude
 ```
 
 To observe guard findings in another terminal:
 
 ```sh
-cc-blackbox guard watch
+"$cc_blackbox_bin" guard watch
 ```
 
 After a session has enough evidence, read the latest postmortem:
 
 ```sh
-cc-blackbox postmortem latest
+"$cc_blackbox_bin" postmortem latest
 ```
 
 ## Troubleshooting
@@ -231,7 +257,7 @@ cc-blackbox postmortem latest
 When done, report:
 
 - installed path;
-- installed version or `cc-blackbox --help` success if no version command is available;
+- installed version from `cc-blackbox --version`;
 - whether the install directory is on `PATH`;
 - result of `cc-blackbox doctor`;
 - whether the guard stack was started;

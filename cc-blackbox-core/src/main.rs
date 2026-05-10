@@ -302,28 +302,28 @@ fn record_api_response_for_guard(
     status: u32,
     has_parsed_model: bool,
     policy: Option<&guard::GuardPolicy>,
-) {
+) -> Option<guard::GuardFinding> {
     if !has_parsed_model {
-        return;
+        return None;
     }
 
     let mut runtime = lock_or_recover(&RUNTIME_STATE, "runtime_state");
     if status >= 400 {
         runtime.consecutive_errors += 1;
         let Some(policy) = policy else {
-            return;
+            return None;
         };
         let Some(rule) = policy
             .rules
             .get(&guard::RuleId::ApiErrorCircuitBreakerCooldown)
         else {
-            return;
+            return None;
         };
         if !matches!(
             rule.action,
             guard::GuardAction::Cooldown | guard::GuardAction::Block
         ) {
-            return;
+            return None;
         }
         let threshold = rule.threshold_count.unwrap_or(5);
         let cooldown_secs = rule.cooldown_secs.unwrap_or(30);
@@ -339,6 +339,25 @@ fn record_api_response_for_guard(
                 cooldown_secs,
                 "guard API error cooldown tripped"
             );
+            let detail = format!(
+                "{} consecutive API errors opened a {}s cooldown; {}s remain.",
+                runtime.consecutive_errors, cooldown_secs, cooldown_secs
+            );
+            let suggested =
+                "Wait for the cooldown to expire, fix the API error cause, or raise the cooldown policy."
+                    .to_string();
+            let draft = guard::FindingDraft::new(
+                guard::RuleId::ApiErrorCircuitBreakerCooldown,
+                guard::FindingSeverity::Critical,
+                guard::EvidenceLevel::DirectProxy,
+                guard::FindingSource::Proxy,
+                1.0,
+                GLOBAL_GUARD_SESSION_ID,
+                now_iso8601(),
+            )
+            .with_detail(detail)
+            .with_suggested_action(suggested);
+            return Some(policy.resolve_finding(draft));
         }
     } else {
         runtime.consecutive_errors = 0;
@@ -347,6 +366,7 @@ fn record_api_response_for_guard(
             info!("guard API error cooldown reset after successful response");
         }
     }
+    None
 }
 
 fn apply_legacy_env_limits(policy: &mut guard::GuardPolicy) {
@@ -2476,6 +2496,202 @@ fn build_sessions_response_json(sessions: Vec<Value>) -> Value {
         "pricing_caveats": pricing::pricing_caveats(),
         "sessions": sessions,
     })
+}
+
+fn build_recent_sessions_response_from_db(
+    conn: &Connection,
+    limit: i64,
+    days: i64,
+) -> Result<Value, String> {
+    let since_secs = now_epoch_secs().saturating_sub(days.max(0) as u64 * 86400);
+    let since = epoch_to_iso8601(since_secs);
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT ids.session_id, s.started_at, s.last_activity_at, s.ended_at, \
+                    s.model, s.working_dir, s.request_count, s.total_input_tokens, \
+                    s.total_output_tokens, s.total_cache_read_tokens, \
+                    s.total_cache_creation_tokens, d.completed_at, d.outcome, \
+                    d.degraded, d.total_turns, d.causes_json, d.cache_hit_ratio \
+             FROM (
+                SELECT session_id FROM sessions
+                UNION
+                SELECT session_id FROM session_diagnoses
+             ) ids \
+             LEFT JOIN sessions s ON s.session_id = ids.session_id \
+             LEFT JOIN session_diagnoses d ON d.session_id = ids.session_id \
+             WHERE COALESCE(d.completed_at, s.ended_at, s.last_activity_at, s.started_at) >= ?1 \
+             ORDER BY COALESCE(d.completed_at, s.ended_at, s.last_activity_at, s.started_at) DESC \
+             LIMIT ?2",
+        )
+        .map_err(|err| format!("prepare sessions query: {err}"))?;
+
+    type RecentSessionRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+        Option<String>,
+        Option<String>,
+        Option<i32>,
+        Option<i64>,
+        Option<String>,
+        Option<f64>,
+    );
+
+    let rows: Vec<RecentSessionRow> = stmt
+        .query_map(rusqlite::params![since, limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<u64>>(7)?,
+                row.get::<_, Option<u64>>(8)?,
+                row.get::<_, Option<u64>>(9)?,
+                row.get::<_, Option<u64>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<i32>>(13)?,
+                row.get::<_, Option<i64>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, Option<f64>>(16)?,
+            ))
+        })
+        .map_err(|err| format!("query sessions: {err}"))?
+        .filter_map(|row| match row {
+            Ok(row) => Some(row),
+            Err(err) => {
+                warn!(error = %err, "skipping malformed session row");
+                None
+            }
+        })
+        .collect();
+
+    let session_ids = rows.iter().map(|row| row.0.clone()).collect::<Vec<_>>();
+    let estimated_costs = compute_estimated_costs_for_sessions(conn, &session_ids)
+        .map_err(|err| format!("load session cost estimates: {err}"))?;
+    let billing = load_latest_billing_reconciliations(conn, &session_ids)
+        .map_err(|err| format!("load billing reconciliations: {err}"))?;
+
+    let sessions = rows
+        .into_iter()
+        .map(
+            |(
+                session_id,
+                started_at,
+                last_activity_at,
+                ended_at,
+                model,
+                working_dir,
+                request_count,
+                total_input_tokens,
+                total_output_tokens,
+                total_cache_read_tokens,
+                total_cache_creation_tokens,
+                completed_at,
+                outcome,
+                degraded,
+                total_turns,
+                causes_str,
+                diagnosis_cache_hit_ratio,
+            )| {
+                let causes: Vec<Value> = causes_str
+                    .as_deref()
+                    .and_then(|causes| serde_json::from_str(causes).ok())
+                    .unwrap_or_default();
+                let primary_cause = causes
+                    .first()
+                    .and_then(|c| c.get("cause_type"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let estimated = estimated_costs
+                    .get(&session_id)
+                    .cloned()
+                    .unwrap_or_else(|| CostAccumulator::new().finish());
+                let billed = billing.get(&session_id);
+                let total_input_tokens = total_input_tokens.unwrap_or(0);
+                let total_output_tokens = total_output_tokens.unwrap_or(0);
+                let total_cache_read_tokens = total_cache_read_tokens.unwrap_or(0);
+                let total_cache_creation_tokens = total_cache_creation_tokens.unwrap_or(0);
+                let request_count = request_count.unwrap_or(0);
+                let cache_total = total_cache_read_tokens + total_cache_creation_tokens;
+                let cache_hit_ratio = diagnosis_cache_hit_ratio.unwrap_or_else(|| {
+                    if cache_total == 0 {
+                        0.0
+                    } else {
+                        total_cache_read_tokens as f64 / cache_total as f64
+                    }
+                });
+                let outcome = outcome.unwrap_or_else(|| {
+                    if ended_at.is_some() {
+                        "Ended".to_string()
+                    } else {
+                        "In Progress".to_string()
+                    }
+                });
+                let mut summary = build_session_summary_json(
+                    session_id.clone(),
+                    started_at,
+                    outcome,
+                    degraded.unwrap_or(0) != 0,
+                    total_turns.unwrap_or(request_count),
+                    estimated.estimated_cost_dollars,
+                    estimated.cost_source,
+                    estimated.trusted_for_budget_enforcement,
+                    billed.map(|record| record.billed_cost_dollars),
+                    billed.map(|record| record.source.clone()),
+                    billed.map(|record| record.imported_at.clone()),
+                    primary_cause,
+                    cache_hit_ratio,
+                    model,
+                );
+                if let Value::Object(ref mut object) = summary {
+                    object.insert(
+                        "last_activity_at".to_string(),
+                        serde_json::json!(last_activity_at.clone()),
+                    );
+                    object.insert("ended_at".to_string(), serde_json::json!(ended_at.clone()));
+                    object.insert(
+                        "completed_at".to_string(),
+                        serde_json::json!(completed_at.clone()),
+                    );
+                    object.insert("working_dir".to_string(), serde_json::json!(working_dir));
+                    object.insert(
+                        "request_count".to_string(),
+                        serde_json::json!(request_count),
+                    );
+                    object.insert(
+                        "total_tokens".to_string(),
+                        serde_json::json!(
+                            total_input_tokens
+                                + total_output_tokens
+                                + total_cache_read_tokens
+                                + total_cache_creation_tokens
+                        ),
+                    );
+                    object.insert(
+                        "active".to_string(),
+                        serde_json::json!(ended_at.is_none() && completed_at.is_none()),
+                    );
+                }
+                summary
+            },
+        )
+        .collect();
+
+    Ok(build_sessions_response_json(sessions))
 }
 
 #[derive(Clone, Debug)]
@@ -5396,10 +5612,15 @@ fn finalize_response(
             .then(|| String::from_utf8_lossy(&acc.error_body).to_string())
     });
     let guard_policy = request_guard_policy();
-    if acc.stream_error_type.is_some() {
-        record_api_response_for_guard(500, !model.is_empty(), guard_policy.as_ref());
-    } else if acc.http_status > 0 && acc.http_status < 400 {
-        record_api_response_for_guard(acc.http_status, !model.is_empty(), guard_policy.as_ref());
+    let api_cooldown_started = if acc.stream_error_type.is_some() {
+        record_api_response_for_guard(500, !model.is_empty(), guard_policy.as_ref())
+    } else if acc.http_status > 0 {
+        record_api_response_for_guard(acc.http_status, !model.is_empty(), guard_policy.as_ref())
+    } else {
+        None
+    };
+    if let Some(finding) = api_cooldown_started {
+        broadcast_guard_finding(finding);
     }
     let cache_event = if is_internal_request || acc.has_response_error() {
         "none"
@@ -8063,17 +8284,28 @@ impl ExternalProcessor for CcBlackboxProcessor {
                         match parse_request_body(&b.body) {
                             Some(parsed) => {
                                 info!(phase="request_body", request_id=%request_id, model=%parsed.model, message_count=parsed.message_count, has_tools=parsed.has_tools, system_prompt_length=parsed.system_prompt_length, estimated_input_tokens=parsed.estimated_input_tokens, sys_prompt_hash=parsed.sys_prompt_hash, "ext_proc");
-                                let session_id = diagnosis::SESSIONS
-                                    .get(&parsed.sys_prompt_hash)
-                                    .map(|state| state.session_id.clone());
+                                let session_id = ensure_session_state(
+                                    parsed.sys_prompt_hash,
+                                    &parsed.working_dir,
+                                    &parsed.model,
+                                    &parsed.user_prompt_excerpt,
+                                );
                                 let policy = request_guard_policy();
                                 if let Some(decision) = evaluate_request_guard_for_session(
-                                    session_id.as_deref(),
+                                    Some(&session_id),
                                     policy.as_ref(),
                                 ) {
                                     let finding = decision.finding.clone();
                                     if let Some(block) = decision.block.as_ref() {
                                         warn!(request_id = %request_id, error_type = %block.error_type, rule_id = %block.rule_id, "request blocked");
+                                        ensure_session_inserted(
+                                            parsed.sys_prompt_hash,
+                                            &session_id,
+                                            &parsed.model,
+                                            &parsed.working_dir,
+                                            &parsed.first_message_hash,
+                                            &parsed.user_prompt_excerpt,
+                                        );
                                         let response = make_guard_block_response(block);
                                         if tx.send(Ok(response)).await.is_err() {
                                             break;
@@ -8587,101 +8819,7 @@ async fn handle_sessions(
     let result = tokio::task::spawn_blocking(move || {
         let conn = Connection::open(db_path()).ok()?;
         let _ = repair_persisted_session_artifacts(&conn);
-        let since_secs = now_epoch_secs() - (days as u64 * 86400);
-        let since = epoch_to_iso8601(since_secs);
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT d.session_id, s.started_at, d.outcome, d.degraded, d.total_turns, \
-             d.causes_json, d.cache_hit_ratio, s.model \
-             FROM session_diagnoses d \
-             LEFT JOIN sessions s ON d.session_id = s.session_id \
-             WHERE d.completed_at >= ?1 \
-             ORDER BY d.completed_at DESC LIMIT ?2",
-            )
-            .ok()?;
-
-        type RecentDiagnosisRow = (
-            String,
-            Option<String>,
-            String,
-            bool,
-            i64,
-            String,
-            f64,
-            Option<String>,
-        );
-
-        let session_rows: Vec<RecentDiagnosisRow> = stmt
-            .query_map(rusqlite::params![since, limit], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i32>(3)? != 0,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, f64>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                ))
-            })
-            .ok()?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        let session_ids = session_rows
-            .iter()
-            .map(|row| row.0.clone())
-            .collect::<Vec<_>>();
-        let estimated_costs = compute_estimated_costs_for_sessions(&conn, &session_ids).ok()?;
-        let billing = load_latest_billing_reconciliations(&conn, &session_ids).ok()?;
-
-        let sessions: Vec<Value> = session_rows
-            .into_iter()
-            .map(
-                |(
-                    session_id,
-                    started_at,
-                    outcome,
-                    degraded,
-                    total_turns,
-                    causes_str,
-                    cache_hit_ratio,
-                    model,
-                )| {
-                    let causes: Vec<Value> = serde_json::from_str(&causes_str).unwrap_or_default();
-                    let primary_cause = causes
-                        .first()
-                        .and_then(|c| c.get("cause_type"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let estimated = estimated_costs
-                        .get(&session_id)
-                        .cloned()
-                        .unwrap_or_else(|| CostAccumulator::new().finish());
-                    let billed = billing.get(&session_id);
-                    build_session_summary_json(
-                        session_id,
-                        started_at,
-                        outcome,
-                        degraded,
-                        total_turns,
-                        estimated.estimated_cost_dollars,
-                        estimated.cost_source,
-                        estimated.trusted_for_budget_enforcement,
-                        billed.map(|record| record.billed_cost_dollars),
-                        billed.map(|record| record.source.clone()),
-                        billed.map(|record| record.imported_at.clone()),
-                        primary_cause,
-                        cache_hit_ratio,
-                        model,
-                    )
-                },
-            )
-            .collect();
-
-        Some(build_sessions_response_json(sessions))
+        build_recent_sessions_response_from_db(&conn, limit, days).ok()
     })
     .await
     .ok()
@@ -9819,27 +9957,28 @@ mod tests {
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use rusqlite::Connection;
+    use serde_json::Value;
 
     use super::{
         build_cache_rebuilds_response_from_db, build_diagnosis_response_json,
         build_guard_policy_report_json, build_guard_status_report_json,
-        build_postmortem_response_from_db, build_session_summary_json,
-        build_sessions_response_json, build_summary_response_json, canonical_telemetry_name,
-        classify_cache_event, clean_user_prompt, compact_response_summary,
-        content_metadata_for_storage, context_fill_percent, context_fill_ratio, correlation,
-        db_writer_loop, derive_display_name, diagnosis, end_session_with_db_tx,
-        ensure_session_columns, epoch_to_iso8601, estimated_rebuild_cost_for_cache_event,
-        evaluate_request_guard_for_session, extract_explicit_skill_refs, extract_header,
-        extract_headers, extract_working_dir, fallback_request_id, guard,
-        guard_finding_watch_event, in_memory_postmortem_totals, infer_context_window_tokens,
-        is_internal_request_shape, load_degradation_view_from_db, lock_or_recover,
-        looks_like_machine_recall_line, looks_like_title_request, make_guard_block_response,
-        metrics, model_requests_1m_context, normalize_search_text, now_epoch_secs,
-        parse_latest_tool_results, parse_request_body, persist_billing_reconciliation,
-        persist_final_session_artifacts, pricing, query_historical_metrics, query_redact_enabled,
-        query_summary, record_api_response_for_guard, redact_operational_text,
-        repair_persisted_session_artifacts, repair_turn_snapshot_context_windows,
-        request_cache_ttl_evidence, request_cache_ttl_secs,
+        build_postmortem_response_from_db, build_recent_sessions_response_from_db,
+        build_session_summary_json, build_sessions_response_json, build_summary_response_json,
+        canonical_telemetry_name, classify_cache_event, clean_user_prompt,
+        compact_response_summary, content_metadata_for_storage, context_fill_percent,
+        context_fill_ratio, correlation, db_writer_loop, derive_display_name, diagnosis,
+        end_session_with_db_tx, ensure_session_columns, epoch_to_iso8601,
+        estimated_rebuild_cost_for_cache_event, evaluate_request_guard_for_session,
+        extract_explicit_skill_refs, extract_header, extract_headers, extract_working_dir,
+        fallback_request_id, guard, guard_finding_watch_event, in_memory_postmortem_totals,
+        infer_context_window_tokens, is_internal_request_shape, load_degradation_view_from_db,
+        lock_or_recover, looks_like_machine_recall_line, looks_like_title_request,
+        make_guard_block_response, metrics, model_requests_1m_context, normalize_search_text,
+        now_epoch_secs, now_iso8601, parse_latest_tool_results, parse_request_body,
+        persist_billing_reconciliation, persist_final_session_artifacts, pricing,
+        query_historical_metrics, query_redact_enabled, query_summary,
+        record_api_response_for_guard, redact_operational_text, repair_persisted_session_artifacts,
+        repair_turn_snapshot_context_windows, request_cache_ttl_evidence, request_cache_ttl_secs,
         request_context_window_hint_from_headers, request_guard_policy, request_uses_1m_context,
         resolve_context_window_tokens, resolve_context_window_tokens_with_config,
         response_cache_ttl_secs, score_recall_doc, seed_live_metric_labels_from_db,
@@ -12476,6 +12615,58 @@ mod tests {
     }
 
     #[test]
+    fn sessions_response_includes_active_sessions_without_diagnosis_rows() {
+        let path = unique_test_db_path("active-sessions-api");
+        let conn = Connection::open(&path).expect("open test db");
+        conn.execute_batch(SCHEMA).expect("create schema");
+        let now = now_iso8601();
+        conn.execute(
+            "INSERT INTO sessions (
+                session_id, started_at, last_activity_at, model, working_dir,
+                request_count, total_input_tokens, total_output_tokens,
+                total_cache_read_tokens, total_cache_creation_tokens,
+                first_message_hash, prompt_correlation_hash, initial_prompt
+            ) VALUES (?1,?2,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            rusqlite::params![
+                "session-active-api",
+                now,
+                "claude-haiku-4-5-20251001",
+                "/Users/pradeepsingh/code/tools/KubeAttention",
+                2,
+                10,
+                5,
+                80,
+                10,
+                "hash-active",
+                "prompt-hash-active",
+                "initial prompt captured (redacted, 4 words, 20 chars).",
+            ],
+        )
+        .expect("insert active session");
+
+        let json = build_recent_sessions_response_from_db(&conn, 10, 1)
+            .expect("build recent sessions response");
+        let sessions = json
+            .get("sessions")
+            .and_then(Value::as_array)
+            .expect("sessions array");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["session_id"], "session-active-api");
+        assert_eq!(sessions[0]["outcome"], "In Progress");
+        assert_eq!(sessions[0]["active"], true);
+        assert_eq!(
+            sessions[0]["working_dir"],
+            "/Users/pradeepsingh/code/tools/KubeAttention"
+        );
+        assert_eq!(sessions[0]["total_turns"], 2);
+        assert_eq!(sessions[0]["request_count"], 2);
+        assert_eq!(sessions[0]["total_tokens"], 105);
+
+        cleanup_test_db(&path);
+    }
+
+    #[test]
     fn postmortem_from_synthetic_db_includes_structured_redacted_evidence() {
         let conn = create_full_test_db();
         insert_session(
@@ -14958,10 +15149,16 @@ action = "page_the_user"
         api_rule.threshold_count = Some(2);
         api_rule.cooldown_secs = Some(60);
 
-        record_api_response_for_guard(500, true, Some(&policy));
+        assert!(record_api_response_for_guard(500, true, Some(&policy)).is_none());
         assert!(evaluate_request_guard_for_session(None, Some(&policy)).is_none());
 
-        record_api_response_for_guard(500, true, Some(&policy));
+        let opened_finding = record_api_response_for_guard(500, true, Some(&policy))
+            .expect("cooldown opening should emit a persistable finding");
+        assert_eq!(
+            opened_finding.rule_id,
+            guard::RuleId::ApiErrorCircuitBreakerCooldown
+        );
+        assert_eq!(opened_finding.session_id, super::GLOBAL_GUARD_SESSION_ID);
         let decision = evaluate_request_guard_for_session(None, Some(&policy))
             .expect("cooldown should block the next request");
         let block = decision.block.expect("cooldown block metadata");

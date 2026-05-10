@@ -3527,6 +3527,14 @@ struct EvidenceRow {
     detail: String,
 }
 
+#[derive(Debug, Clone)]
+struct FindingRow {
+    source: String,
+    evidence: String,
+    turn: String,
+    detail: String,
+}
+
 fn clean_terminal_cell(value: &str) -> String {
     value
         .replace('`', "")
@@ -3645,6 +3653,34 @@ fn parse_evidence_section(lines: &[String]) -> Vec<EvidenceRow> {
             Some(EvidenceRow {
                 kind: columns[0].clone(),
                 label: columns[1].clone(),
+                turn: columns[2].clone(),
+                detail: columns[3..].join("  "),
+            })
+        })
+        .collect()
+}
+
+fn parse_findings_section(lines: &[String]) -> Vec<FindingRow> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with("Source")
+                || trimmed.starts_with("----------")
+                || trimmed
+                    .chars()
+                    .all(|ch| ch == '-' || ch.is_ascii_whitespace())
+            {
+                return None;
+            }
+            let columns = split_aligned_columns(trimmed);
+            if columns.len() < 4 {
+                return None;
+            }
+            Some(FindingRow {
+                source: columns[0].clone(),
+                evidence: columns[1].clone(),
                 turn: columns[2].clone(),
                 detail: columns[3..].join("  "),
             })
@@ -3947,6 +3983,27 @@ fn evidence_terminal_line(evidence: &EvidenceRow, width: usize) -> TerminalLine 
     TerminalLine::styled(raw, painted)
 }
 
+fn finding_terminal_lines(finding: &FindingRow, width: usize) -> Vec<TerminalLine> {
+    let text = format!(
+        "Finding: {} {} turn {}: {}",
+        finding.source, finding.evidence, finding.turn, finding.detail
+    );
+    let lower = text.to_ascii_lowercase();
+    wrapped_terminal_lines(&text, width, move |line| {
+        if lower.contains("blocked")
+            || lower.contains("cooldown")
+            || lower.contains("critical")
+            || lower.contains("budget exceeded")
+        {
+            line.red().bold().to_string()
+        } else if lower.contains("warn") || lower.contains("warning") {
+            line.yellow().bold().to_string()
+        } else {
+            line.bright_white().to_string()
+        }
+    })
+}
+
 fn signal_card_lines(
     label: &str,
     value: &str,
@@ -4088,6 +4145,11 @@ fn render_postmortem_terminal_for_width(markdown: &str, width: usize) -> String 
         .get("Evidence")
         .map(|lines| parse_evidence_section(lines))
         .unwrap_or_default();
+    let findings = parsed
+        .sections
+        .get("Top Findings")
+        .map(|lines| parse_findings_section(lines))
+        .unwrap_or_default();
     let analysis = parsed
         .sections
         .get("Claude Analysis")
@@ -4136,12 +4198,31 @@ fn render_postmortem_terminal_for_width(markdown: &str, width: usize) -> String 
         ));
     }
 
+    if !findings.is_empty() {
+        let finding_lines = findings
+            .iter()
+            .take(5)
+            .flat_map(|finding| finding_terminal_lines(finding, inner_width))
+            .collect::<Vec<_>>();
+        out.push('\n');
+        out.push_str(&terminal_box(
+            "Top findings",
+            &finding_lines,
+            width,
+            PostmortemAccent::Warning,
+        ));
+    }
+
     let healthy_checks = signals
         .iter()
         .filter(|(label, value)| is_postmortem_signal(label, value) && is_low_signal(label, value))
         .map(|(label, value)| (label, value))
         .collect::<Vec<_>>();
-    if !healthy_checks.is_empty() {
+    if !findings.is_empty() {
+        // Normalized policy or detector findings are the higher-signal user
+        // outcome. Showing a generic "checks passed" card next to a block
+        // finding makes the terminal postmortem materially misleading.
+    } else if !healthy_checks.is_empty() {
         out.push('\n');
         out.push_str(&terminal_box(
             "Checks passed",
@@ -7121,6 +7202,70 @@ mod tests {
         assert!(markdown.contains("Retry with the intended model."));
         assert!(markdown.contains("matched"));
         assert!(markdown.contains("jsonl-session"));
+    }
+
+    #[test]
+    fn postmortem_terminal_renders_policy_block_findings() {
+        let report = serde_json::json!({
+            "session_id": "session_blocked",
+            "redacted": true,
+            "partial": true,
+            "summary": {
+                "duration_secs": 1,
+                "model": "claude-haiku-4-5-20251001",
+                "outcome": "In Progress",
+                "total_turns": 1,
+                "total_tokens": 28442
+            },
+            "diagnosis": {
+                "likely_cause": "none",
+                "likely_cause_is_heuristic": false,
+                "next_action": "Start a fresh session, raise the per-session token limit, or disable the limit."
+            },
+            "impact": {
+                "estimated_total_cost_dollars": 0.01,
+                "estimated_likely_wasted_tokens": 0,
+                "estimated_likely_wasted_cost_dollars": 0.0
+            },
+            "signals": {
+                "cache": { "cache_hit_ratio": 0.95 },
+                "context": { "max_fill_percent": 14.0, "turns_to_compact": null },
+                "tools": [],
+                "skills": [],
+                "mcp": []
+            },
+            "findings": [
+                {
+                    "rule_id": "per_session_token_budget_exceeded",
+                    "title": "Session token budget exceeded",
+                    "severity": "critical",
+                    "action": "block",
+                    "source": "proxy",
+                    "evidence_level": "direct_proxy",
+                    "confidence": 1.0,
+                    "detail": "Session has used 28442 tokens across 1 requests, crossing the configured 1 token limit.",
+                    "suggested_action": "Start a fresh session, raise the per-session token limit, or disable the limit."
+                }
+            ],
+            "evidence": [
+                { "type": "direct", "label": "tokens", "detail": "28442 total tokens across 1 requests", "turn": null }
+            ],
+            "timeline": [],
+            "enrichment_status": {
+                "source": "jsonl",
+                "status": "ambiguous",
+                "confidence": 0.0
+            },
+            "recommendations": []
+        });
+
+        let markdown = render_postmortem_markdown(&report);
+        let terminal = render_postmortem_terminal_for_width(&markdown, 132);
+
+        assert!(terminal.contains("Top findings"));
+        assert!(terminal.contains("Session token budget exceeded"));
+        assert!(terminal.contains("direct_proxy"));
+        assert!(!terminal.contains("Checks passed"));
     }
 
     #[test]

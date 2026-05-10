@@ -56,6 +56,7 @@ pub mod envoy {
 pub mod correlation;
 pub mod diagnosis;
 pub mod guard;
+pub mod jsonl;
 pub mod metrics;
 pub mod pricing;
 pub mod watch;
@@ -232,6 +233,7 @@ static RUNTIME_STATE: LazyLock<Mutex<RuntimeState>> =
 static SESSION_BUDGETS: LazyLock<DashMap<String, SessionBudgetState>> = LazyLock::new(DashMap::new);
 static FALLBACK_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 const GUARD_POLICY_PATH_ENV: &str = "CC_BLACKBOX_GUARD_POLICY_PATH";
+const JSONL_DIR_ENV: &str = "CC_BLACKBOX_JSONL_DIR";
 
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard<'a, T> {
     match mutex.lock() {
@@ -499,6 +501,7 @@ fn guard_finding_title(rule_id: &str) -> String {
         "model_mismatch" => "Model route mismatch",
         "suspected_compaction_loop" => "Suspected compaction loop",
         "tool_failure_streak" => "Tool failure streak",
+        "jsonl_only_tool_failure_streak" => "JSONL tool failure streak",
         "high_weekly_project_quota_burn" => "High quota burn",
         other => other,
     }
@@ -2376,9 +2379,13 @@ fn build_sessions_response_json(sessions: Vec<Value>) -> Value {
 struct PostmortemSessionRow {
     session_id: String,
     started_at: String,
+    started_at_epoch_secs: u64,
     last_activity_at: Option<String>,
+    last_activity_at_epoch_secs: u64,
     ended_at: Option<String>,
     model: Option<String>,
+    working_dir: String,
+    first_message_hash: String,
     initial_prompt: Option<String>,
     total_input_tokens: u64,
     total_output_tokens: u64,
@@ -2548,7 +2555,11 @@ fn load_postmortem_session(
     session_id: &str,
 ) -> rusqlite::Result<Option<PostmortemSessionRow>> {
     conn.query_row(
-        "SELECT session_id, started_at, last_activity_at, ended_at, model, initial_prompt, \
+        "SELECT session_id, started_at, \
+                CAST(strftime('%s', started_at) AS INTEGER), \
+                last_activity_at, \
+                CAST(strftime('%s', COALESCE(last_activity_at, ended_at, started_at)) AS INTEGER), \
+                ended_at, model, COALESCE(working_dir, ''), COALESCE(first_message_hash, ''), initial_prompt, \
                 total_input_tokens, total_output_tokens, total_cache_read_tokens, \
                 total_cache_creation_tokens, request_count, \
                 CASE WHEN ended_at IS NOT NULL \
@@ -2562,18 +2573,24 @@ fn load_postmortem_session(
             Ok(PostmortemSessionRow {
                 session_id: row.get(0)?,
                 started_at: row.get(1)?,
-                last_activity_at: row.get(2)?,
-                ended_at: row.get(3)?,
-                model: row.get(4)?,
-                initial_prompt: row.get(5)?,
-                total_input_tokens: row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u64,
-                total_output_tokens: row.get::<_, Option<i64>>(7)?.unwrap_or(0).max(0) as u64,
-                total_cache_read_tokens: row.get::<_, Option<i64>>(8)?.unwrap_or(0).max(0) as u64,
-                total_cache_creation_tokens: row.get::<_, Option<i64>>(9)?.unwrap_or(0).max(0)
+                started_at_epoch_secs: row.get::<_, Option<i64>>(2)?.unwrap_or(0).max(0) as u64,
+                last_activity_at: row.get(3)?,
+                last_activity_at_epoch_secs: row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0)
                     as u64,
-                request_count: row.get::<_, Option<i64>>(10)?.unwrap_or(0).max(0) as u64,
+                ended_at: row.get(5)?,
+                model: row.get(6)?,
+                working_dir: row.get(7)?,
+                first_message_hash: row.get(8)?,
+                initial_prompt: row.get(9)?,
+                total_input_tokens: row.get::<_, Option<i64>>(10)?.unwrap_or(0).max(0) as u64,
+                total_output_tokens: row.get::<_, Option<i64>>(11)?.unwrap_or(0).max(0) as u64,
+                total_cache_read_tokens: row.get::<_, Option<i64>>(12)?.unwrap_or(0).max(0)
+                    as u64,
+                total_cache_creation_tokens: row.get::<_, Option<i64>>(13)?.unwrap_or(0).max(0)
+                    as u64,
+                request_count: row.get::<_, Option<i64>>(14)?.unwrap_or(0).max(0) as u64,
                 duration_secs: row
-                    .get::<_, Option<i64>>(11)?
+                    .get::<_, Option<i64>>(15)?
                     .map(|value| value.max(0) as u64),
             })
         },
@@ -3103,6 +3120,457 @@ fn total_input_cache_rate_from_tokens(totals: &PostmortemTokenTotals) -> f64 {
     }
 }
 
+fn proxy_only_jsonl_enrichment_status(reason: &str) -> Value {
+    serde_json::json!({
+        "source": "jsonl",
+        "status": "proxy_only",
+        "reason": reason,
+        "confidence": 0.0,
+    })
+}
+
+struct PostmortemJsonlEnrichment {
+    status: Value,
+    summary: Option<jsonl::JsonlDerivedSession>,
+    findings: Vec<guard::GuardFinding>,
+}
+
+fn postmortem_session_allows_jsonl_enrichment(session: &PostmortemSessionRow) -> bool {
+    if session.ended_at.is_some() {
+        return true;
+    }
+    let last_activity = session.last_activity_at_epoch_secs;
+    if last_activity == 0 {
+        return false;
+    }
+    now_epoch_secs().saturating_sub(last_activity) >= postmortem_idle_secs()
+}
+
+fn jsonl_search_roots() -> Vec<PathBuf> {
+    if let Ok(raw) = std::env::var(JSONL_DIR_ENV) {
+        return std::env::split_paths(&raw).collect();
+    }
+    #[cfg(test)]
+    {
+        Vec::new()
+    }
+    #[cfg(not(test))]
+    {
+        std::env::var("HOME")
+            .ok()
+            .map(|home| PathBuf::from(home).join(".claude").join("projects"))
+            .into_iter()
+            .collect()
+    }
+}
+
+fn collect_jsonl_paths(root: &Path, paths: &mut Vec<PathBuf>) {
+    const MAX_JSONL_FILES: usize = 512;
+    if paths.len() >= MAX_JSONL_FILES {
+        return;
+    }
+    let Ok(metadata) = std::fs::metadata(root) else {
+        return;
+    };
+    if metadata.is_file() {
+        if root.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            paths.push(root.to_path_buf());
+        }
+        return;
+    }
+    if !metadata.is_dir() {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        collect_jsonl_paths(&entry.path(), paths);
+        if paths.len() >= MAX_JSONL_FILES {
+            break;
+        }
+    }
+}
+
+fn load_jsonl_candidate_sessions() -> Vec<jsonl::JsonlDerivedSession> {
+    let mut paths = Vec::new();
+    for root in jsonl_search_roots() {
+        collect_jsonl_paths(&root, &mut paths);
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+        .iter()
+        .filter_map(|path| match jsonl::parse_jsonl_file(path) {
+            Ok(session) => session,
+            Err(err) => {
+                debug!(path = %path.display(), error = %err, "failed to parse JSONL candidate");
+                None
+            }
+        })
+        .collect()
+}
+
+fn proxy_correlation_for_postmortem_session(
+    session: &PostmortemSessionRow,
+    turn_count: u64,
+) -> correlation::ProxySessionCorrelation {
+    correlation::ProxySessionCorrelation {
+        session_id: session.session_id.clone(),
+        cwd: session.working_dir.clone(),
+        started_at_epoch_secs: session.started_at_epoch_secs,
+        last_activity_at_epoch_secs: session.last_activity_at_epoch_secs,
+        first_message_hash: session.first_message_hash.clone(),
+        request_count: session.request_count,
+        turn_count,
+    }
+}
+
+fn jsonl_matched_status(proxy_session_id: &str, jsonl_session_id: &str) -> Value {
+    serde_json::json!({
+        "source": "jsonl",
+        "status": "matched",
+        "proxy_session_id": proxy_session_id,
+        "jsonl_session_id": jsonl_session_id,
+        "confidence": 0.95,
+    })
+}
+
+fn jsonl_ambiguous_status(proxy_session_id: &str, candidate_count: usize) -> Value {
+    serde_json::json!({
+        "source": "jsonl",
+        "status": "ambiguous",
+        "proxy_session_id": proxy_session_id,
+        "candidate_count": candidate_count,
+        "reason": "ambiguous_match",
+        "confidence": 0.0,
+    })
+}
+
+fn jsonl_tool_failure_finding(
+    session_id: &str,
+    summary: &jsonl::JsonlDerivedSession,
+) -> Option<guard::GuardFinding> {
+    let consecutive_failure_turns = summary.longest_tool_failure_streak();
+    let failed_tool_calls = summary.total_tool_failures();
+    let policy = guard::GuardPolicy::default();
+    guard::detect_tool_failure_finding(
+        Some(&policy),
+        guard::ToolFailureObservation {
+            session_id: session_id.to_string(),
+            request_id: None,
+            turn_number: summary.last_failed_tool_turn().map(|turn| turn as u32),
+            timestamp: epoch_to_iso8601(summary.last_activity_at_epoch_secs),
+            consecutive_failure_turns: consecutive_failure_turns.min(u32::MAX as u64) as u32,
+            failed_tool_calls: failed_tool_calls.min(u32::MAX as u64) as u32,
+            source: guard::FindingSource::Jsonl,
+        },
+    )
+}
+
+fn load_postmortem_jsonl_enrichment(
+    session: &PostmortemSessionRow,
+    turn_count: u64,
+) -> PostmortemJsonlEnrichment {
+    if !postmortem_session_allows_jsonl_enrichment(session) {
+        return PostmortemJsonlEnrichment {
+            status: proxy_only_jsonl_enrichment_status("session_active"),
+            summary: None,
+            findings: Vec::new(),
+        };
+    }
+
+    let candidates = load_jsonl_candidate_sessions();
+    let proxy = proxy_correlation_for_postmortem_session(session, turn_count);
+    let correlations = candidates
+        .iter()
+        .map(jsonl::JsonlDerivedSession::correlation)
+        .collect::<Vec<_>>();
+
+    match correlation::correlate_jsonl_session(&proxy, &correlations) {
+        correlation::JsonlEnrichmentStatus::Matched {
+            proxy_session_id,
+            jsonl_session_id,
+        } => {
+            let summary = candidates
+                .into_iter()
+                .find(|candidate| candidate.jsonl_session_id == jsonl_session_id);
+            let findings = summary
+                .as_ref()
+                .and_then(|summary| jsonl_tool_failure_finding(&session.session_id, summary))
+                .into_iter()
+                .collect::<Vec<_>>();
+            PostmortemJsonlEnrichment {
+                status: jsonl_matched_status(&proxy_session_id, &jsonl_session_id),
+                summary,
+                findings,
+            }
+        }
+        correlation::JsonlEnrichmentStatus::ProxyOnly { reason, .. } => {
+            let reason = match reason {
+                correlation::ProxyOnlyReason::MissingJsonl => "missing_jsonl",
+                correlation::ProxyOnlyReason::NoMatch => "no_confident_match",
+            };
+            PostmortemJsonlEnrichment {
+                status: proxy_only_jsonl_enrichment_status(reason),
+                summary: None,
+                findings: Vec::new(),
+            }
+        }
+        correlation::JsonlEnrichmentStatus::Ambiguous {
+            proxy_session_id,
+            candidate_count,
+        } => PostmortemJsonlEnrichment {
+            status: jsonl_ambiguous_status(&proxy_session_id, candidate_count),
+            summary: None,
+            findings: Vec::new(),
+        },
+    }
+}
+
+fn persist_guard_finding_if_absent(
+    conn: &Connection,
+    finding: &guard::GuardFinding,
+) -> rusqlite::Result<()> {
+    let rule_id = finding.rule_id.to_string();
+    let source = serialized_label(finding.source);
+    let evidence_level = serialized_label(finding.evidence_level);
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM guard_findings \
+             WHERE session_id = ?1 AND rule_id = ?2 AND source = ?3 AND evidence_level = ?4 \
+             LIMIT 1",
+            rusqlite::params![&finding.session_id, &rule_id, &source, &evidence_level],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if exists {
+        return Ok(());
+    }
+
+    let severity = serialized_label(finding.severity);
+    let action = serialized_label(finding.action);
+    conn.execute(
+        "INSERT INTO guard_findings (
+            session_id, request_id, turn_number, timestamp, rule_id, severity,
+            action, source, evidence_level, confidence, detail, suggested_action
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        rusqlite::params![
+            &finding.session_id,
+            &finding.request_id,
+            finding.turn_number,
+            &finding.timestamp,
+            rule_id,
+            severity,
+            action,
+            source,
+            evidence_level,
+            finding.confidence,
+            &finding.detail,
+            &finding.suggested_action,
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_postmortem_findings(conn: &Connection, session_id: &str) -> rusqlite::Result<Vec<Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT rule_id, severity, action, source, evidence_level, confidence, \
+                timestamp, detail, suggested_action, turn_number, request_id \
+         FROM guard_findings WHERE session_id = ?1 \
+         ORDER BY timestamp ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+        let rule_id: String = row.get(0)?;
+        Ok(serde_json::json!({
+            "rule_id": rule_id,
+            "title": guard_finding_title(&rule_id),
+            "severity": row.get::<_, String>(1)?,
+            "action": row.get::<_, String>(2)?,
+            "source": row.get::<_, String>(3)?,
+            "evidence_level": row.get::<_, String>(4)?,
+            "confidence": row.get::<_, f64>(5)?,
+            "timestamp": row.get::<_, String>(6)?,
+            "detail": row.get::<_, String>(7)?,
+            "suggested_action": row.get::<_, Option<String>>(8)?,
+            "turn_number": row.get::<_, Option<i64>>(9)?.map(|turn| turn.max(0) as u64),
+            "request_id": row.get::<_, Option<String>>(10)?,
+        }))
+    })?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+fn diagnosis_cause_finding(session_id: &str, completed_at: &str, cause: &Value) -> Option<Value> {
+    let cause_type = cause.get("cause_type").and_then(Value::as_str)?;
+    let is_heuristic = cause
+        .get("is_heuristic")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (rule_id, source, evidence_level, confidence) = match cause_type {
+        "api_error" => (
+            "api_error_circuit_breaker_cooldown",
+            "proxy",
+            "direct_proxy",
+            0.95,
+        ),
+        "cache_miss_thrash" => ("repeated_cache_rebuilds", "proxy", "direct_proxy", 0.9),
+        "cache_miss_ttl" => ("repeated_cache_rebuilds", "proxy", "inferred", 0.78),
+        "context_bloat" | "near_compaction" => {
+            ("context_near_warning_threshold", "proxy", "derived", 0.82)
+        }
+        "model_fallback" => ("model_mismatch", "proxy", "direct_proxy", 0.98),
+        "tool_failure_streak" => ("tool_failure_streak", "proxy", "direct_proxy", 0.92),
+        "compaction_suspected" => ("suspected_compaction_loop", "heuristic", "inferred", 0.72),
+        "no_progress_turns" => ("no_progress_turns", "heuristic", "inferred", 0.65),
+        _ if is_heuristic => (cause_type, "heuristic", "inferred", 0.6),
+        _ => (cause_type, "proxy", "derived", 0.75),
+    };
+    let detail = cause
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or(cause_type);
+    Some(serde_json::json!({
+        "rule_id": rule_id,
+        "title": guard_finding_title(rule_id),
+        "severity": if source == "heuristic" { "warning" } else { "warning" },
+        "action": "diagnose_only",
+        "source": source,
+        "evidence_level": evidence_level,
+        "confidence": confidence,
+        "session_id": session_id,
+        "timestamp": completed_at,
+        "detail": detail,
+        "turn_number": cause.get("turn_first_noticed").and_then(Value::as_u64),
+        "request_id": null,
+        "suggested_action": null,
+    }))
+}
+
+fn diagnosis_findings_from_causes(
+    session_id: &str,
+    completed_at: Option<&str>,
+    causes: &[Value],
+) -> Vec<Value> {
+    let completed_at = completed_at
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|| Cow::Owned(now_iso8601()));
+    causes
+        .iter()
+        .filter_map(|cause| diagnosis_cause_finding(session_id, completed_at.as_ref(), cause))
+        .collect()
+}
+
+fn finding_identity(value: &Value) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        value
+            .get("rule_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        value
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        value
+            .get("evidence_level")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        value
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    )
+}
+
+fn merge_postmortem_findings(mut primary: Vec<Value>, secondary: Vec<Value>) -> Vec<Value> {
+    let mut seen = primary.iter().map(finding_identity).collect::<HashSet<_>>();
+    for finding in secondary {
+        if seen.insert(finding_identity(&finding)) {
+            primary.push(finding);
+        }
+    }
+    primary
+}
+
+fn evidence_labels_json(findings: &[Value]) -> Value {
+    let mut seen = HashSet::new();
+    let labels = findings
+        .iter()
+        .filter_map(|finding| {
+            let source = finding.get("source").and_then(Value::as_str)?;
+            let evidence_level = finding.get("evidence_level").and_then(Value::as_str)?;
+            let rule_id = finding
+                .get("rule_id")
+                .and_then(Value::as_str)
+                .unwrap_or("finding");
+            let confidence = finding
+                .get("confidence")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let key = format!("{rule_id}|{source}|{evidence_level}");
+            seen.insert(key).then(|| {
+                serde_json::json!({
+                    "rule_id": rule_id,
+                    "source": source,
+                    "evidence_level": evidence_level,
+                    "confidence": confidence,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    Value::Array(labels)
+}
+
+fn count_map_json(map: &BTreeMap<String, u64>, key_name: &str) -> Value {
+    Value::Array(
+        map.iter()
+            .map(|(key, count)| {
+                serde_json::json!({
+                    key_name: key,
+                    "count": count,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn string_set_json(values: &std::collections::BTreeSet<String>) -> Value {
+    Value::Array(
+        values
+            .iter()
+            .map(|value| Value::String(value.clone()))
+            .collect(),
+    )
+}
+
+fn jsonl_signal_json(summary: Option<&jsonl::JsonlDerivedSession>) -> Value {
+    let Some(summary) = summary else {
+        return Value::Null;
+    };
+    serde_json::json!({
+        "session_id": summary.jsonl_session_id,
+        "user_turn_count": summary.user_turn_count,
+        "assistant_turn_count": summary.assistant_turn_count,
+        "tool_calls": count_map_json(&summary.tool_calls, "tool_name"),
+        "tool_failures": count_map_json(&summary.tool_failures, "tool_name"),
+        "mcp_tool_names": string_set_json(&summary.mcp_tool_names),
+        "skill_names": string_set_json(&summary.skill_names),
+        "bash_command_categories": count_map_json(&summary.bash_command_categories, "category"),
+        "file_operation_categories": count_map_json(&summary.file_operation_categories, "category"),
+        "usage_fallback": {
+            "input_tokens": summary.usage.input_tokens,
+            "output_tokens": summary.usage.output_tokens,
+            "cache_read_tokens": summary.usage.cache_read_tokens,
+            "cache_creation_tokens": summary.usage.cache_creation_tokens,
+        },
+        "system_event_categories": count_map_json(&summary.system_event_categories, "category"),
+    })
+}
+
 fn build_postmortem_response_from_db(
     conn: &Connection,
     target: &str,
@@ -3150,6 +3618,12 @@ fn build_postmortem_response_from_db(
     let billing = load_latest_billing_reconciliations(conn, &session_ids)
         .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?
         .remove(&session.session_id);
+    let jsonl_enrichment = load_postmortem_jsonl_enrichment(&session, turns.len() as u64);
+    for finding in &jsonl_enrichment.findings {
+        let _ = persist_guard_finding_if_absent(conn, finding);
+    }
+    let stored_findings = load_postmortem_findings(conn, &session.session_id)
+        .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?;
 
     let sanitized_causes = diagnosis
         .as_ref()
@@ -3159,6 +3633,12 @@ fn build_postmortem_response_from_db(
         .as_ref()
         .map(|diag| sanitize_advice(&diag.advice, redact))
         .unwrap_or_default();
+    let diagnosis_findings = diagnosis_findings_from_causes(
+        &session.session_id,
+        diagnosis.as_ref().map(|diag| diag.completed_at.as_str()),
+        &sanitized_causes,
+    );
+    let findings = merge_postmortem_findings(diagnosis_findings, stored_findings);
     let partial = session.ended_at.is_none();
     let primary_cause = sanitized_causes
         .first()
@@ -3409,6 +3889,15 @@ fn build_postmortem_response_from_db(
             None,
         ));
     }
+    for finding in &jsonl_enrichment.findings {
+        evidence.push(evidence_json(
+            "direct_jsonl",
+            "tools",
+            finding.detail.clone(),
+            finding.turn_number.map(u64::from),
+            Some(finding.timestamp.clone()),
+        ));
+    }
 
     let confidence = postmortem_confidence(diagnosis.as_ref(), evidence.len()).to_string();
 
@@ -3498,12 +3987,30 @@ fn build_postmortem_response_from_db(
     if recommendations.is_empty() {
         recommendations.push(next_action.clone());
     }
+    let enrichment_status = jsonl_enrichment.status.clone();
+    let evidence_labels = evidence_labels_json(&findings);
 
     Ok(serde_json::json!({
         "session_id": session.session_id,
+        "generated_at": now_iso8601(),
         "redacted": redact,
         "redaction_status": if redact { "redacted" } else { "local_unredacted" },
         "partial": partial,
+        "proxy_summary": {
+            "outcome": diagnosis
+                .as_ref()
+                .map(|diag| diag.outcome.clone())
+                .unwrap_or_else(|| if partial { "In Progress".to_string() } else { "Completed state unknown".to_string() }),
+            "estimated_total_cost_dollars": rounded_estimated_cost_dollars(estimated.estimated_cost_dollars),
+            "total_turns": diagnosis
+                .as_ref()
+                .map(|diag| diag.total_turns)
+                .filter(|turns| *turns > 0)
+                .unwrap_or(turns.len() as u64),
+            "main_degradation": primary_cause,
+            "request_count": token_totals.request_count,
+            "total_tokens": token_totals.total_tokens(),
+        },
         "summary": {
             "started_at": session.started_at,
             "last_activity_at": session.last_activity_at,
@@ -3584,9 +4091,13 @@ fn build_postmortem_response_from_db(
             "tools": tool_values,
             "skills": skill_events,
             "mcp": mcp_events,
+            "jsonl": jsonl_signal_json(jsonl_enrichment.summary.as_ref()),
         },
+        "findings": findings,
+        "evidence_labels": evidence_labels,
         "evidence": evidence,
         "timeline": timeline,
+        "enrichment_status": enrichment_status,
         "recommendations": recommendations,
         "caveats": [
             "This report is deterministic and generated from local cc-blackbox SQLite data.",
@@ -11719,10 +12230,577 @@ mod tests {
     }
 
     #[test]
+    fn postmortem_json_includes_phase6_structured_fields_and_labeled_findings() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let _jsonl_dir = EnvVarGuard::set(
+            "CC_BLACKBOX_JSONL_DIR",
+            "/tmp/cc-blackbox-jsonl-fixtures-do-not-exist",
+        );
+        let conn = create_full_test_db();
+        insert_session(
+            &conn,
+            "session-phase6-json",
+            "2026-01-01T00:00:00Z",
+            Some("2026-01-01T00:08:00Z"),
+            "claude-opus-4-7",
+            None,
+        );
+        insert_request(
+            &conn,
+            "req-phase6-json",
+            "session-phase6-json",
+            "2026-01-01T00:01:00Z",
+            "claude-opus-4-7",
+            160_000,
+            1_000,
+            0,
+            12_000,
+        );
+        conn.execute(
+            "INSERT INTO session_diagnoses (
+                session_id, completed_at, outcome, total_turns, total_cost, cache_hit_ratio,
+                degraded, degradation_turn, causes_json, advice_json
+            ) VALUES (?1, ?2, 'Likely Partially Completed', 2, 2.0, 0.10, 1, 2, ?3, ?4)",
+            rusqlite::params![
+                "session-phase6-json",
+                "2026-01-01T00:08:00Z",
+                r#"[{"turn_first_noticed":2,"cause_type":"model_fallback","detail":"Requested opus, got sonnet","estimated_cost":0.42,"is_heuristic":false,"requested_model":"claude-opus-4-7","actual_model":"claude-sonnet-4-6"}]"#,
+                r#"["Retry with the intended model."]"#,
+            ],
+        )
+        .expect("insert diagnosis");
+        conn.execute(
+            "INSERT INTO turn_snapshots (
+                session_id, turn_number, timestamp, input_tokens, cache_read_tokens,
+                cache_creation_tokens, output_tokens, ttft_ms, tool_calls, tool_failures,
+                gap_from_prev_secs, context_utilization, context_window_tokens,
+                frustration_signals, requested_model, actual_model
+            ) VALUES
+                ('session-phase6-json', 1, '2026-01-01T00:01:00Z', 160000, 0, 12000, 1000, 1200, '[]', 0, 0.0, 0.86, 200000, 0, 'claude-opus-4-7', 'claude-opus-4-7'),
+                ('session-phase6-json', 2, '2026-01-01T00:03:00Z', 170000, 0, 14000, 1500, 2400, '[]', 0, 10.0, 0.92, 200000, 0, 'claude-opus-4-7', 'claude-sonnet-4-6')",
+            [],
+        )
+        .expect("insert turns");
+
+        let json = build_postmortem_response_from_db(&conn, "session-phase6-json", true)
+            .expect("postmortem");
+
+        assert!(json
+            .get("generated_at")
+            .and_then(|value| value.as_str())
+            .is_some());
+        assert_eq!(
+            json.pointer("/proxy_summary/main_degradation")
+                .and_then(|value| value.as_str()),
+            Some("model_fallback")
+        );
+        assert_eq!(
+            json.pointer("/enrichment_status/status")
+                .and_then(|value| value.as_str()),
+            Some("proxy_only")
+        );
+        let findings = json
+            .get("findings")
+            .and_then(serde_json::Value::as_array)
+            .expect("findings");
+        let model_finding = findings
+            .iter()
+            .find(|finding| {
+                finding.get("rule_id").and_then(serde_json::Value::as_str) == Some("model_mismatch")
+            })
+            .expect("model finding");
+        assert_eq!(
+            model_finding
+                .get("source")
+                .and_then(serde_json::Value::as_str),
+            Some("proxy")
+        );
+        assert_eq!(
+            model_finding
+                .get("evidence_level")
+                .and_then(serde_json::Value::as_str),
+            Some("direct_proxy")
+        );
+        assert!(model_finding
+            .get("confidence")
+            .and_then(serde_json::Value::as_f64)
+            .is_some_and(|confidence| confidence >= 0.9));
+        let labels = json
+            .get("evidence_labels")
+            .and_then(serde_json::Value::as_array)
+            .expect("evidence labels");
+        assert!(labels.iter().any(|label| {
+            label.get("source").and_then(serde_json::Value::as_str) == Some("proxy")
+                && label
+                    .get("evidence_level")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("direct_proxy")
+        }));
+        assert!(json
+            .get("recommendations")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| !items.is_empty()));
+    }
+
+    #[test]
+    fn postmortem_represents_required_degradation_explanations_when_evidence_exists() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let _jsonl_dir = EnvVarGuard::set(
+            "CC_BLACKBOX_JSONL_DIR",
+            "/tmp/cc-blackbox-jsonl-fixtures-do-not-exist",
+        );
+        let conn = create_full_test_db();
+        insert_session(
+            &conn,
+            "session-required-findings",
+            "2026-01-01T00:00:00Z",
+            Some("2026-01-01T00:08:00Z"),
+            "claude-opus-4-7",
+            None,
+        );
+        insert_request(
+            &conn,
+            "req-required-findings",
+            "session-required-findings",
+            "2026-01-01T00:01:00Z",
+            "claude-opus-4-7",
+            160_000,
+            1_000,
+            0,
+            12_000,
+        );
+        conn.execute(
+            "INSERT INTO session_diagnoses (
+                session_id, completed_at, outcome, total_turns, total_cost, cache_hit_ratio,
+                degraded, degradation_turn, causes_json, advice_json
+            ) VALUES (?1, ?2, 'Degraded', 6, 2.0, 0.10, 1, 2, ?3, '[]')",
+            rusqlite::params![
+                "session-required-findings",
+                "2026-01-01T00:08:00Z",
+                r#"[
+                    {"turn_first_noticed":2,"cause_type":"cache_miss_thrash","detail":"Cache rebuilt repeatedly.","estimated_cost":0.42,"is_heuristic":false},
+                    {"turn_first_noticed":3,"cause_type":"context_bloat","detail":"Context crossed warning threshold.","estimated_cost":0.10,"is_heuristic":false},
+                    {"turn_first_noticed":4,"cause_type":"model_fallback","detail":"Requested opus, got sonnet.","estimated_cost":0.20,"is_heuristic":false,"requested_model":"claude-opus-4-7","actual_model":"claude-sonnet-4-6"},
+                    {"turn_first_noticed":5,"cause_type":"tool_failure_streak","detail":"Tools failed repeatedly.","estimated_cost":0.05,"is_heuristic":false}
+                ]"#,
+            ],
+        )
+        .expect("insert diagnosis");
+        for (rule_id, action, source, evidence_level, detail) in [
+            (
+                "per_session_token_budget_exceeded",
+                "block",
+                "proxy",
+                "direct_proxy",
+                "Session token budget exceeded.",
+            ),
+            (
+                "api_error_circuit_breaker_cooldown",
+                "cooldown",
+                "proxy",
+                "direct_proxy",
+                "API error cooldown is active.",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO guard_findings (
+                    session_id, request_id, turn_number, timestamp, rule_id, severity,
+                    action, source, evidence_level, confidence, detail, suggested_action
+                ) VALUES (?1,NULL,NULL,?2,?3,'critical',?4,?5,?6,1.0,?7,NULL)",
+                rusqlite::params![
+                    "session-required-findings",
+                    "2026-01-01T00:07:00Z",
+                    rule_id,
+                    action,
+                    source,
+                    evidence_level,
+                    detail,
+                ],
+            )
+            .expect("insert guard finding");
+        }
+
+        let json = build_postmortem_response_from_db(&conn, "session-required-findings", true)
+            .expect("postmortem");
+        let rule_ids = json
+            .get("findings")
+            .and_then(serde_json::Value::as_array)
+            .expect("findings")
+            .iter()
+            .filter_map(|finding| finding.get("rule_id").and_then(serde_json::Value::as_str))
+            .collect::<std::collections::HashSet<_>>();
+
+        for rule_id in [
+            "per_session_token_budget_exceeded",
+            "api_error_circuit_breaker_cooldown",
+            "repeated_cache_rebuilds",
+            "context_near_warning_threshold",
+            "model_mismatch",
+            "tool_failure_streak",
+        ] {
+            assert!(
+                rule_ids.contains(rule_id),
+                "missing {rule_id}: {rule_ids:?}"
+            );
+        }
+    }
+
+    #[test]
     fn postmortem_last_reports_empty_state_when_no_sessions_exist() {
         let conn = create_full_test_db();
         let err = build_postmortem_response_from_db(&conn, "last", true).unwrap_err();
         assert!(matches!(err, PostmortemError::NoSessions));
+    }
+
+    #[test]
+    fn proxy_only_postmortem_marks_missing_jsonl_enrichment_status() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let _jsonl_dir = EnvVarGuard::set(
+            "CC_BLACKBOX_JSONL_DIR",
+            "/tmp/cc-blackbox-jsonl-fixtures-do-not-exist",
+        );
+        let conn = create_full_test_db();
+        insert_session(
+            &conn,
+            "session-proxy-only",
+            "2026-01-01T00:00:00Z",
+            Some("2026-01-01T00:02:00Z"),
+            "claude-sonnet",
+            None,
+        );
+        insert_request(
+            &conn,
+            "req-proxy-only",
+            "session-proxy-only",
+            "2026-01-01T00:01:00Z",
+            "claude-sonnet",
+            2_000,
+            300,
+            0,
+            0,
+        );
+
+        let json = build_postmortem_response_from_db(&conn, "session-proxy-only", true)
+            .expect("postmortem");
+
+        assert_eq!(
+            json.pointer("/enrichment_status/status")
+                .and_then(|value| value.as_str()),
+            Some("proxy_only")
+        );
+        assert_eq!(
+            json.pointer("/enrichment_status/reason")
+                .and_then(|value| value.as_str()),
+            Some("missing_jsonl")
+        );
+        assert_eq!(
+            json.pointer("/enrichment_status/source")
+                .and_then(|value| value.as_str()),
+            Some("jsonl")
+        );
+    }
+
+    #[test]
+    fn matched_jsonl_postmortem_adds_direct_jsonl_tool_failure_finding() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let jsonl_dir = std::env::temp_dir().join(format!(
+            "cc-blackbox-jsonl-match-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&jsonl_dir).expect("create jsonl dir");
+        let _jsonl_dir = EnvVarGuard::set(
+            "CC_BLACKBOX_JSONL_DIR",
+            jsonl_dir.to_str().expect("jsonl dir is utf-8"),
+        );
+        let conn = create_full_test_db();
+        let raw_prompt = "RAW_JSONL_PROMPT_66 fix the failing test";
+        let first_message_hash = super::hash_text_hex(raw_prompt);
+        conn.execute(
+            "INSERT INTO sessions (
+                session_id, started_at, last_activity_at, ended_at, model, working_dir,
+                first_message_hash, initial_prompt
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+            rusqlite::params![
+                "session-jsonl-match",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:05:00Z",
+                "2026-01-01T00:06:00Z",
+                "claude-sonnet",
+                "/tmp/cc-blackbox-jsonl",
+                first_message_hash,
+            ],
+        )
+        .expect("insert session");
+        insert_request(
+            &conn,
+            "req-jsonl-match",
+            "session-jsonl-match",
+            "2026-01-01T00:01:00Z",
+            "claude-sonnet",
+            5_000,
+            500,
+            0,
+            0,
+        );
+        for turn in 1..=5 {
+            insert_turn_snapshot(
+                &conn,
+                "session-jsonl-match",
+                turn,
+                &format!("2026-01-01T00:0{turn}:00Z"),
+                0,
+                0,
+                100,
+                0.0,
+                0.02,
+                None,
+            );
+        }
+
+        let mut jsonl = String::new();
+        jsonl.push_str(&format!(
+            r#"{{"type":"user","sessionId":"jsonl-match","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:00Z","message":{{"role":"user","content":[{{"type":"text","text":"{raw_prompt}"}}]}}}}"#
+        ));
+        jsonl.push('\n');
+        for turn in 1..=5 {
+            jsonl.push_str(&format!(
+                r#"{{"type":"assistant","sessionId":"jsonl-match","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:0{turn}:00Z","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_{turn}","name":"Bash","input":{{"command":"cargo test -- RAW_JSONL_COMMAND_77"}}}}]}}}}"#
+            ));
+            jsonl.push('\n');
+            jsonl.push_str(&format!(
+                r#"{{"type":"user","sessionId":"jsonl-match","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:0{turn}:30Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_{turn}","is_error":true,"content":"RAW_JSONL_OUTPUT_88"}}]}}}}"#
+            ));
+            jsonl.push('\n');
+        }
+        let jsonl_path = jsonl_dir.join("session.jsonl");
+        fs::write(&jsonl_path, jsonl).expect("write jsonl fixture");
+
+        let json = build_postmortem_response_from_db(&conn, "session-jsonl-match", true)
+            .expect("postmortem");
+
+        assert_eq!(
+            json.pointer("/enrichment_status/status")
+                .and_then(|value| value.as_str()),
+            Some("matched")
+        );
+        assert_eq!(
+            json.pointer("/enrichment_status/jsonl_session_id")
+                .and_then(|value| value.as_str()),
+            Some("jsonl-match")
+        );
+        let findings = json
+            .get("findings")
+            .and_then(serde_json::Value::as_array)
+            .expect("findings array");
+        let jsonl_finding = findings
+            .iter()
+            .find(|finding| {
+                finding.get("rule_id").and_then(serde_json::Value::as_str)
+                    == Some("jsonl_only_tool_failure_streak")
+            })
+            .expect("jsonl tool failure finding");
+        assert_eq!(
+            jsonl_finding
+                .get("source")
+                .and_then(serde_json::Value::as_str),
+            Some("jsonl")
+        );
+        assert_eq!(
+            jsonl_finding
+                .get("evidence_level")
+                .and_then(serde_json::Value::as_str),
+            Some("direct_jsonl")
+        );
+        assert!(jsonl_finding
+            .get("confidence")
+            .and_then(serde_json::Value::as_f64)
+            .is_some_and(|confidence| confidence >= 0.9));
+
+        let rendered = serde_json::to_string(&json).expect("serialize postmortem");
+        for forbidden in [
+            raw_prompt,
+            "RAW_JSONL_COMMAND_77",
+            "RAW_JSONL_OUTPUT_88",
+            "cargo test --",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "raw JSONL leaked: {rendered}"
+            );
+        }
+
+        fs::remove_dir_all(jsonl_dir).expect("remove jsonl dir");
+    }
+
+    #[test]
+    fn ambiguous_jsonl_match_stays_proxy_only_without_jsonl_findings() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let jsonl_dir = std::env::temp_dir().join(format!(
+            "cc-blackbox-jsonl-ambiguous-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&jsonl_dir).expect("create jsonl dir");
+        let _jsonl_dir = EnvVarGuard::set(
+            "CC_BLACKBOX_JSONL_DIR",
+            jsonl_dir.to_str().expect("jsonl dir is utf-8"),
+        );
+        let conn = create_full_test_db();
+        let raw_prompt = "RAW_AMBIGUOUS_PROMPT_91 isolate the flaky tool";
+        let first_message_hash = super::hash_text_hex(raw_prompt);
+        conn.execute(
+            "INSERT INTO sessions (
+                session_id, started_at, last_activity_at, ended_at, model, working_dir,
+                first_message_hash, initial_prompt
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+            rusqlite::params![
+                "session-jsonl-ambiguous",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:05:00Z",
+                "2026-01-01T00:06:00Z",
+                "claude-sonnet",
+                "/tmp/cc-blackbox-jsonl",
+                first_message_hash,
+            ],
+        )
+        .expect("insert session");
+        insert_request(
+            &conn,
+            "req-jsonl-ambiguous",
+            "session-jsonl-ambiguous",
+            "2026-01-01T00:01:00Z",
+            "claude-sonnet",
+            5_000,
+            500,
+            0,
+            0,
+        );
+        for turn in 1..=5 {
+            insert_turn_snapshot(
+                &conn,
+                "session-jsonl-ambiguous",
+                turn,
+                &format!("2026-01-01T00:0{turn}:00Z"),
+                0,
+                0,
+                100,
+                0.0,
+                0.02,
+                None,
+            );
+        }
+
+        let mut jsonl = String::new();
+        jsonl.push_str(&format!(
+            r#"{{"type":"user","sessionId":"jsonl-ambiguous","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:00Z","message":{{"role":"user","content":[{{"type":"text","text":"{raw_prompt}"}}]}}}}"#
+        ));
+        jsonl.push('\n');
+        for turn in 1..=5 {
+            jsonl.push_str(&format!(
+                r#"{{"type":"assistant","sessionId":"jsonl-ambiguous","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:0{turn}:00Z","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_{turn}","name":"Bash","input":{{"command":"cargo test -- RAW_AMBIGUOUS_COMMAND_92"}}}}]}}}}"#
+            ));
+            jsonl.push('\n');
+            jsonl.push_str(&format!(
+                r#"{{"type":"user","sessionId":"jsonl-ambiguous","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:0{turn}:30Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_{turn}","is_error":true,"content":"RAW_AMBIGUOUS_OUTPUT_93"}}]}}}}"#
+            ));
+            jsonl.push('\n');
+        }
+        fs::write(jsonl_dir.join("one.jsonl"), &jsonl).expect("write jsonl fixture one");
+        fs::write(jsonl_dir.join("two.jsonl"), &jsonl).expect("write jsonl fixture two");
+
+        let json = build_postmortem_response_from_db(&conn, "session-jsonl-ambiguous", true)
+            .expect("postmortem");
+
+        assert_eq!(
+            json.pointer("/enrichment_status/status")
+                .and_then(|value| value.as_str()),
+            Some("ambiguous")
+        );
+        assert_eq!(
+            json.pointer("/enrichment_status/candidate_count")
+                .and_then(|value| value.as_u64()),
+            Some(2)
+        );
+        let rendered = serde_json::to_string(&json).expect("serialize postmortem");
+        assert!(!rendered.contains("jsonl_only_tool_failure_streak"));
+        assert!(!rendered.contains("RAW_AMBIGUOUS_COMMAND_92"));
+        assert!(!rendered.contains("RAW_AMBIGUOUS_OUTPUT_93"));
+
+        fs::remove_dir_all(jsonl_dir).expect("remove jsonl dir");
+    }
+
+    #[test]
+    fn active_session_postmortem_does_not_run_jsonl_enrichment() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let jsonl_dir = std::env::temp_dir().join(format!(
+            "cc-blackbox-jsonl-active-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&jsonl_dir).expect("create jsonl dir");
+        let _jsonl_dir = EnvVarGuard::set(
+            "CC_BLACKBOX_JSONL_DIR",
+            jsonl_dir.to_str().expect("jsonl dir is utf-8"),
+        );
+        let conn = create_full_test_db();
+        let now = now_epoch_secs();
+        let now_iso = epoch_to_iso8601(now);
+        let raw_prompt = "RAW_ACTIVE_PROMPT_101 keep working";
+        let first_message_hash = super::hash_text_hex(raw_prompt);
+        conn.execute(
+            "INSERT INTO sessions (
+                session_id, started_at, last_activity_at, ended_at, model, working_dir,
+                first_message_hash, initial_prompt
+            ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL)",
+            rusqlite::params![
+                "session-jsonl-active",
+                now_iso,
+                now_iso,
+                "claude-sonnet",
+                "/tmp/cc-blackbox-jsonl",
+                first_message_hash,
+            ],
+        )
+        .expect("insert active session");
+        let jsonl = format!(
+            "{}\n{}\n",
+            format!(
+                r#"{{"type":"user","sessionId":"raw-jsonl-active-match-103","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"{now_iso}","message":{{"role":"user","content":[{{"type":"text","text":"{raw_prompt}"}}]}}}}"#
+            ),
+            format!(
+                r#"{{"type":"assistant","sessionId":"raw-jsonl-active-match-103","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"{now_iso}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{{"command":"cargo test -- RAW_ACTIVE_COMMAND_102"}}}}]}}}}"#
+            )
+        );
+        fs::write(jsonl_dir.join("active.jsonl"), jsonl).expect("write jsonl fixture");
+
+        let json = build_postmortem_response_from_db(&conn, "session-jsonl-active", true)
+            .expect("postmortem");
+
+        assert_eq!(
+            json.pointer("/enrichment_status/status")
+                .and_then(|value| value.as_str()),
+            Some("proxy_only")
+        );
+        assert_eq!(
+            json.pointer("/enrichment_status/reason")
+                .and_then(|value| value.as_str()),
+            Some("session_active")
+        );
+        let rendered = serde_json::to_string(&json).expect("serialize postmortem");
+        assert!(!rendered.contains("raw-jsonl-active-match-103"));
+        assert!(!rendered.contains("RAW_ACTIVE_COMMAND_102"));
+
+        fs::remove_dir_all(jsonl_dir).expect("remove jsonl dir");
     }
 
     #[test]

@@ -3001,6 +3001,26 @@ fn mcp_signal(report: &serde_json::Value) -> String {
     }
 }
 
+fn confidence_label(value: Option<f64>) -> String {
+    value
+        .map(|confidence| format!("{:.0}%", (confidence * 100.0).clamp(0.0, 100.0)))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn enrichment_status_text(report: &serde_json::Value) -> String {
+    let status = json_str(report, "/enrichment_status/status").unwrap_or("proxy_only");
+    let reason = json_str(report, "/enrichment_status/reason");
+    match (status, reason) {
+        ("matched", _) => "matched".to_string(),
+        ("ambiguous", Some(reason)) => format!("ambiguous ({reason})"),
+        ("ambiguous", None) => "ambiguous".to_string(),
+        ("proxy_only", Some(reason)) => format!("proxy_only ({reason})"),
+        ("proxy_only", None) => "proxy_only".to_string(),
+        (other, Some(reason)) => format!("{other} ({reason})"),
+        (other, None) => other.to_string(),
+    }
+}
+
 fn table_cell(value: &str) -> String {
     let single_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_for_box(&single_line, 140)
@@ -4125,6 +4145,150 @@ fn render_watch_postmortem_markdown(report: &serde_json::Value, analysis: Option
         );
     }
     out.push('\n');
+
+    out.push_str("## Timeline\n");
+    push_table_header(&mut out, &["Time", "Turn", "Event", "Detail"]);
+    let mut timeline_rows = 0;
+    if let Some(items) = report.get("timeline").and_then(|value| value.as_array()) {
+        for item in items.iter().take(6) {
+            let timestamp = item
+                .get("timestamp")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let turn = item
+                .get("turn")
+                .and_then(|value| value.as_u64())
+                .map(|turn| turn.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let label = item
+                .get("label")
+                .and_then(|value| value.as_str())
+                .unwrap_or("event");
+            let detail = item
+                .get("detail")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            push_table_row(
+                &mut out,
+                &[
+                    timestamp.to_string(),
+                    turn,
+                    label.to_string(),
+                    detail.to_string(),
+                ],
+            );
+            timeline_rows += 1;
+        }
+    }
+    if timeline_rows == 0 {
+        push_table_row(
+            &mut out,
+            &[
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "No timeline entries recorded.".to_string(),
+            ],
+        );
+    }
+    out.push('\n');
+
+    out.push_str("## Top Findings\n");
+    push_table_header(&mut out, &["Source", "Evidence", "Turn", "Detail"]);
+    let mut finding_rows = 0;
+    if let Some(items) = report.get("findings").and_then(|value| value.as_array()) {
+        for finding in items.iter().take(5) {
+            let source = finding
+                .get("source")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            let evidence = finding
+                .get("evidence_level")
+                .and_then(|value| value.as_str())
+                .unwrap_or("derived");
+            let confidence =
+                confidence_label(finding.get("confidence").and_then(|value| value.as_f64()));
+            let turn = finding
+                .get("turn_number")
+                .and_then(|value| value.as_u64())
+                .map(|turn| turn.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let title = finding
+                .get("title")
+                .or_else(|| finding.get("rule_id"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("finding");
+            let detail = finding
+                .get("detail")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            push_table_row(
+                &mut out,
+                &[
+                    source.to_string(),
+                    format!("{evidence} {confidence}"),
+                    turn,
+                    format!("{title}: {detail}"),
+                ],
+            );
+            finding_rows += 1;
+        }
+    }
+    if finding_rows == 0 {
+        push_table_row(
+            &mut out,
+            &[
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "No normalized findings recorded.".to_string(),
+            ],
+        );
+    }
+    out.push('\n');
+
+    out.push_str("## Advice\n");
+    if let Some(items) = report
+        .get("recommendations")
+        .and_then(|value| value.as_array())
+    {
+        for (idx, item) in items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .take(5)
+            .enumerate()
+        {
+            out.push_str(&format!("  {}. {}\n", idx + 1, table_cell(item)));
+        }
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+
+    out.push_str("## Enrichment\n");
+    push_key_value_table(
+        &mut out,
+        vec![
+            ("Status", enrichment_status_text(report)),
+            (
+                "Source",
+                json_str(report, "/enrichment_status/source")
+                    .unwrap_or("jsonl")
+                    .to_string(),
+            ),
+            (
+                "JSONL session",
+                json_str(report, "/enrichment_status/jsonl_session_id")
+                    .unwrap_or("-")
+                    .to_string(),
+            ),
+            (
+                "Confidence",
+                confidence_label(json_f64(report, "/enrichment_status/confidence")),
+            ),
+        ],
+    );
 
     if let Some(analysis) = analysis {
         append_claude_analysis_section(&mut out, analysis);
@@ -6622,6 +6786,82 @@ mod tests {
         assert!(!markdown.contains("Estimated costs are local calculations"));
         assert!(!markdown.contains("## Timeline Highlights"));
         assert!(!markdown.contains("## Caveats"));
+    }
+
+    #[test]
+    fn postmortem_markdown_includes_phase6_human_sections_and_enrichment_status() {
+        let report = serde_json::json!({
+            "session_id": "session_phase6",
+            "generated_at": "2026-01-01T00:06:00Z",
+            "redacted": true,
+            "partial": false,
+            "summary": {
+                "duration_secs": 360,
+                "model": "claude-sonnet",
+                "outcome": "Likely Partially Completed",
+                "total_turns": 5,
+                "total_tokens": 50000
+            },
+            "diagnosis": {
+                "likely_cause": "model_fallback",
+                "likely_cause_is_heuristic": false,
+                "next_action": "Retry with the intended model."
+            },
+            "impact": {
+                "estimated_total_cost_dollars": 2.34,
+                "estimated_likely_wasted_tokens": 12000,
+                "estimated_likely_wasted_cost_dollars": 0.42
+            },
+            "signals": {
+                "cache": { "cache_hit_ratio": 0.45 },
+                "context": { "max_fill_percent": 82.0, "turns_to_compact": 1 },
+                "tools": [
+                    { "tool_name": "Bash", "calls": 5, "failures": 5 }
+                ],
+                "skills": [],
+                "mcp": []
+            },
+            "findings": [
+                {
+                    "rule_id": "jsonl_only_tool_failure_streak",
+                    "title": "JSONL tool failure streak",
+                    "source": "jsonl",
+                    "evidence_level": "direct_jsonl",
+                    "confidence": 0.9,
+                    "detail": "JSONL-only tool failure streak: 5 consecutive turns included 5 failed tool calls.",
+                    "turn_number": 5
+                }
+            ],
+            "evidence": [
+                { "type": "direct_jsonl", "label": "tools", "detail": "5 failed tool calls", "turn": 5 }
+            ],
+            "timeline": [
+                { "timestamp": "2026-01-01T00:00:00Z", "turn": null, "label": "session_started", "detail": "Session row created." },
+                { "timestamp": "2026-01-01T00:05:00Z", "turn": 5, "label": "turn_signal", "detail": "5 tool failures" }
+            ],
+            "enrichment_status": {
+                "source": "jsonl",
+                "status": "matched",
+                "jsonl_session_id": "jsonl-session",
+                "confidence": 0.95
+            },
+            "recommendations": ["Retry with the intended model."]
+        });
+
+        let markdown = render_postmortem_markdown(&report);
+
+        assert!(markdown.contains("## Timeline"));
+        assert!(markdown.contains("## Top Findings"));
+        assert!(markdown.contains("## Advice"));
+        assert!(markdown.contains("## Enrichment"));
+        assert!(markdown.contains("Likely Partially Completed"));
+        assert!(markdown.contains("$2.34"));
+        assert!(markdown.contains("5 turns"));
+        assert!(markdown.contains("Model route changed"));
+        assert!(markdown.contains("direct_jsonl"));
+        assert!(markdown.contains("Retry with the intended model."));
+        assert!(markdown.contains("matched"));
+        assert!(markdown.contains("jsonl-session"));
     }
 
     #[test]

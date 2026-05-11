@@ -37,6 +37,7 @@ docs/prd-postmortem-command.md
 
 # Scratch / logs
 /tmp/cc-blackbox-repro/
+launch/
 *.log
 
 # Planning docs (not shipped per CLAUDE.md)

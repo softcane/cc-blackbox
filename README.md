@@ -1,14 +1,42 @@
 # cc-blackbox
 
-Claude Code failure usually does not look like failure at first. The terminal is still moving. Tools are still running. But the session may already be rebuilding cache every turn, drifting toward compaction, retrying broken API calls, or spending real money on work that should have been restarted ten minutes ago.
+cc-blackbox is a local flight recorder and guardrail for Claude Code. It tells you when a session is wasting tokens, looping on tools, drifting toward compaction, hitting model-route surprises, or should be restarted.
 
-cc-blackbox runs Claude Code through a local proxy so it can watch the API stream while the session is still alive. It gives you a live guard, a plain-language watch view, explicit policy checks, and a postmortem when the session is done.
+Claude Code failure usually does not look like failure at first. The terminal is still moving. Tools are still running. But the session may already be rebuilding cache every turn, retrying broken commands, or spending tokens on work that should have been restarted ten minutes ago.
 
-The point is simple: see the burn while it is happening, and stop the next bad request when you have told cc-blackbox exactly what should be stopped.
+cc-blackbox gives you two answers:
 
-The proxy, database, metrics, dashboard, and CLI run on your machine. cc-blackbox does not send telemetry to a hosted cc-blackbox service. Claude Code API traffic is proxied to Anthropic. Optional postmortem analysis asks Claude to read redacted evidence unless you disable that step.
+- **During the run:** is this session healthy, warning, critical, blocked, cooling down, or ended?
+- **After the run:** what happened, what evidence supports it, and what restart prompt should I use?
 
-![demo](docs/demo.gif)
+## Real Example
+
+In a read-only KubeAttention validation run, Claude kept moving through a fixed checklist. The session looked productive from the terminal, but the useful answer was already clear: stop, fix the blockers, then rerun validation.
+
+The postmortem found:
+
+- 15 assistant turns in 31 seconds.
+- 321K total tokens, including 299K cache-read tokens.
+- 6 failed Bash tool results.
+- Missing `go.sum` data in the nested scheduler module.
+- `kubectl` checks hitting `localhost:8080` with no real cluster available.
+- No final ship/no-ship verdict captured.
+
+![cc-blackbox postmortem showing a degraded KubeAttention validation session](docs/kubeattention-postmortem-screenshot.png)
+
+This screenshot uses local Claude JSONL evidence from that run. Proxy captures add live guard state and request-side policy checks while the session is still active.
+
+The important part is not the chart. It is the decision: **stop this session, fix the module boundary and `go.sum`, attach a real cluster, then rerun validation.**
+
+## What You Get
+
+- **A live guard:** current state, warnings, critical findings, blocks, cooldowns, and policy source.
+- **A plain watch stream:** tool use, cache state, context pressure, model route mismatch, quota burn, and session lifecycle.
+- **A redacted postmortem:** likely cause, direct/proxy/JSONL/heuristic evidence, token/cost impact, and next action.
+- **A restart prompt:** a compact prompt for a fresh Claude Code session when continuing is no longer the right move.
+- **Local-first storage:** derived metadata in local SQLite; no hosted cc-blackbox telemetry service.
+
+cc-blackbox runs Claude Code through a local proxy so it can watch the API stream while the session is still alive. The proxy, database, metrics, dashboard, and CLI run on your machine. Claude Code API traffic is proxied to Anthropic. Optional postmortem analysis asks Claude to read redacted evidence unless you disable that step.
 
 ## Quick Start
 

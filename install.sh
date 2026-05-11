@@ -1,6 +1,11 @@
 #!/usr/bin/env sh
 set -eu
 
+# macOS system tools can warn or fail when callers export C.UTF-8, which is not
+# guaranteed to exist there. The installer only handles ASCII paths and hashes.
+export LC_ALL=C
+export LANG=C
+
 repo="softcane/cc-blackbox"
 bin_name="cc-blackbox"
 install_dir="${CC_BLACKBOX_INSTALL_DIR:-$HOME/.local/bin}"

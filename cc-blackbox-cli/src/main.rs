@@ -696,12 +696,15 @@ fn bundled_compose_yaml(stack_dir: &Path) -> String {
       - "127.0.0.1:9091:9090"
     environment:
       - RUST_LOG=info
-      - CC_BLACKBOX_SESSION_BUDGET_DOLLARS=0
-      - CC_BLACKBOX_SESSION_BUDGET_TOKENS=0
-      - CC_BLACKBOX_CIRCUIT_BREAKER_THRESHOLD=5
+      - CC_BLACKBOX_SESSION_BUDGET_DOLLARS=${{CC_BLACKBOX_SESSION_BUDGET_DOLLARS:-0}}
+      - CC_BLACKBOX_SESSION_BUDGET_TOKENS=${{CC_BLACKBOX_SESSION_BUDGET_TOKENS:-0}}
+      - CC_BLACKBOX_CIRCUIT_BREAKER_THRESHOLD=${{CC_BLACKBOX_CIRCUIT_BREAKER_THRESHOLD:-0}}
+      - CC_BLACKBOX_CIRCUIT_BREAKER_COOLDOWN_SECS=${{CC_BLACKBOX_CIRCUIT_BREAKER_COOLDOWN_SECS:-0}}
+      - CC_BLACKBOX_GUARD_POLICY_PATH=/config/guard-policy.toml
       - CC_BLACKBOX_JSONL_DIR=/root/.claude/projects
     volumes:
       - cc_blackbox_data:/data
+      - "${{HOME}}/.config/cc-blackbox:/config:ro"
       - "${{HOME}}/.claude/projects:/root/.claude/projects:ro"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/health"]
@@ -8375,7 +8378,12 @@ If failures recur, restart with a shorter prompt.\n\
         assert!(yaml.contains(
             "\"/tmp/cc-blackbox test/grafana/dashboards:/var/lib/grafana/dashboards:ro\""
         ));
+        assert!(yaml.contains(
+            "- CC_BLACKBOX_SESSION_BUDGET_TOKENS=${CC_BLACKBOX_SESSION_BUDGET_TOKENS:-0}"
+        ));
+        assert!(yaml.contains("- CC_BLACKBOX_GUARD_POLICY_PATH=/config/guard-policy.toml"));
         assert!(yaml.contains("- CC_BLACKBOX_JSONL_DIR=/root/.claude/projects"));
+        assert!(yaml.contains("\"${HOME}/.config/cc-blackbox:/config:ro\""));
         assert!(yaml.contains("\"${HOME}/.claude/projects:/root/.claude/projects:ro\""));
     }
 }

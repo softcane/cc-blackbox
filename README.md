@@ -93,25 +93,25 @@ Guard findings are evidence-labeled. A model mismatch is reported as a route mis
 
 cc-blackbox fails open by default. If policy cannot load, a detector fails, or the guard is unhealthy, traffic is allowed rather than making the proxy a hard dependency.
 
-By default, blocking is conservative:
+By default, request blocking is conservative:
 
-| Signal | Default action | Can block? | When a request is blocked |
+| Signal | Default action | Stops next request? | Policy key |
 | --- | --- | --- | --- |
-| Session token budget | Block | Yes | The next request after the session exceeds `CC_BLACKBOX_SESSION_BUDGET_TOKENS` or the policy token limit. |
-| Trusted session dollar budget | Block | Yes | The next request after trusted estimated spend exceeds `CC_BLACKBOX_SESSION_BUDGET_DOLLARS` or the policy dollar limit. |
-| API error streak | Cooldown | Yes | Requests during the cooldown window after the configured number of consecutive API errors. |
-| Repeated cache rebuilds | Warn | Only if explicitly configured | Not blocked by default. |
-| Context pressure / near compaction | Warn | Only if explicitly configured | Not blocked by default. |
-| Suspected compaction loop | Warn | Only if explicitly configured | Not blocked by default. |
-| Model route mismatch | Warn | Only if explicitly configured | Not blocked by default. |
-| Tool failure streak | Warn | Only if explicitly configured | Not blocked by default. |
-| Weekly/project quota burn | Warn | No by default | Not blocked by default. |
-| No-progress / task abandonment inference | Diagnose only | No by default | Not blocked by default. |
-| Missing or ambiguous JSONL | Diagnose only | No | Never blocks live traffic. |
+| Session token budget | Block when a token limit is set | Yes | `per_session_token_budget_exceeded` |
+| Trusted session dollar budget | Block when a trusted dollar limit is set | Yes | `per_session_trusted_dollar_budget_exceeded` |
+| API error streak | Cooldown | Yes | `api_error_circuit_breaker_cooldown` |
+| Repeated cache rebuilds | Warn | No | `repeated_cache_rebuilds` |
+| Context pressure / near compaction | Warn | No | `context_near_warning_threshold` |
+| Suspected compaction loop | Warn | No | `suspected_compaction_loop` |
+| Model route mismatch | Warn | No | `model_mismatch` |
+| Tool failure streak | Warn | No | `tool_failure_streak` |
+| Weekly/project quota burn | Warn | No | `high_weekly_project_quota_burn` |
 
 Blocking happens on the next request, not by stopping a response already in flight. Response-side analysis updates guard state after the stream continues, and request-side policy enforcement decides whether the next call is forwarded upstream.
 
 That split matters. A false warning is annoying. A false block interrupts work. cc-blackbox should only block when the policy is explicit and the signal is strong enough.
+
+Only token budget, trusted dollar budget, and API cooldown stop a request today. The other signals change guard severity and postmortem output; they do not interrupt Claude Code traffic.
 
 For simple budget controls, set limits before starting the guard stack:
 
@@ -125,13 +125,51 @@ cc-blackbox guard start
 
 Token budgets are straightforward hard stops. Dollar budgets only hard-stop when the active pricing source is trusted for enforcement; otherwise they stay visible as estimates.
 
-For a TOML policy file, set `CC_BLACKBOX_GUARD_POLICY_PATH` and check what cc-blackbox loaded with `cc-blackbox guard policy`.
+For a TOML policy file, edit `~/.config/cc-blackbox/guard-policy.toml`. The bundled guard stack mounts that file into the core service as `/config/guard-policy.toml`.
+
+```bash
+mkdir -p ~/.config/cc-blackbox
+$EDITOR ~/.config/cc-blackbox/guard-policy.toml
+cc-blackbox guard start
+cc-blackbox guard policy
+```
+
+Example policy:
+
+```toml
+fail_open = true
+
+[rules.per_session_token_budget_exceeded]
+action = "block"
+limit_tokens = 1000000
+
+[rules.per_session_trusted_dollar_budget_exceeded]
+action = "block"
+limit_dollars = 5.00
+
+[rules.api_error_circuit_breaker_cooldown]
+action = "cooldown"
+threshold_count = 5
+cooldown_secs = 30
+
+[rules.context_near_warning_threshold]
+action = "critical"
+threshold_count = 90
+
+[rules.repeated_cache_rebuilds]
+action = "critical"
+
+[rules.model_mismatch]
+action = "warn"
+```
+
+`cc-blackbox guard policy` shows the effective policy, where it was loaded from, and any ignored keys. The core reads the file when policy is checked, so editing the TOML is enough for the next request/status read.
 
 ## Postmortem
 
 The guard tells you what is happening now. The postmortem tells you what happened after the session has enough evidence to be useful.
 
-Postmortems are redacted by default. They combine proxy data with local Claude Code JSONL when a confident match exists. If JSONL is missing or ambiguous, cc-blackbox says so and produces a proxy-only report instead of mixing sessions.
+Postmortems are redacted by default. They combine proxy data with local Claude Code JSONL when a confident match exists. Without a confident JSONL match, cc-blackbox produces a proxy-only report instead of mixing sessions.
 
 ```markdown
 # cc-blackbox Postmortem

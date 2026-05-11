@@ -204,6 +204,8 @@ struct RuntimeState {
     request_count: u64,
     consecutive_errors: u64,
     circuit_open_until: Option<Instant>,
+    counted_api_error_request_ids: HashSet<String>,
+    counted_api_error_request_order: VecDeque<String>,
 }
 
 impl RuntimeState {
@@ -214,6 +216,8 @@ impl RuntimeState {
             request_count: 0,
             consecutive_errors: 0,
             circuit_open_until: None,
+            counted_api_error_request_ids: HashSet::new(),
+            counted_api_error_request_order: VecDeque::new(),
         }
     }
 }
@@ -235,6 +239,7 @@ static FALLBACK_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 const GUARD_POLICY_PATH_ENV: &str = "CC_BLACKBOX_GUARD_POLICY_PATH";
 const JSONL_DIR_ENV: &str = "CC_BLACKBOX_JSONL_DIR";
 const GLOBAL_GUARD_SESSION_ID: &str = "guard_api_error_cooldown";
+const API_ERROR_REQUEST_DEDUP_LIMIT: usize = 2048;
 
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, name: &'static str) -> MutexGuard<'a, T> {
     match mutex.lock() {
@@ -299,6 +304,7 @@ fn api_cooldown_observation(
 }
 
 fn record_api_response_for_guard(
+    request_id: Option<&str>,
     status: u32,
     has_parsed_model: bool,
     policy: Option<&guard::GuardPolicy>,
@@ -309,16 +315,29 @@ fn record_api_response_for_guard(
 
     let mut runtime = lock_or_recover(&RUNTIME_STATE, "runtime_state");
     if status >= 400 {
+        if let Some(request_id) = request_id.map(str::trim).filter(|id| !id.is_empty()) {
+            if !runtime
+                .counted_api_error_request_ids
+                .insert(request_id.to_string())
+            {
+                return None;
+            }
+            runtime
+                .counted_api_error_request_order
+                .push_back(request_id.to_string());
+            while runtime.counted_api_error_request_order.len() > API_ERROR_REQUEST_DEDUP_LIMIT {
+                if let Some(old_request_id) = runtime.counted_api_error_request_order.pop_front() {
+                    runtime
+                        .counted_api_error_request_ids
+                        .remove(&old_request_id);
+                }
+            }
+        }
         runtime.consecutive_errors += 1;
-        let Some(policy) = policy else {
-            return None;
-        };
-        let Some(rule) = policy
+        let policy = policy?;
+        let rule = policy
             .rules
-            .get(&guard::RuleId::ApiErrorCircuitBreakerCooldown)
-        else {
-            return None;
-        };
+            .get(&guard::RuleId::ApiErrorCircuitBreakerCooldown)?;
         if !matches!(
             rule.action,
             guard::GuardAction::Cooldown | guard::GuardAction::Block
@@ -361,6 +380,8 @@ fn record_api_response_for_guard(
         }
     } else {
         runtime.consecutive_errors = 0;
+        runtime.counted_api_error_request_ids.clear();
+        runtime.counted_api_error_request_order.clear();
         if runtime.circuit_open_until.is_some() {
             runtime.circuit_open_until = None;
             info!("guard API error cooldown reset after successful response");
@@ -702,6 +723,9 @@ fn build_guard_status_report_json(session_filter: Option<&str>) -> Value {
         .iter()
         .filter_map(|entry| {
             let session = entry.value();
+            if !session.session_inserted {
+                return None;
+            }
             if session_filter
                 .map(|wanted| wanted != session.session_id)
                 .unwrap_or(false)
@@ -5613,9 +5637,19 @@ fn finalize_response(
     });
     let guard_policy = request_guard_policy();
     let api_cooldown_started = if acc.stream_error_type.is_some() {
-        record_api_response_for_guard(500, !model.is_empty(), guard_policy.as_ref())
+        record_api_response_for_guard(
+            Some(request_id),
+            500,
+            !model.is_empty(),
+            guard_policy.as_ref(),
+        )
     } else if acc.http_status > 0 {
-        record_api_response_for_guard(acc.http_status, !model.is_empty(), guard_policy.as_ref())
+        record_api_response_for_guard(
+            Some(request_id),
+            acc.http_status,
+            !model.is_empty(),
+            guard_policy.as_ref(),
+        )
     } else {
         None
     };
@@ -8404,14 +8438,6 @@ impl ExternalProcessor for CcBlackboxProcessor {
                         if tx.send(Ok(response)).await.is_err() {
                             break;
                         }
-                        if status >= 400 {
-                            let policy = request_guard_policy();
-                            record_api_response_for_guard(
-                                status,
-                                !model.is_empty(),
-                                policy.as_ref(),
-                            );
-                        }
                     }
                     Some(ExtProcRequest::ResponseBody(ref b)) => {
                         let response = ProcessingResponse {
@@ -8598,7 +8624,7 @@ async fn handle_watch(
     let synthetic_start = session_filter.as_ref().and_then(|sid| {
         diagnosis::SESSIONS.iter().find_map(|entry| {
             let s = entry.value();
-            if s.session_id == *sid {
+            if s.session_id == *sid && s.session_inserted {
                 Some(watch::WatchEvent::SessionStart {
                     session_id: s.session_id.clone(),
                     display_name: s.display_name.clone(),
@@ -14897,6 +14923,75 @@ action = "warn"
     }
 
     #[test]
+    fn guard_status_report_omits_uninserted_placeholder_sessions() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
+        let path = unique_test_db_path("guard-status-placeholder");
+        {
+            let conn = Connection::open(&path).expect("open test db");
+            conn.execute_batch(SCHEMA).expect("create schema");
+            conn.execute(
+                "INSERT INTO sessions (session_id, started_at, model, working_dir, first_message_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "session-status-real",
+                    "2026-05-10T00:00:00Z",
+                    "claude-haiku",
+                    "/tmp/project",
+                    "hash-real"
+                ],
+            )
+            .expect("insert persisted session");
+        }
+        let _db_path = EnvVarGuard::set("CC_BLACKBOX_DB_PATH", &path);
+        diagnosis::SESSIONS.insert(
+            4545,
+            diagnosis::SessionState {
+                session_id: "session-status-real".to_string(),
+                display_name: "project".to_string(),
+                model: "claude-haiku".to_string(),
+                initial_prompt: None,
+                created_at: Instant::now(),
+                last_activity: Instant::now(),
+                session_inserted: true,
+                cache_warning_sent: false,
+                idle_postmortem_sent: false,
+            },
+        );
+        diagnosis::SESSIONS.insert(
+            4646,
+            diagnosis::SessionState {
+                session_id: "session-status-placeholder".to_string(),
+                display_name: "project-dup".to_string(),
+                model: "claude-haiku".to_string(),
+                initial_prompt: None,
+                created_at: Instant::now(),
+                last_activity: Instant::now(),
+                session_inserted: false,
+                cache_warning_sent: false,
+                idle_postmortem_sent: false,
+            },
+        );
+
+        let report = build_guard_status_report_json(None);
+        let sessions = report["sessions"].as_array().expect("sessions array");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["session_id"], "session-status-real");
+
+        let filtered = build_guard_status_report_json(Some("session-status-placeholder"));
+        assert_eq!(filtered["overall_state"], "healthy");
+        assert!(filtered["sessions"]
+            .as_array()
+            .expect("filtered sessions array")
+            .is_empty());
+
+        diagnosis::SESSIONS.remove(&4545);
+        diagnosis::SESSIONS.remove(&4646);
+        cleanup_test_db(&path);
+    }
+
+    #[test]
     fn guard_status_report_ignores_expired_findings_for_active_state() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
         let path = unique_test_db_path("guard-status-expired-finding");
@@ -15149,11 +15244,15 @@ action = "page_the_user"
         api_rule.threshold_count = Some(2);
         api_rule.cooldown_secs = Some(60);
 
-        assert!(record_api_response_for_guard(500, true, Some(&policy)).is_none());
+        assert!(
+            record_api_response_for_guard(Some("req-api-error-1"), 500, true, Some(&policy))
+                .is_none()
+        );
         assert!(evaluate_request_guard_for_session(None, Some(&policy)).is_none());
 
-        let opened_finding = record_api_response_for_guard(500, true, Some(&policy))
-            .expect("cooldown opening should emit a persistable finding");
+        let opened_finding =
+            record_api_response_for_guard(Some("req-api-error-2"), 500, true, Some(&policy))
+                .expect("cooldown opening should emit a persistable finding");
         assert_eq!(
             opened_finding.rule_id,
             guard::RuleId::ApiErrorCircuitBreakerCooldown
@@ -15186,6 +15285,34 @@ action = "page_the_user"
     }
 
     #[test]
+    fn api_error_streak_counts_each_request_once() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
+        let mut policy = guard::GuardPolicy::default();
+        let api_rule = policy
+            .rules
+            .get_mut(&guard::RuleId::ApiErrorCircuitBreakerCooldown)
+            .expect("default api cooldown rule exists");
+        api_rule.threshold_count = Some(2);
+        api_rule.cooldown_secs = Some(60);
+
+        assert!(record_api_response_for_guard(Some("req-dup"), 401, true, Some(&policy)).is_none());
+        assert!(record_api_response_for_guard(Some("req-dup"), 401, true, Some(&policy)).is_none());
+        assert!(evaluate_request_guard_for_session(None, Some(&policy)).is_none());
+
+        let opened_finding =
+            record_api_response_for_guard(Some("req-next"), 401, true, Some(&policy))
+                .expect("second distinct failed request opens cooldown");
+        assert_eq!(
+            opened_finding.rule_id,
+            guard::RuleId::ApiErrorCircuitBreakerCooldown
+        );
+        assert!(evaluate_request_guard_for_session(None, Some(&policy)).is_some());
+
+        reset_runtime_state_for_test();
+    }
+
+    #[test]
     fn guard_status_reports_active_global_cooldown_without_known_session() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
         reset_runtime_state_for_test();
@@ -15205,7 +15332,7 @@ action = "page_the_user"
         api_rule.threshold_count = Some(1);
         api_rule.cooldown_secs = Some(60);
 
-        record_api_response_for_guard(500, true, Some(&policy));
+        record_api_response_for_guard(Some("req-global-cooldown"), 500, true, Some(&policy));
 
         let report = build_guard_status_report_json(None);
 
@@ -15236,10 +15363,10 @@ action = "page_the_user"
         api_rule.threshold_count = Some(1);
         api_rule.cooldown_secs = Some(60);
 
-        record_api_response_for_guard(500, true, Some(&policy));
+        record_api_response_for_guard(Some("req-reset-error"), 500, true, Some(&policy));
         assert!(evaluate_request_guard_for_session(None, Some(&policy)).is_some());
 
-        record_api_response_for_guard(200, true, Some(&policy));
+        record_api_response_for_guard(Some("req-reset-success"), 200, true, Some(&policy));
         assert!(evaluate_request_guard_for_session(None, Some(&policy)).is_none());
 
         reset_runtime_state_for_test();

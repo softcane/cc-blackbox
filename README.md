@@ -6,7 +6,7 @@ cc-blackbox runs Claude Code through a local proxy so it can watch the API strea
 
 The point is simple: see the burn while it is happening, and stop the next bad request when you have told cc-blackbox exactly what should be stopped.
 
-The proxy, database, metrics, dashboard, and CLI run on your machine. cc-blackbox does not send telemetry to a hosted cc-blackbox service. Claude Code API traffic is proxied to Anthropic. Claude-assisted postmortems ask Claude to analyze redacted evidence unless you disable that step.
+The proxy, database, metrics, dashboard, and CLI run on your machine. cc-blackbox does not send telemetry to a hosted cc-blackbox service. Claude Code API traffic is proxied to Anthropic. Optional postmortem analysis asks Claude to read redacted evidence unless you disable that step.
 
 ![demo](docs/demo.gif)
 
@@ -133,17 +133,16 @@ Postmortems are redacted by default. They combine proxy data with local Claude C
   direct      cache         6      cache miss followed by 62K cache creation tokens
   direct      tools         7      14 Read/Edit calls against the same redacted path
 
-## Claude Analysis
-  Status       Final - session degraded after a cache rebuild
-  Main signal  Read/Edit loop began after the cache miss
-  Risk         High - context estimate is heuristic, but the direct tool loop is enough to act
-  Next action  Restart with the summary and ask for one file-level change at a time
+## Analysis
+  What happened  The session got stuck in repeated Read/Edit work after a cache rebuild.
+  What it means  The direct tool loop is enough to act; the context estimate is heuristic.
+  What to do     Restart with the summary and ask for one file-level change at a time.
 
 ## Restart Prompt
   Continue from this summary. Make one file-level change at a time, and inspect the repeated Read/Edit path before editing.
 ```
 
-Claude-assisted synthesis is on by default. It sends only the redacted postmortem JSON to Claude for analysis. For deterministic local output without that extra Claude analysis call, run:
+Model-assisted analysis is on by default. It sends only the redacted postmortem JSON to Claude. For deterministic local output without that extra analysis call, run:
 
 ```bash
 cc-blackbox postmortem latest --no-analyze-with-claude

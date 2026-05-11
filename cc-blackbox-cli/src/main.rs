@@ -2098,7 +2098,7 @@ fn print_tagged(tag: &str, line: &str) {
 
 fn print_postmortem_progress(tag: &str, session_id: &str, analyze_with_claude: bool) {
     let work = if analyze_with_claude {
-        "fetching redacted report + running Claude analysis"
+        "fetching redacted report + running analysis"
     } else {
         "fetching redacted report"
     };
@@ -4152,7 +4152,8 @@ fn render_postmortem_terminal_for_width(markdown: &str, width: usize) -> String 
         .unwrap_or_default();
     let analysis = parsed
         .sections
-        .get("Claude Analysis")
+        .get("Analysis")
+        .or_else(|| parsed.sections.get("Claude Analysis"))
         .map(|lines| parse_key_value_section(lines))
         .unwrap_or_default();
     let restart_prompt = parsed
@@ -4259,7 +4260,7 @@ fn render_postmortem_terminal_for_width(markdown: &str, width: usize) -> String 
     if !analysis.is_empty() {
         out.push('\n');
         out.push_str(&terminal_box(
-            "Claude Analysis",
+            "Analysis",
             &analysis,
             width,
             PostmortemAccent::Info,
@@ -4641,11 +4642,26 @@ fn extract_labeled_value(line: &str, label: &str) -> Option<String> {
     }
 }
 
+fn join_analysis_parts(first: &str, second: &str) -> String {
+    let first = first.trim().trim_end_matches('.');
+    let second = second.trim();
+    if first.is_empty() {
+        second.to_string()
+    } else if second.is_empty() {
+        first.to_string()
+    } else {
+        format!("{first}. {second}")
+    }
+}
+
 fn render_claude_analysis_section(analysis: &str) -> String {
-    let mut status = None;
-    let mut main_signal = None;
-    let mut risk = None;
-    let mut next_action = None;
+    let mut what_happened = None;
+    let mut what_it_means = None;
+    let mut what_to_do = None;
+    let mut legacy_status = None;
+    let mut legacy_main_signal = None;
+    let mut legacy_risk = None;
+    let mut legacy_next_action = None;
     let mut restart_lines = Vec::new();
     let mut in_restart_prompt = false;
     let mut fallback_lines = Vec::new();
@@ -4655,7 +4671,9 @@ fn render_claude_analysis_section(analysis: &str) -> String {
         if line.is_empty() || line.starts_with("```") {
             continue;
         }
-        if line.eq_ignore_ascii_case("## Claude Analysis") {
+        if line.eq_ignore_ascii_case("## Analysis")
+            || line.eq_ignore_ascii_case("## Claude Analysis")
+        {
             in_restart_prompt = false;
             continue;
         }
@@ -4672,17 +4690,29 @@ fn render_claude_analysis_section(analysis: &str) -> String {
             continue;
         }
 
-        if status.is_none() {
-            status = extract_labeled_value(line, "Status");
+        if what_happened.is_none() {
+            what_happened = extract_labeled_value(line, "What happened");
         }
-        if main_signal.is_none() {
-            main_signal = extract_labeled_value(line, "Main signal");
+        if what_it_means.is_none() {
+            what_it_means = extract_labeled_value(line, "What it means")
+                .or_else(|| extract_labeled_value(line, "Why it matters"));
         }
-        if risk.is_none() {
-            risk = extract_labeled_value(line, "Risk");
+        if what_to_do.is_none() {
+            what_to_do = extract_labeled_value(line, "What to do")
+                .or_else(|| extract_labeled_value(line, "Next action"))
+                .or_else(|| extract_labeled_value(line, "Next"));
         }
-        if next_action.is_none() {
-            next_action = extract_labeled_value(line, "Next action")
+        if legacy_status.is_none() {
+            legacy_status = extract_labeled_value(line, "Status");
+        }
+        if legacy_main_signal.is_none() {
+            legacy_main_signal = extract_labeled_value(line, "Main signal");
+        }
+        if legacy_risk.is_none() {
+            legacy_risk = extract_labeled_value(line, "Risk");
+        }
+        if legacy_next_action.is_none() {
+            legacy_next_action = extract_labeled_value(line, "Next action")
                 .or_else(|| extract_labeled_value(line, "Next"));
         }
         if fallback_lines.len() < 2 {
@@ -4701,32 +4731,40 @@ fn render_claude_analysis_section(analysis: &str) -> String {
         Some(restart_lines.join(" "))
     };
 
-    if next_action.is_none() {
-        next_action = restart_prompt.clone();
+    if what_happened.is_none() {
+        what_happened = match (legacy_status, legacy_main_signal) {
+            (Some(status), Some(main_signal)) => Some(join_analysis_parts(&status, &main_signal)),
+            (Some(status), None) => Some(status),
+            (None, Some(main_signal)) => Some(main_signal),
+            (None, None) => None,
+        };
+    }
+    if what_it_means.is_none() {
+        what_it_means = legacy_risk;
+    }
+    if what_to_do.is_none() {
+        what_to_do = legacy_next_action.or_else(|| restart_prompt.clone());
     }
 
     let mut rows = Vec::new();
-    if let Some(value) = status {
-        rows.push(("Status", value));
+    if let Some(value) = what_happened {
+        rows.push(("What happened", value));
     }
-    if let Some(value) = main_signal {
-        rows.push(("Main signal", value));
+    if let Some(value) = what_it_means {
+        rows.push(("What it means", value));
     }
-    if let Some(value) = risk {
-        rows.push(("Risk", value));
-    }
-    if let Some(value) = next_action {
-        rows.push(("Next action", value));
+    if let Some(value) = what_to_do {
+        rows.push(("What to do", value));
     }
     if rows.is_empty() && !fallback_lines.is_empty() {
-        rows.push(("Summary", fallback_lines.join(" ")));
+        rows.push(("What happened", fallback_lines.join(" ")));
     }
     if rows.is_empty() {
         return String::new();
     }
 
     let mut out = String::new();
-    out.push_str("## Claude Analysis\n");
+    out.push_str("## Analysis\n");
     push_key_value_table(&mut out, rows);
     out.push_str("## Restart Prompt\n");
     out.push_str(&format!(
@@ -4755,19 +4793,20 @@ fn build_claude_analysis_prompt(report: &serde_json::Value) -> String {
     format!(
         "You are cc-blackbox's postmortem analyst.\n\
 Use only the redacted JSON evidence below. Do not invent facts, files, commands, or raw prompts.\n\
-Write compact GitHub-flavored Markdown for a tmux pane. Keep it under 160 words.\n\
+Write compact GitHub-flavored Markdown for a tmux pane. Keep it under 120 words.\n\
+Write for the person watching the run. Use plain, direct language. Tell them what happened, whether they need to act, and what to do next.\n\
+Avoid jargon such as signal, runway, or degradation unless it appears in the evidence and is needed.\n\
 Use aligned key/value rows, not Markdown pipe tables. No code fences. No extra caveat block, no extra prose, no bullet lists.\n\
 Preserve direct versus heuristic evidence labels. Do not turn heuristic, inferred, likely, or suspected causes into direct facts.\n\
 When `is_heuristic` is true or evidence type is `heuristic`, mark causal wording with `[heuristic]`, likely, suspected, or inferred. Direct evidence can stay direct.\n\
 Include exactly these sections:\n\
-## Claude Analysis\n\
-Status       partial or final, in plain language\n\
-Main signal  the one signal that matters most\n\
-Risk         should the user care now?\n\
-Next action  the next concrete action\n\
+## Analysis\n\
+What happened  one plain sentence; if partial, say the session is still running\n\
+What it means  one plain sentence about whether the user needs to care now\n\
+What to do     one concrete next step; say \"Keep going.\" when no intervention is needed\n\
 ## Restart Prompt\n\
 One short prompt the user can paste into a fresh Claude Code session, or \"No restart needed.\".\n\
-Preserve caveats briefly inside the key/value rows only: costs are estimates, context runway is heuristic, and redacted evidence may omit details.\n\n\
+Keep caveats brief inside the key/value rows only: costs are estimates, context projections are heuristic, and redacted evidence may omit details.\n\n\
 Redacted cc-blackbox postmortem JSON:\n```json\n{bundle}\n```"
     )
 }
@@ -4808,7 +4847,7 @@ async fn run_claude_postmortem_analysis_with_command(
 
     let output = tokio::time::timeout(timeout, child.wait_with_output())
         .await
-        .map_err(|_| "claude analysis timed out".to_string())?
+        .map_err(|_| "analysis timed out".to_string())?
         .map_err(|err| format!("failed to wait for claude: {err}"))?;
 
     if !output.status.success() {
@@ -4864,7 +4903,7 @@ async fn render_postmortem_markdown_with_optional_analysis(
                 return (
                     markdown,
                     Some(format!(
-                        "Claude analysis skipped because redacted evidence could not be fetched: {err}"
+                        "Analysis skipped because redacted evidence could not be fetched: {err}"
                     )),
                 );
             }
@@ -4876,10 +4915,7 @@ async fn render_postmortem_markdown_with_optional_analysis(
             append_claude_analysis_section(&mut markdown, &analysis);
             (markdown, None)
         }
-        Err(err) => (
-            markdown,
-            Some(format!("Claude analysis unavailable: {err}")),
-        ),
+        Err(err) => (markdown, Some(format!("Analysis unavailable: {err}"))),
     }
 }
 
@@ -4902,7 +4938,7 @@ async fn render_watch_postmortem_markdown_with_optional_analysis(
                 return (
                     render_watch_postmortem_markdown(report, None),
                     Some(format!(
-                        "Claude analysis skipped because redacted evidence could not be fetched: {err}"
+                        "Analysis skipped because redacted evidence could not be fetched: {err}"
                     )),
                 );
             }
@@ -4916,7 +4952,7 @@ async fn render_watch_postmortem_markdown_with_optional_analysis(
         ),
         Err(err) => (
             render_watch_postmortem_markdown(report, None),
-            Some(format!("Claude analysis unavailable: {err}")),
+            Some(format!("Analysis unavailable: {err}")),
         ),
     }
 }
@@ -4954,7 +4990,7 @@ async fn fetch_run_final_postmortem_markdown_with_retry(
 async fn render_run_final_postmortem(base_url: &str) {
     eprintln!(
         "{}",
-        "Postmortem in progress: waiting for final report + running Claude analysis..."
+        "Postmortem in progress: waiting for final report + running analysis..."
             .cyan()
             .bold()
     );
@@ -5328,7 +5364,7 @@ async fn fetch_postmortem_json_with_retry(
 fn postmortem_progress_message(target: &str, redact: bool, analyze_with_claude: bool) -> String {
     let report_kind = if redact { "redacted" } else { "local" };
     let work = if analyze_with_claude {
-        format!("fetching {report_kind} report + running Claude analysis")
+        format!("fetching {report_kind} report + running analysis")
     } else {
         format!("fetching {report_kind} report")
     };
@@ -6926,7 +6962,7 @@ mod tests {
     fn postmortem_progress_message_is_single_combined_line() {
         assert_eq!(
             postmortem_progress_message("last", true, true),
-            "Postmortem in progress: fetching redacted report + running Claude analysis for last..."
+            "Postmortem in progress: fetching redacted report + running analysis for last..."
         );
         assert_eq!(
             postmortem_progress_message("session_1234_abcd", false, false),
@@ -7405,11 +7441,14 @@ No restart needed.\n\
 If failures recur, restart with a shorter prompt.\n\
 ```",
         );
-        assert!(markdown.contains("## Claude Analysis"));
-        assert!(markdown.contains("Status       Partial"));
-        assert!(markdown.contains("Main signal  Cache hit ratio stayed high"));
-        assert!(markdown.contains("Risk         Low"));
-        assert!(markdown.contains("Next action  No restart needed."));
+        assert!(markdown.contains("## Analysis"));
+        assert!(!markdown.contains("## Claude Analysis"));
+        assert!(markdown.contains(
+            "What happened  Partial - no degradation detected. Cache hit ratio stayed high"
+        ));
+        assert!(markdown.contains("What it means  Low"));
+        assert!(markdown.contains("What to do"));
+        assert!(markdown.contains("No restart needed."));
         assert!(markdown.contains("## Restart Prompt"));
         assert!(markdown.contains("No restart needed."));
         assert!(!markdown.contains("```"));
@@ -7466,11 +7505,10 @@ If failures recur, restart with a shorter prompt.\n\
   ----------  ------------  -----  ------\n\
   direct      tools         7      14 Read/Edit calls against the same redacted path\n\
 \n\
-## Claude Analysis\n\
-  Status       Final - session degraded after repeated failures\n\
-  Main signal  Tool failure loop\n\
-  Risk         High - restart is cheaper\n\
-  Next action  Restart with the summary\n\
+## Analysis\n\
+  What happened  The session hit a tool failure loop after repeated failures.\n\
+  What it means  Restarting is cheaper than continuing this run.\n\
+  What to do     Restart with the summary.\n\
 ## Restart Prompt\n\
   Continue from this summary and inspect the failing command before editing.\n";
 
@@ -7484,7 +7522,10 @@ If failures recur, restart with a shorter prompt.\n\
         assert!(terminal.contains("Impact: Likely waste: 76K tokens, $1.84"));
         assert!(terminal.contains("Priority: High"));
         assert!(terminal.contains("Evidence"));
-        assert!(terminal.contains("Claude Analysis"));
+        assert!(terminal.contains("Analysis"));
+        assert!(!terminal.contains("Claude Analysis"));
+        assert!(terminal.contains("What happened: The session hit a tool failure loop"));
+        assert!(terminal.contains("What to do: Restart with the summary."));
         assert!(terminal.contains("Restart: Continue from this summary"));
         assert!(!terminal.contains("Finding 1"));
         assert!(!terminal.contains("## Snapshot"));
@@ -7548,11 +7589,14 @@ If failures recur, restart with a shorter prompt.\n\
         assert!(prompt.contains("Preserve direct versus heuristic evidence labels"));
         assert!(prompt.contains("Do not turn heuristic"));
         assert!(prompt.contains("Write compact GitHub-flavored Markdown for a tmux pane"));
+        assert!(prompt.contains("Write for the person watching the run"));
         assert!(prompt.contains("Use aligned key/value rows"));
         assert!(prompt.contains("No code fences"));
-        assert!(prompt.contains("Status       partial or final"));
-        assert!(prompt.contains("Main signal  the one signal that matters most"));
-        assert!(prompt.contains("## Claude Analysis"));
+        assert!(prompt.contains("What happened  one plain sentence"));
+        assert!(prompt.contains("What it means  one plain sentence"));
+        assert!(prompt.contains("What to do"));
+        assert!(prompt.contains("Keep going."));
+        assert!(prompt.contains("## Analysis"));
         assert!(prompt.contains("## Restart Prompt"));
         assert!(prompt.contains("\"redacted\": true"));
         assert!(prompt.contains("Initial prompt captured"));
@@ -7564,8 +7608,9 @@ If failures recur, restart with a shorter prompt.\n\
             "fake-claude",
             concat!(
                 "cat >/dev/null\n",
-                "printf '%s\\n' '## Claude Analysis'\n",
-                "printf '%s\\n' '- Likely cause: cache rebuild'\n",
+                "printf '%s\\n' '## Analysis'\n",
+                "printf '%s\\n' 'What happened  Cache rebuilt during the run.'\n",
+                "printf '%s\\n' 'What to do     Start fresh with a summary.'\n",
                 "printf '%s\\n' '## Restart Prompt'\n",
                 "printf '%s\\n' 'Start fresh with a summary.'\n",
             ),
@@ -7584,8 +7629,8 @@ If failures recur, restart with a shorter prompt.\n\
         .await
         .expect("fake claude analysis");
 
-        assert!(analysis.contains("## Claude Analysis"));
-        assert!(analysis.contains("cache rebuild"));
+        assert!(analysis.contains("## Analysis"));
+        assert!(analysis.contains("Cache rebuilt"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -7646,7 +7691,7 @@ If failures recur, restart with a shorter prompt.\n\
         .await
         .expect_err("timed out claude should fail");
 
-        assert!(err.contains("claude analysis timed out"));
+        assert!(err.contains("analysis timed out"));
         let _ = fs::remove_dir_all(dir);
     }
 

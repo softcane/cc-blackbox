@@ -26,7 +26,7 @@ The postmortem found:
 
 This screenshot uses local Claude JSONL evidence from that run. Proxy captures add live guard state and request-side policy checks while the session is still active.
 
-The important part is not the chart. It is the decision: **stop this session, fix the module boundary and `go.sum`, attach a real cluster, then rerun validation.**
+The postmortem gives a concrete next step: **stop this session, fix the module boundary and `go.sum`, attach a real cluster, then rerun validation.**
 
 ## What You Get
 

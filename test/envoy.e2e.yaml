@@ -5,12 +5,13 @@
 admin:
   address:
     socket_address:
-      address: 0.0.0.0
+      address: 127.0.0.1
       port_value: 9901
 
 static_resources:
   listeners:
     - name: anthropic_listener
+      per_connection_buffer_limit_bytes: 67108864
       address:
         socket_address:
           address: 0.0.0.0
@@ -22,7 +23,13 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: anthropic_proxy
                 codec_type: AUTO
-                stream_idle_timeout: 300s
+                use_remote_address: true
+                internal_address_config:
+                  cidr_ranges: []
+                max_request_headers_kb: 64
+                request_headers_timeout: 10s
+                request_timeout: 60s
+                stream_idle_timeout: 600s
 
                 route_config:
                   name: anthropic_route
@@ -31,11 +38,32 @@ static_resources:
                       domains: ["*"]
                       routes:
                         - match:
-                            prefix: "/"
+                            path: "/v1/messages"
+                            headers:
+                              - name: ":method"
+                                string_match:
+                                  exact: "POST"
                           route:
                             cluster: anthropic_upstream
-                            timeout: 300s
+                            timeout: 0s
+                            idle_timeout: 600s
                             host_rewrite_literal: fake-anthropic
+                        - match:
+                            path: "/v1/messages/count_tokens"
+                            headers:
+                              - name: ":method"
+                                string_match:
+                                  exact: "POST"
+                          route:
+                            cluster: anthropic_upstream
+                            timeout: 60s
+                            host_rewrite_literal: fake-anthropic
+                        - match:
+                            prefix: "/"
+                          direct_response:
+                            status: 404
+                            body:
+                              inline_string: "cc-blackbox only forwards Anthropic /v1/messages requests\n"
 
                 access_log:
                   - name: envoy.access_loggers.stdout
@@ -78,6 +106,7 @@ static_resources:
       type: STRICT_DNS
       dns_lookup_family: V4_ONLY
       connect_timeout: 2s
+      per_connection_buffer_limit_bytes: 67108864
       load_assignment:
         cluster_name: anthropic_upstream
         endpoints:

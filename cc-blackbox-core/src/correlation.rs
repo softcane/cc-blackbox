@@ -133,7 +133,7 @@ fn strong_prompt_match(
             && proxy.prompt_correlation_hash == candidate.prompt_correlation_hash)
 }
 
-fn candidate_matches_proxy(
+pub fn candidate_matches_proxy(
     proxy: &ProxySessionCorrelation,
     candidate: &JsonlSessionCorrelation,
 ) -> bool {

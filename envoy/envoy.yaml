@@ -4,12 +4,17 @@
 admin:
   address:
     socket_address:
-      address: 0.0.0.0
+      # Keep Envoy's admin API private to the container. It should not be
+      # reachable from other containers or from an accidental host port publish.
+      address: 127.0.0.1
       port_value: 9901
 
 static_resources:
   listeners:
     - name: anthropic_listener
+      # Request bodies are buffered for session identity, so set an explicit
+      # ceiling instead of relying on Envoy defaults. Responses remain streamed.
+      per_connection_buffer_limit_bytes: 67108864
       address:
         socket_address:
           address: 0.0.0.0
@@ -21,9 +26,18 @@ static_resources:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                 stat_prefix: anthropic_proxy
                 codec_type: AUTO
+                use_remote_address: true
+                # Treat all downstream IPs as external. The proxy is host-loopback
+                # published, so Docker bridge RFC1918 addresses should not gain
+                # trusted internal header semantics.
+                internal_address_config:
+                  cidr_ranges: []
+                max_request_headers_kb: 64
+                request_headers_timeout: 10s
+                request_timeout: 60s
 
-                # SSE streaming: don't idle-timeout the stream.
-                stream_idle_timeout: 300s
+                # SSE streaming: allow long active streams, but close dead ones.
+                stream_idle_timeout: 600s
 
                 route_config:
                   name: anthropic_route
@@ -32,11 +46,34 @@ static_resources:
                       domains: ["*"]
                       routes:
                         - match:
-                            prefix: "/"
+                            path: "/v1/messages"
+                            headers:
+                              - name: ":method"
+                                string_match:
+                                  exact: "POST"
                           route:
                             cluster: anthropic_upstream
-                            timeout: 300s
+                            # Route timeout is incompatible with long streaming
+                            # responses; stream_idle_timeout handles dead peers.
+                            timeout: 0s
+                            idle_timeout: 600s
                             host_rewrite_literal: api.anthropic.com
+                        - match:
+                            path: "/v1/messages/count_tokens"
+                            headers:
+                              - name: ":method"
+                                string_match:
+                                  exact: "POST"
+                          route:
+                            cluster: anthropic_upstream
+                            timeout: 60s
+                            host_rewrite_literal: api.anthropic.com
+                        - match:
+                            prefix: "/"
+                          direct_response:
+                            status: 404
+                            body:
+                              inline_string: "cc-blackbox only forwards Anthropic /v1/messages requests\n"
 
                 # Access log: every request with status, duration, upstream info.
                 access_log:
@@ -84,6 +121,7 @@ static_resources:
       type: LOGICAL_DNS
       dns_lookup_family: V4_ONLY
       connect_timeout: 10s
+      per_connection_buffer_limit_bytes: 67108864
       load_assignment:
         cluster_name: anthropic_upstream
         endpoints:

@@ -424,6 +424,7 @@ const DEFAULT_CORE_IMAGE: &str = concat!(
     "ghcr.io/softcane/cc-blackbox-core:v",
     env!("CARGO_PKG_VERSION")
 );
+const DEFAULT_ENVOY_IMAGE: &str = "envoyproxy/envoy:v1.32.7";
 const BUNDLED_ENVOY_YAML: &str = include_str!("../../envoy/envoy.yaml");
 const BUNDLED_PROMETHEUS_YAML: &str = include_str!("../../prometheus/prometheus.yml");
 const BUNDLED_GRAFANA_DASHBOARD_PROVIDER_YAML: &str =
@@ -673,7 +674,7 @@ fn bundled_compose_yaml(stack_dir: &Path) -> String {
     format!(
         r#"services:
   envoy:
-    image: envoyproxy/envoy:v1.32-latest
+    image: {DEFAULT_ENVOY_IMAGE}
     volumes:
       - {envoy_config}
     ports:
@@ -8367,6 +8368,7 @@ If failures recur, restart with a shorter prompt.\n\
     fn bundled_compose_uses_release_image_and_quoted_volume_mounts() {
         let yaml = super::bundled_compose_yaml(Path::new("/tmp/cc-blackbox test"));
         assert!(yaml.contains(super::DEFAULT_CORE_IMAGE));
+        assert!(yaml.contains(super::DEFAULT_ENVOY_IMAGE));
         assert!(
             yaml.contains("\"/tmp/cc-blackbox test/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro\"")
         );

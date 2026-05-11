@@ -1044,6 +1044,19 @@ CREATE TABLE IF NOT EXISTS session_recall (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
+CREATE TABLE IF NOT EXISTS session_jsonl_correlations (
+    proxy_session_id           TEXT PRIMARY KEY,
+    jsonl_session_id           TEXT NOT NULL,
+    status                     TEXT NOT NULL,
+    confidence                 REAL NOT NULL,
+    matched_at                 TEXT NOT NULL,
+    jsonl_started_at           TEXT,
+    jsonl_last_activity_at     TEXT,
+    jsonl_request_count        INTEGER,
+    jsonl_turn_count           INTEGER,
+    FOREIGN KEY (proxy_session_id) REFERENCES sessions(session_id)
+);
+
 CREATE TABLE IF NOT EXISTS billing_reconciliations (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id          TEXT NOT NULL,
@@ -1076,6 +1089,8 @@ CREATE INDEX IF NOT EXISTS idx_tool_outcomes_session ON tool_outcomes(session_id
 CREATE INDEX IF NOT EXISTS idx_skill_events_session ON skill_events(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_mcp_events_session ON mcp_events(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_session_recall_session ON session_recall(session_id);
+CREATE INDEX IF NOT EXISTS idx_session_jsonl_correlations_jsonl
+    ON session_jsonl_correlations(jsonl_session_id);
 CREATE INDEX IF NOT EXISTS idx_guard_findings_session ON guard_findings(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_billing_reconciliations_session_imported
     ON billing_reconciliations(session_id, imported_at DESC);
@@ -3481,6 +3496,11 @@ struct PostmortemJsonlEnrichment {
     findings: Vec<guard::GuardFinding>,
 }
 
+#[derive(Clone, Debug)]
+struct StoredJsonlCorrelation {
+    jsonl_session_id: String,
+}
+
 fn postmortem_session_allows_jsonl_enrichment(session: &PostmortemSessionRow) -> bool {
     if session.ended_at.is_some() {
         return true;
@@ -3586,6 +3606,90 @@ fn jsonl_matched_status(proxy_session_id: &str, jsonl_session_id: &str) -> Value
     })
 }
 
+fn load_stored_jsonl_correlation(
+    conn: &Connection,
+    proxy_session_id: &str,
+) -> rusqlite::Result<Option<StoredJsonlCorrelation>> {
+    if !table_exists(conn, "session_jsonl_correlations")? {
+        return Ok(None);
+    }
+
+    conn.query_row(
+        "SELECT jsonl_session_id \
+         FROM session_jsonl_correlations \
+         WHERE proxy_session_id = ?1 AND status = 'matched'",
+        rusqlite::params![proxy_session_id],
+        |row| {
+            Ok(StoredJsonlCorrelation {
+                jsonl_session_id: row.get(0)?,
+            })
+        },
+    )
+    .optional()
+}
+
+fn persist_jsonl_correlation(
+    conn: &Connection,
+    proxy_session_id: &str,
+    summary: &jsonl::JsonlDerivedSession,
+) -> rusqlite::Result<()> {
+    let jsonl_started_at = (summary.started_at_epoch_secs > 0)
+        .then(|| epoch_to_iso8601(summary.started_at_epoch_secs));
+    let jsonl_last_activity_at = (summary.last_activity_at_epoch_secs > 0)
+        .then(|| epoch_to_iso8601(summary.last_activity_at_epoch_secs));
+    conn.execute(
+        "INSERT INTO session_jsonl_correlations (
+            proxy_session_id, jsonl_session_id, status, confidence, matched_at,
+            jsonl_started_at, jsonl_last_activity_at, jsonl_request_count, jsonl_turn_count
+        ) VALUES (?1, ?2, 'matched', 0.95, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(proxy_session_id) DO UPDATE SET
+            jsonl_session_id = excluded.jsonl_session_id,
+            status = excluded.status,
+            confidence = excluded.confidence,
+            matched_at = excluded.matched_at,
+            jsonl_started_at = excluded.jsonl_started_at,
+            jsonl_last_activity_at = excluded.jsonl_last_activity_at,
+            jsonl_request_count = excluded.jsonl_request_count,
+            jsonl_turn_count = excluded.jsonl_turn_count",
+        rusqlite::params![
+            proxy_session_id,
+            &summary.jsonl_session_id,
+            now_iso8601(),
+            jsonl_started_at,
+            jsonl_last_activity_at,
+            summary.request_count,
+            summary.assistant_turn_count,
+        ],
+    )?;
+    Ok(())
+}
+
+fn stored_jsonl_match(
+    conn: &Connection,
+    proxy: &correlation::ProxySessionCorrelation,
+    candidates: &[jsonl::JsonlDerivedSession],
+) -> Option<jsonl::JsonlDerivedSession> {
+    let stored = match load_stored_jsonl_correlation(conn, &proxy.session_id) {
+        Ok(stored) => stored?,
+        Err(err) => {
+            debug!(
+                session_id = %proxy.session_id,
+                error = %err,
+                "failed to load stored JSONL correlation"
+            );
+            return None;
+        }
+    };
+
+    candidates
+        .iter()
+        .find(|candidate| {
+            candidate.jsonl_session_id == stored.jsonl_session_id
+                && correlation::candidate_matches_proxy(proxy, &candidate.correlation())
+        })
+        .cloned()
+}
+
 fn jsonl_ambiguous_status(proxy_session_id: &str, candidate_count: usize) -> Value {
     serde_json::json!({
         "source": "jsonl",
@@ -3619,6 +3723,7 @@ fn jsonl_tool_failure_finding(
 }
 
 fn load_postmortem_jsonl_enrichment(
+    conn: &Connection,
     session: &PostmortemSessionRow,
     turn_count: u64,
 ) -> PostmortemJsonlEnrichment {
@@ -3637,6 +3742,17 @@ fn load_postmortem_jsonl_enrichment(
         .map(jsonl::JsonlDerivedSession::correlation)
         .collect::<Vec<_>>();
 
+    if let Some(summary) = stored_jsonl_match(conn, &proxy, &candidates) {
+        let findings = jsonl_tool_failure_finding(&session.session_id, &summary)
+            .into_iter()
+            .collect::<Vec<_>>();
+        return PostmortemJsonlEnrichment {
+            status: jsonl_matched_status(&proxy.session_id, &summary.jsonl_session_id),
+            summary: Some(summary),
+            findings,
+        };
+    }
+
     match correlation::correlate_jsonl_session(&proxy, &correlations) {
         correlation::JsonlEnrichmentStatus::Matched {
             proxy_session_id,
@@ -3650,6 +3766,16 @@ fn load_postmortem_jsonl_enrichment(
                 .and_then(|summary| jsonl_tool_failure_finding(&session.session_id, summary))
                 .into_iter()
                 .collect::<Vec<_>>();
+            if let Some(summary) = &summary {
+                if let Err(err) = persist_jsonl_correlation(conn, &session.session_id, summary) {
+                    debug!(
+                        session_id = %session.session_id,
+                        jsonl_session_id = %summary.jsonl_session_id,
+                        error = %err,
+                        "failed to persist JSONL correlation"
+                    );
+                }
+            }
             PostmortemJsonlEnrichment {
                 status: jsonl_matched_status(&proxy_session_id, &jsonl_session_id),
                 summary,
@@ -3966,7 +4092,7 @@ fn build_postmortem_response_from_db(
     let billing = load_latest_billing_reconciliations(conn, &session_ids)
         .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?
         .remove(&session.session_id);
-    let jsonl_enrichment = load_postmortem_jsonl_enrichment(&session, turns.len() as u64);
+    let jsonl_enrichment = load_postmortem_jsonl_enrichment(conn, &session, turns.len() as u64);
     for finding in &jsonl_enrichment.findings {
         let _ = persist_guard_finding_if_absent(conn, finding);
     }
@@ -13179,6 +13305,15 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("jsonl-match")
         );
+        let persisted_jsonl_id: String = conn
+            .query_row(
+                "SELECT jsonl_session_id FROM session_jsonl_correlations \
+                 WHERE proxy_session_id = ?1",
+                rusqlite::params!["session-jsonl-match"],
+                |row| row.get(0),
+            )
+            .expect("persisted JSONL correlation");
+        assert_eq!(persisted_jsonl_id, "jsonl-match");
         let findings = json
             .get("findings")
             .and_then(serde_json::Value::as_array)
@@ -13334,6 +13469,108 @@ mod tests {
     }
 
     #[test]
+    fn stored_jsonl_correlation_disambiguates_later_ambiguous_scan() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let jsonl_dir = std::env::temp_dir().join(format!(
+            "cc-blackbox-jsonl-saved-correlation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&jsonl_dir).expect("create jsonl dir");
+        let _jsonl_dir = EnvVarGuard::set(
+            "CC_BLACKBOX_JSONL_DIR",
+            jsonl_dir.to_str().expect("jsonl dir is utf-8"),
+        );
+        let conn = create_full_test_db();
+        let raw_prompt = "RAW_SAVED_MAPPING_PROMPT_201 summarize structure";
+        let first_message_hash = super::hash_text_hex(raw_prompt);
+        conn.execute(
+            "INSERT INTO sessions (
+                session_id, started_at, last_activity_at, ended_at, model, working_dir,
+                first_message_hash, initial_prompt
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
+            rusqlite::params![
+                "session-jsonl-saved-map",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:01:00Z",
+                "2026-01-01T00:02:00Z",
+                "claude-haiku-4-5-20251001",
+                "/tmp/cc-blackbox-jsonl",
+                first_message_hash,
+            ],
+        )
+        .expect("insert session");
+        insert_request(
+            &conn,
+            "req-jsonl-saved-map",
+            "session-jsonl-saved-map",
+            "2026-01-01T00:00:30Z",
+            "claude-haiku-4-5-20251001",
+            500,
+            100,
+            0,
+            0,
+        );
+        insert_turn_snapshot(
+            &conn,
+            "session-jsonl-saved-map",
+            1,
+            "2026-01-01T00:01:00Z",
+            0,
+            0,
+            100,
+            0.0,
+            0.02,
+            None,
+        );
+
+        let jsonl_for = |jsonl_session_id: &str| {
+            format!(
+                r#"{{"type":"user","sessionId":"{jsonl_session_id}","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:00Z","message":{{"role":"user","content":[{{"type":"text","text":"{raw_prompt}"}}]}}}}
+{{"type":"assistant","sessionId":"{jsonl_session_id}","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:01:00Z","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"Glob","input":{{"pattern":"*.rs"}}}}],"usage":{{"input_tokens":10,"output_tokens":5}}}}}}
+"#
+            )
+        };
+        fs::write(jsonl_dir.join("one.jsonl"), jsonl_for("jsonl-saved-one"))
+            .expect("write first jsonl fixture");
+
+        let first_json = build_postmortem_response_from_db(&conn, "session-jsonl-saved-map", true)
+            .expect("first postmortem");
+        assert_eq!(
+            first_json
+                .pointer("/enrichment_status/jsonl_session_id")
+                .and_then(|value| value.as_str()),
+            Some("jsonl-saved-one")
+        );
+
+        fs::write(jsonl_dir.join("two.jsonl"), jsonl_for("jsonl-saved-two"))
+            .expect("write second jsonl fixture");
+        let second_json = build_postmortem_response_from_db(&conn, "session-jsonl-saved-map", true)
+            .expect("second postmortem");
+
+        assert_eq!(
+            second_json
+                .pointer("/enrichment_status/status")
+                .and_then(|value| value.as_str()),
+            Some("matched")
+        );
+        assert_eq!(
+            second_json
+                .pointer("/enrichment_status/jsonl_session_id")
+                .and_then(|value| value.as_str()),
+            Some("jsonl-saved-one")
+        );
+        assert!(second_json
+            .pointer("/enrichment_status/candidate_count")
+            .is_none());
+
+        fs::remove_dir_all(jsonl_dir).expect("remove jsonl dir");
+    }
+
+    #[test]
     fn ambiguous_jsonl_match_stays_proxy_only_without_jsonl_findings() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
         let jsonl_dir = std::env::temp_dir().join(format!(
@@ -13470,13 +13707,9 @@ mod tests {
         )
         .expect("insert active session");
         let jsonl = format!(
-            "{}\n{}\n",
-            format!(
-                r#"{{"type":"user","sessionId":"raw-jsonl-active-match-103","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"{now_iso}","message":{{"role":"user","content":[{{"type":"text","text":"{raw_prompt}"}}]}}}}"#
-            ),
-            format!(
-                r#"{{"type":"assistant","sessionId":"raw-jsonl-active-match-103","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"{now_iso}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{{"command":"cargo test -- RAW_ACTIVE_COMMAND_102"}}}}]}}}}"#
-            )
+            r#"{{"type":"user","sessionId":"raw-jsonl-active-match-103","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"{now_iso}","message":{{"role":"user","content":[{{"type":"text","text":"{raw_prompt}"}}]}}}}
+{{"type":"assistant","sessionId":"raw-jsonl-active-match-103","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"{now_iso}","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{{"command":"cargo test -- RAW_ACTIVE_COMMAND_102"}}}}]}}}}
+"#
         );
         fs::write(jsonl_dir.join("active.jsonl"), jsonl).expect("write jsonl fixture");
 
@@ -14682,7 +14915,7 @@ mod tests {
             "file_contents",
         ] {
             assert!(
-                body.contains(forbidden) == false,
+                !body.contains(forbidden),
                 "block response leaked content field {forbidden}"
             );
         }

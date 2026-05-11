@@ -373,6 +373,17 @@ grep -q "$SKILL_A" <<<"$watch_output" \
     && pass "/watch replays hook skill events" \
     || fail "/watch did not replay $SKILL_A; output: $watch_output"
 
+info "Checking Envoy route guardrails..."
+unknown_status=$(curl -sS -o /dev/null -w "%{http_code}" "$ENVOY_URL/")
+[ "$unknown_status" = "404" ] \
+    && pass "Envoy rejects unexpected paths" \
+    || fail "Envoy unexpected path returned HTTP $unknown_status"
+
+wrong_method_status=$(curl -sS -o /dev/null -w "%{http_code}" "$ENVOY_URL/v1/messages")
+[ "$wrong_method_status" = "404" ] \
+    && pass "Envoy rejects non-POST message requests" \
+    || fail "Envoy GET /v1/messages returned HTTP $wrong_method_status"
+
 info "Sending fake Anthropic streaming turns through Envoy..."
 send_proxy_turn "proxy-a" "$SKILL_A"
 send_proxy_turn "proxy-b" "$SKILL_B"

@@ -3184,6 +3184,10 @@ fn table_cell(value: &str) -> String {
     truncate_for_box(&single_line, 140)
 }
 
+fn full_table_cell(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn column_widths_for(headers: &[&str]) -> Vec<usize> {
     match headers {
         ["Type", "Signal", "Turn", "Detail"] => vec![10, 12, 5, 0],
@@ -3269,6 +3273,14 @@ fn push_table_row(out: &mut String, cells: &[String]) {
 }
 
 fn push_key_value_table(out: &mut String, rows: Vec<(&str, String)>) {
+    push_key_value_table_with_cells(out, rows, table_cell);
+}
+
+fn push_key_value_table_with_cells(
+    out: &mut String,
+    rows: Vec<(&str, String)>,
+    cell: fn(&str) -> String,
+) {
     let label_width = rows
         .iter()
         .map(|(field, _)| field.len())
@@ -3279,7 +3291,7 @@ fn push_key_value_table(out: &mut String, rows: Vec<(&str, String)>) {
         out.push_str(&format!(
             "  {:<label_width$}  {}\n",
             field,
-            table_cell(&value),
+            cell(&value),
             label_width = label_width
         ));
     }
@@ -3294,46 +3306,42 @@ fn parse_percent_prefix(value: &str) -> Option<f64> {
     })
 }
 
+fn postmortem_green(text: &str) -> String {
+    text.green().to_string()
+}
+
+fn postmortem_green_bold(text: &str) -> String {
+    text.green().bold().to_string()
+}
+
 fn colorize_postmortem_value(label: &str, value: &str) -> String {
     let lower = value.to_ascii_lowercase();
     match label {
-        "State" => {
-            if lower.contains("final") {
-                value.green().bold().to_string()
-            } else {
-                value.yellow().bold().to_string()
-            }
-        }
+        "State" => postmortem_green_bold(value),
         "Outcome" => {
-            if lower.contains("degraded") || lower.contains("failed") || lower.contains("error") {
-                value.red().bold().to_string()
-            } else if lower.contains("complete") {
-                value.green().bold().to_string()
-            } else if lower.contains("progress") {
-                value.yellow().bold().to_string()
+            if lower.contains("degraded")
+                || lower.contains("failed")
+                || lower.contains("error")
+                || lower.contains("complete")
+                || lower.contains("progress")
+            {
+                postmortem_green_bold(value)
             } else {
                 value.to_string()
             }
         }
-        "Cause" => {
-            if lower == "none" || lower.contains("no degradation detected") {
-                value.green().bold().to_string()
-            } else {
-                value.yellow().bold().to_string()
-            }
-        }
-        "Cache" => value.green().to_string(),
+        "Cause" => postmortem_green_bold(value),
+        "Cache" => postmortem_green(value),
         "Context" => match parse_percent_prefix(value) {
-            Some(percent) if percent >= 80.0 => value.red().bold().to_string(),
-            Some(percent) if percent >= 60.0 => value.yellow().bold().to_string(),
-            Some(_) => value.green().to_string(),
+            Some(percent) if percent >= 60.0 => postmortem_green_bold(value),
+            Some(_) => postmortem_green(value),
             None => value.to_string(),
         },
         "Waste" => {
             if lower.starts_with("0 tokens") || lower.contains("no likely wasted tokens") {
-                value.green().to_string()
+                postmortem_green(value)
             } else {
-                value.red().bold().to_string()
+                postmortem_green_bold(value)
             }
         }
         "Tools" | "Skills" | "MCP" => {
@@ -3341,24 +3349,20 @@ fn colorize_postmortem_value(label: &str, value: &str) -> String {
                 && !lower.contains("0 failures")
                 && !lower.starts_with("no failed")
             {
-                value.red().bold().to_string()
+                postmortem_green_bold(value)
             } else {
-                value.green().to_string()
+                postmortem_green(value)
             }
         }
-        "Cost" => value.magenta().to_string(),
+        "Cost" => postmortem_green(value),
         "Risk" => {
-            if lower.contains("high") {
-                value.red().bold().to_string()
-            } else if lower.contains("medium") {
-                value.yellow().bold().to_string()
-            } else if lower.contains("low") {
-                value.green().bold().to_string()
+            if lower.contains("high") || lower.contains("medium") || lower.contains("low") {
+                postmortem_green_bold(value)
             } else {
                 value.to_string()
             }
         }
-        "Next" | "Next action" => value.bright_white().to_string(),
+        "Next" | "Next action" => postmortem_green(value),
         _ => value.to_string(),
     }
 }
@@ -3387,7 +3391,7 @@ fn colorize_aligned_key_value_line(line: &str) -> Option<String> {
     Some(format!(
         "{}{}{}{}",
         indent,
-        label.bright_blue().bold(),
+        postmortem_green_bold(label),
         " ".repeat(padding_len),
         colorize_postmortem_value(label, value)
     ))
@@ -3395,9 +3399,7 @@ fn colorize_aligned_key_value_line(line: &str) -> Option<String> {
 
 fn colorize_evidence_type(kind: &str) -> String {
     match kind {
-        "direct" => kind.green().bold().to_string(),
-        "heuristic" => kind.yellow().bold().to_string(),
-        "derived" => kind.cyan().bold().to_string(),
+        "direct" | "heuristic" | "derived" => postmortem_green_bold(kind),
         "-" => kind.bright_black().to_string(),
         _ => kind.bright_white().to_string(),
     }
@@ -3425,10 +3427,10 @@ fn colorize_evidence_line(line: &str) -> Option<String> {
 fn colorize_postmortem_line(line: &str) -> String {
     let trimmed = line.trim_start();
     if line.starts_with("# ") {
-        return line.bright_cyan().bold().to_string();
+        return postmortem_green_bold(line);
     }
     if line.starts_with("## ") {
-        return line.cyan().bold().to_string();
+        return postmortem_green_bold(line);
     }
     if trimmed.starts_with("Type") && trimmed.contains("Signal") {
         return line.bright_black().bold().to_string();
@@ -3473,23 +3475,13 @@ enum PostmortemAccent {
 
 impl PostmortemAccent {
     fn paint(self, text: &str) -> String {
-        match self {
-            PostmortemAccent::Info => text.truecolor(92, 230, 220).to_string(),
-            PostmortemAccent::Good => text.truecolor(80, 220, 135).to_string(),
-            PostmortemAccent::Warning => text.truecolor(246, 207, 68).to_string(),
-            PostmortemAccent::Danger => text.truecolor(255, 95, 105).to_string(),
-            PostmortemAccent::Muted => text.bright_black().to_string(),
-        }
+        let _ = self;
+        postmortem_green(text)
     }
 
     fn paint_bold(self, text: &str) -> String {
-        match self {
-            PostmortemAccent::Info => text.truecolor(92, 230, 220).bold().to_string(),
-            PostmortemAccent::Good => text.truecolor(80, 220, 135).bold().to_string(),
-            PostmortemAccent::Warning => text.truecolor(246, 207, 68).bold().to_string(),
-            PostmortemAccent::Danger => text.truecolor(255, 95, 105).bold().to_string(),
-            PostmortemAccent::Muted => text.bright_black().bold().to_string(),
-        }
+        let _ = self;
+        postmortem_green_bold(text)
     }
 }
 
@@ -3878,7 +3870,7 @@ fn postmortem_tabs_line(width: usize, state: Option<&str>) -> TerminalLine {
     let painted = if let Some(rest) = raw.strip_prefix("Postmortem") {
         format!(
             "{}{}",
-            "Postmortem".truecolor(255, 145, 71).bold(),
+            postmortem_green_bold("Postmortem"),
             rest.bright_black()
         )
     } else {
@@ -3920,7 +3912,7 @@ fn summary_lines(
     lines.extend(wrapped_terminal_lines(
         &format!("{duration} · {turns} · {cost}"),
         inner_width,
-        |line| line.truecolor(80, 220, 135).bold().to_string(),
+        postmortem_green_bold,
     ));
     lines.extend(wrapped_terminal_lines(
         &format!("{model} · {session}"),
@@ -3932,9 +3924,9 @@ fn summary_lines(
         inner_width,
         |line| {
             if is_low_signal("Waste", waste) {
-                line.truecolor(80, 220, 135).to_string()
+                postmortem_green(line)
             } else {
-                line.truecolor(246, 207, 68).bold().to_string()
+                postmortem_green_bold(line)
             }
         },
     ));
@@ -3998,10 +3990,10 @@ fn finding_terminal_lines(finding: &FindingRow, width: usize) -> Vec<TerminalLin
             || lower.contains("cooldown")
             || lower.contains("critical")
             || lower.contains("budget exceeded")
+            || lower.contains("warn")
+            || lower.contains("warning")
         {
-            line.red().bold().to_string()
-        } else if lower.contains("warn") || lower.contains("warning") {
-            line.yellow().bold().to_string()
+            postmortem_green_bold(line)
         } else {
             line.bright_white().to_string()
         }
@@ -4030,17 +4022,17 @@ fn signal_card_lines(
             "High" => format!(
                 "{} {}",
                 "Priority:".bright_black().bold(),
-                severity.red().bold()
+                postmortem_green_bold(severity)
             ),
             "Medium" => format!(
                 "{} {}",
                 "Priority:".bright_black().bold(),
-                severity.yellow().bold()
+                postmortem_green_bold(severity)
             ),
             "Low" => format!(
                 "{} {}",
                 "Priority:".bright_black().bold(),
-                severity.green().bold()
+                postmortem_green_bold(severity)
             ),
             _ => format!("{} {severity}", "Priority:".bright_black().bold()),
         },
@@ -4059,7 +4051,7 @@ fn signal_card_lines(
             lines.extend(wrapped_terminal_lines(
                 &format!("Next: {next_action}"),
                 inner_width,
-                |line| line.truecolor(92, 230, 220).to_string(),
+                postmortem_green,
             ));
         }
     }
@@ -4073,13 +4065,13 @@ fn health_check_lines(rows: &[(&String, &String)], inner_width: usize) -> Vec<Te
         lines.extend(wrapped_terminal_lines(
             &format!("{label}: {value}"),
             inner_width,
-            |line| line.truecolor(80, 220, 135).to_string(),
+            postmortem_green,
         ));
     }
     if lines.is_empty() {
         lines.push(TerminalLine::styled(
             "No guard signals need attention.".to_string(),
-            "No guard signals need attention.".green().to_string(),
+            postmortem_green("No guard signals need attention."),
         ));
     }
     lines
@@ -4112,7 +4104,7 @@ fn analysis_lines(
             lines.extend(wrapped_terminal_lines(
                 &format!("Restart: {}", prompt.trim()),
                 inner_width,
-                |line| line.truecolor(92, 230, 220).bold().to_string(),
+                postmortem_green_bold,
             ));
         }
     }
@@ -4769,11 +4761,11 @@ fn render_claude_analysis_section(analysis: &str) -> String {
 
     let mut out = String::new();
     out.push_str("## Analysis\n");
-    push_key_value_table(&mut out, rows);
+    push_key_value_table_with_cells(&mut out, rows, full_table_cell);
     out.push_str("## Restart Prompt\n");
     out.push_str(&format!(
         "  {}\n",
-        table_cell(&restart_prompt.unwrap_or_else(|| "No restart needed.".to_string()))
+        full_table_cell(&restart_prompt.unwrap_or_else(|| "No restart needed.".to_string()))
     ));
     out
 }
@@ -4802,6 +4794,8 @@ Write for the person watching the run. Use plain, direct language. Tell them wha
 Avoid jargon such as signal, runway, or degradation unless it appears in the evidence and is needed.\n\
 Use aligned key/value rows, not Markdown pipe tables. No code fences. No extra caveat block, no extra prose, no bullet lists.\n\
 Preserve direct versus heuristic evidence labels. Do not turn heuristic, inferred, likely, or suspected causes into direct facts.\n\
+Use `summary.outcome` as the resolved report outcome. If `summary.stored_diagnosis_outcome` differs, treat it as older proxy context, not the conclusion.\n\
+If the findings include `jsonl_compaction_boundary`, say the segment ended at compaction and continued afterward; do not call it abandoned.\n\
 When `is_heuristic` is true or evidence type is `heuristic`, mark causal wording with `[heuristic]`, likely, suspected, or inferred. Direct evidence can stay direct.\n\
 Include exactly these sections:\n\
 ## Analysis\n\
@@ -5895,6 +5889,30 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    static COLOR_OVERRIDE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn render_plain_postmortem_terminal_for_width(markdown: &str, width: usize) -> String {
+        let _color_lock = COLOR_OVERRIDE_LOCK.lock().expect("color override lock");
+        colored::control::unset_override();
+        render_postmortem_terminal_for_width(markdown, width)
+    }
+
+    fn render_colored_postmortem_terminal_for_width(markdown: &str, width: usize) -> String {
+        let _color_lock = COLOR_OVERRIDE_LOCK.lock().expect("color override lock");
+        colored::control::set_override(true);
+        let terminal = render_postmortem_terminal_for_width(markdown, width);
+        colored::control::unset_override();
+        terminal
+    }
+
+    fn colorize_colored_postmortem_for_terminal(markdown: &str) -> String {
+        let _color_lock = COLOR_OVERRIDE_LOCK.lock().expect("color override lock");
+        colored::control::set_override(true);
+        let terminal = colorize_postmortem_for_terminal(markdown);
+        colored::control::unset_override();
+        terminal
+    }
 
     fn unique_test_dir(label: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -7300,7 +7318,7 @@ mod tests {
         });
 
         let markdown = render_postmortem_markdown(&report);
-        let terminal = render_postmortem_terminal_for_width(&markdown, 132);
+        let terminal = render_plain_postmortem_terminal_for_width(&markdown, 132);
 
         assert!(terminal.contains("Top findings"));
         assert!(terminal.contains("Session token budget exceeded"));
@@ -7460,6 +7478,31 @@ If failures recur, restart with a shorter prompt.\n\
     }
 
     #[test]
+    fn postmortem_analysis_restart_prompt_is_not_truncated() {
+        let mut markdown = "# cc-blackbox Postmortem\n".to_string();
+        let long_restart = "Continue the task from this compacted session segment: summarize what was accomplished, pick up from the last incomplete step, read only the specific files or functions needed, and avoid broad repository scans.";
+        append_claude_analysis_section(
+            &mut markdown,
+            &format!(
+                "## Analysis\n\
+What happened  Session reached a compaction boundary and continued afterward.\n\
+What it means  The old proxy diagnosis is not the final conclusion.\n\
+What to do     Continue from the compacted segment.\n\
+## Restart Prompt\n\
+{long_restart}\n"
+            ),
+        );
+
+        assert!(markdown.contains(long_restart));
+        assert!(!markdown.contains("specific f…"));
+
+        let terminal = render_plain_postmortem_terminal_for_width(&markdown, 92);
+        assert!(terminal.contains("Restart: Continue the task from this compacted"));
+        assert!(terminal.contains("avoid broad repository scans."));
+        assert!(!terminal.contains('…'));
+    }
+
+    #[test]
     fn postmortem_terminal_colorization_adds_ansi_without_touching_markdown() {
         let markdown = "# cc-blackbox Postmortem\n\
 \n\
@@ -7473,9 +7516,7 @@ If failures recur, restart with a shorter prompt.\n\
   ----------  ------------  -----  ------\n\
   heuristic   context       2      inferred 1 turn to compact\n";
 
-        colored::control::set_override(true);
-        let terminal = colorize_postmortem_for_terminal(markdown);
-        colored::control::unset_override();
+        let terminal = colorize_colored_postmortem_for_terminal(markdown);
 
         assert!(terminal.contains("\u{1b}["));
         assert!(terminal.contains("cc-blackbox Postmortem"));
@@ -7516,7 +7557,7 @@ If failures recur, restart with a shorter prompt.\n\
 ## Restart Prompt\n\
   Continue from this summary and inspect the failing command before editing.\n";
 
-        let terminal = render_postmortem_terminal_for_width(markdown, 92);
+        let terminal = render_plain_postmortem_terminal_for_width(markdown, 92);
 
         assert!(terminal.contains("Postmortem"));
         assert!(terminal.contains("+ cc-blackbox Postmortem"));
@@ -7534,6 +7575,79 @@ If failures recur, restart with a shorter prompt.\n\
         assert!(!terminal.contains("Finding 1"));
         assert!(!terminal.contains("## Snapshot"));
         assert!(!terminal.contains("Type        Signal"));
+    }
+
+    #[test]
+    fn postmortem_terminal_uses_single_green_accent() {
+        let markdown = "# cc-blackbox Postmortem\n\
+\n\
+## Snapshot\n\
+  Session       `session_target`\n\
+  State         final postmortem\n\
+  Outcome       Degraded\n\
+  Model         claude-sonnet\n\
+  Duration      18m\n\
+  Turns/tokens  7 turns, 214K\n\
+  Cost          $4.91\n\
+\n\
+## Signals\n\
+  Cause   Tool failure loop\n\
+  Cache   Low: 42% reusable prompt cache; 36% of input from cache\n\
+  Context High: 87% full; about 1 turn before auto-compaction\n\
+  Waste   Likely waste: 76K tokens, $1.84\n\
+  Tools   14 calls, 3 failures; failing: Bash (3)\n\
+  Next    Restart with a shorter prompt and inspect the failing command first.\n\
+\n\
+## Evidence\n\
+  Type        Signal        Turn   Detail\n\
+  ----------  ------------  -----  ------\n\
+  direct      tools         7      14 Read/Edit calls against the same redacted path\n\
+\n\
+## Top Findings\n\
+  Source      Evidence      Turn   Detail\n\
+  ----------  ------------  -----  ------\n\
+  proxy       direct        7      critical budget exceeded\n\
+\n\
+## Analysis\n\
+  Risk           High - restart is cheaper\n\
+  What happened  The session hit a tool failure loop.\n";
+
+        let terminal = render_colored_postmortem_terminal_for_width(markdown, 92);
+
+        assert!(terminal.contains("\u{1b}["));
+        assert!(
+            [
+                "38;2;80;220;135",
+                "\u{1b}[32m",
+                "\u{1b}[1;32m",
+                "\u{1b}[92m",
+                "\u{1b}[1;92m",
+            ]
+            .iter()
+            .any(|code| terminal.contains(code)),
+            "expected a green accent in:\n{terminal}"
+        );
+        for forbidden in [
+            "38;2;92;230;220",
+            "38;2;246;207;68",
+            "38;2;255;95;105",
+            "38;2;255;145;71",
+            "\u{1b}[31m",
+            "\u{1b}[1;31m",
+            "\u{1b}[33m",
+            "\u{1b}[1;33m",
+            "\u{1b}[34m",
+            "\u{1b}[1;34m",
+            "\u{1b}[35m",
+            "\u{1b}[1;35m",
+            "\u{1b}[36m",
+            "\u{1b}[1;36m",
+        ] {
+            assert!(
+                !terminal.contains(forbidden),
+                "unexpected non-green accent {forbidden:?} in:\n{terminal}"
+            );
+        }
     }
 
     #[test]
@@ -7562,7 +7676,7 @@ If failures recur, restart with a shorter prompt.\n\
   ----------  ------------  -----  ------\n\
   direct      tools         -      10 tool calls, 2 failures\n";
 
-        let terminal = render_postmortem_terminal_for_width(markdown, 96);
+        let terminal = render_plain_postmortem_terminal_for_width(markdown, 96);
 
         assert!(terminal.contains("Session still running: In Progress"));
         assert!(terminal.contains("Worth watching: Cache"));
@@ -7596,6 +7710,8 @@ If failures recur, restart with a shorter prompt.\n\
         assert!(prompt.contains("Write for the person watching the run"));
         assert!(prompt.contains("Use aligned key/value rows"));
         assert!(prompt.contains("No code fences"));
+        assert!(prompt.contains("Use `summary.outcome` as the resolved report outcome"));
+        assert!(prompt.contains("jsonl_compaction_boundary"));
         assert!(prompt.contains("What happened  one plain sentence"));
         assert!(prompt.contains("What it means  one plain sentence"));
         assert!(prompt.contains("What to do"));

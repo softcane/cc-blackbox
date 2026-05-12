@@ -102,6 +102,10 @@ fn nearby_count(proxy_count: u64, jsonl_count: u64) -> bool {
     proxy_count == 0 || jsonl_count == 0 || proxy_count.abs_diff(jsonl_count) <= 1
 }
 
+fn compatible_count(proxy_count: u64, jsonl_count: u64) -> bool {
+    nearby_count(proxy_count, jsonl_count) || (proxy_count > 0 && jsonl_count >= proxy_count)
+}
+
 pub fn prompt_correlation_hash(raw: &str) -> String {
     let normalized = raw
         .lines()
@@ -146,8 +150,8 @@ pub fn candidate_matches_proxy(
             candidate.last_activity_at_epoch_secs,
             300,
         )
-        && nearby_count(proxy.request_count, candidate.request_count)
-        && nearby_count(proxy.turn_count, candidate.turn_count)
+        && compatible_count(proxy.request_count, candidate.request_count)
+        && compatible_count(proxy.turn_count, candidate.turn_count)
 }
 
 #[cfg(test)]
@@ -239,6 +243,23 @@ mod tests {
 
         assert_eq!(
             correlate_jsonl_session(&proxy, &[candidate]),
+            JsonlEnrichmentStatus::Matched {
+                proxy_session_id: "session_proxy_1".to_string(),
+                jsonl_session_id: "jsonl_1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn proxy_segment_can_match_longer_jsonl_session() {
+        let mut candidate = jsonl_session();
+        candidate.started_at_epoch_secs = 1_000;
+        candidate.last_activity_at_epoch_secs = 3_000;
+        candidate.request_count = 120;
+        candidate.turn_count = 120;
+
+        assert_eq!(
+            correlate_jsonl_session(&proxy_session(), &[candidate]),
             JsonlEnrichmentStatus::Matched {
                 proxy_session_id: "session_proxy_1".to_string(),
                 jsonl_session_id: "jsonl_1".to_string(),

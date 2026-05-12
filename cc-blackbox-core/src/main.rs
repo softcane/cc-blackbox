@@ -540,6 +540,7 @@ fn guard_finding_title(rule_id: &str) -> String {
         "api_error_circuit_breaker_cooldown" => "API error cooldown",
         "repeated_cache_rebuilds" => "Repeated cache rebuilds",
         "context_near_warning_threshold" => "Context near limit",
+        "jsonl_compaction_boundary" => "JSONL compaction boundary",
         "model_mismatch" => "Model route mismatch",
         "suspected_compaction_loop" => "Suspected compaction loop",
         "tool_failure_streak" => "Tool failure streak",
@@ -4026,6 +4027,8 @@ fn jsonl_signal_json(summary: Option<&jsonl::JsonlDerivedSession>) -> Value {
     };
     serde_json::json!({
         "session_id": summary.jsonl_session_id,
+        "started_at": (summary.started_at_epoch_secs > 0).then(|| epoch_to_iso8601(summary.started_at_epoch_secs)),
+        "last_activity_at": (summary.last_activity_at_epoch_secs > 0).then(|| epoch_to_iso8601(summary.last_activity_at_epoch_secs)),
         "user_turn_count": summary.user_turn_count,
         "assistant_turn_count": summary.assistant_turn_count,
         "request_count": summary.request_count,
@@ -4042,6 +4045,69 @@ fn jsonl_signal_json(summary: Option<&jsonl::JsonlDerivedSession>) -> Value {
             "cache_creation_tokens": summary.usage.cache_creation_tokens,
         },
         "system_event_categories": count_map_json(&summary.system_event_categories, "category"),
+    })
+}
+
+fn jsonl_compaction_boundary_near_session(
+    summary: &jsonl::JsonlDerivedSession,
+    session: &PostmortemSessionRow,
+) -> Option<u64> {
+    const TOLERANCE_SECS: u64 = 120;
+    let anchor = session.last_activity_at_epoch_secs;
+    if anchor == 0 {
+        return None;
+    }
+    summary
+        .system_events
+        .iter()
+        .filter(|event| event.category == "compaction")
+        .filter(|event| event.timestamp_epoch_secs.abs_diff(anchor) <= TOLERANCE_SECS)
+        .min_by_key(|event| event.timestamp_epoch_secs.abs_diff(anchor))
+        .map(|event| event.timestamp_epoch_secs)
+}
+
+fn jsonl_continuation_after_session_secs(
+    summary: &jsonl::JsonlDerivedSession,
+    session: &PostmortemSessionRow,
+) -> Option<u64> {
+    const CONTINUATION_SECS: u64 = 60;
+    let anchor = session.last_activity_at_epoch_secs;
+    if anchor == 0 {
+        return None;
+    }
+    let continued_for = summary.last_activity_at_epoch_secs.saturating_sub(anchor);
+    (continued_for >= CONTINUATION_SECS).then_some(continued_for)
+}
+
+fn jsonl_compaction_boundary_finding(
+    session_id: &str,
+    boundary_epoch_secs: u64,
+    continued_for_secs: Option<u64>,
+) -> Value {
+    let mut detail = format!(
+        "Claude Code JSONL recorded a compact_boundary at {}; this proxy segment ended at the compaction boundary, not at task abandonment.",
+        epoch_to_iso8601(boundary_epoch_secs)
+    );
+    if let Some(secs) = continued_for_secs {
+        detail.push_str(&format!(
+            " The same JSONL session continued for about {} min afterward.",
+            (secs + 30) / 60
+        ));
+    }
+    serde_json::json!({
+        "rule_id": "jsonl_compaction_boundary",
+        "title": guard_finding_title("jsonl_compaction_boundary"),
+        "severity": "info",
+        "action": "diagnose_only",
+        "source": "jsonl",
+        "evidence_level": "direct_jsonl",
+        "confidence": 0.95,
+        "timestamp": epoch_to_iso8601(boundary_epoch_secs),
+        "detail": detail,
+        "suggested_action": "Continue from the compacted session segment; do not treat this proxy segment as abandoned.",
+        "turn_number": null,
+        "request_id": null,
+        "session_id": session_id,
     })
 }
 
@@ -4093,6 +4159,14 @@ fn build_postmortem_response_from_db(
         .map_err(|err| PostmortemError::DbUnavailable(err.to_string()))?
         .remove(&session.session_id);
     let jsonl_enrichment = load_postmortem_jsonl_enrichment(conn, &session, turns.len() as u64);
+    let jsonl_compaction_boundary_epoch = jsonl_enrichment
+        .summary
+        .as_ref()
+        .and_then(|summary| jsonl_compaction_boundary_near_session(summary, &session));
+    let jsonl_continued_after_proxy_secs = jsonl_enrichment
+        .summary
+        .as_ref()
+        .and_then(|summary| jsonl_continuation_after_session_secs(summary, &session));
     for finding in &jsonl_enrichment.findings {
         let _ = persist_guard_finding_if_absent(conn, finding);
     }
@@ -4112,7 +4186,17 @@ fn build_postmortem_response_from_db(
         diagnosis.as_ref().map(|diag| diag.completed_at.as_str()),
         &sanitized_causes,
     );
-    let findings = merge_postmortem_findings(diagnosis_findings, stored_findings);
+    let mut findings = merge_postmortem_findings(diagnosis_findings, stored_findings);
+    if let Some(boundary_epoch_secs) = jsonl_compaction_boundary_epoch {
+        findings.insert(
+            0,
+            jsonl_compaction_boundary_finding(
+                &session.session_id,
+                boundary_epoch_secs,
+                jsonl_continued_after_proxy_secs,
+            ),
+        );
+    }
     let partial = session.ended_at.is_none();
     let primary_cause = sanitized_causes
         .first()
@@ -4136,7 +4220,27 @@ fn build_postmortem_response_from_db(
         .and_then(|value| value.as_str())
         .unwrap_or(default_primary_detail)
         .to_string();
-    let next_action = recommended_action(&primary_cause, &sanitized_advice, partial);
+    let mut next_action = recommended_action(&primary_cause, &sanitized_advice, partial);
+    if jsonl_compaction_boundary_epoch.is_some() {
+        next_action = "Continue from the compacted session segment; the JSONL shows this proxy segment ended at compaction, not task abandonment.".to_string();
+    }
+    let diagnosis_outcome = diagnosis
+        .as_ref()
+        .map(|diag| diag.outcome.clone())
+        .unwrap_or_else(|| {
+            if partial {
+                "In Progress".to_string()
+            } else {
+                "Completed state unknown".to_string()
+            }
+        });
+    let display_outcome = if jsonl_compaction_boundary_epoch.is_some() {
+        "Compaction Boundary".to_string()
+    } else if jsonl_continued_after_proxy_secs.is_some() && !partial {
+        "Continued In Same Claude Session".to_string()
+    } else {
+        diagnosis_outcome.clone()
+    };
 
     let max_context_fill_percent = turns
         .iter()
@@ -4264,7 +4368,7 @@ fn build_postmortem_response_from_db(
                 "derived"
             },
             "diagnosis",
-            format!("{} with outcome {}", primary_detail, diag.outcome),
+            format!("{} with outcome {}", primary_detail, display_outcome),
             diag.degradation_turn,
             Some(diag.completed_at.clone()),
         ));
@@ -4372,6 +4476,30 @@ fn build_postmortem_response_from_db(
             Some(finding.timestamp.clone()),
         ));
     }
+    if let Some(boundary_epoch_secs) = jsonl_compaction_boundary_epoch {
+        evidence.push(evidence_json(
+            "direct_jsonl",
+            "jsonl",
+            "JSONL compact_boundary aligned with this proxy segment's last activity".to_string(),
+            None,
+            Some(epoch_to_iso8601(boundary_epoch_secs)),
+        ));
+    }
+    if let Some(continued_for_secs) = jsonl_continued_after_proxy_secs {
+        evidence.push(evidence_json(
+            "direct_jsonl",
+            "jsonl",
+            format!(
+                "same JSONL session continued for about {} min after this proxy segment",
+                (continued_for_secs + 30) / 60
+            ),
+            None,
+            jsonl_enrichment
+                .summary
+                .as_ref()
+                .map(|summary| epoch_to_iso8601(summary.last_activity_at_epoch_secs)),
+        ));
+    }
 
     let confidence = postmortem_confidence(diagnosis.as_ref(), evidence.len()).to_string();
 
@@ -4432,10 +4560,7 @@ fn build_postmortem_response_from_db(
             "timestamp": ended_at,
             "turn": null,
             "label": "session_ended",
-            "detail": diagnosis
-                .as_ref()
-                .map(|diag| diag.outcome.clone())
-                .unwrap_or_else(|| "Session ended; no diagnosis row was available.".to_string()),
+            "detail": display_outcome.clone(),
             "evidence_type": "direct",
         }));
     }
@@ -4471,10 +4596,7 @@ fn build_postmortem_response_from_db(
         "redaction_status": if redact { "redacted" } else { "local_unredacted" },
         "partial": partial,
         "proxy_summary": {
-            "outcome": diagnosis
-                .as_ref()
-                .map(|diag| diag.outcome.clone())
-                .unwrap_or_else(|| if partial { "In Progress".to_string() } else { "Completed state unknown".to_string() }),
+            "outcome": display_outcome.clone(),
             "estimated_total_cost_dollars": rounded_estimated_cost_dollars(estimated.estimated_cost_dollars),
             "total_turns": diagnosis
                 .as_ref()
@@ -4491,10 +4613,8 @@ fn build_postmortem_response_from_db(
             "ended_at": session.ended_at,
             "duration_secs": session.duration_secs,
             "model": session.model,
-            "outcome": diagnosis
-                .as_ref()
-                .map(|diag| diag.outcome.clone())
-                .unwrap_or_else(|| if partial { "In Progress".to_string() } else { "Completed state unknown".to_string() }),
+            "outcome": display_outcome.clone(),
+            "stored_diagnosis_outcome": diagnosis_outcome,
             "total_turns": diagnosis
                 .as_ref()
                 .map(|diag| diag.total_turns)
@@ -7193,20 +7313,74 @@ static BURN_TRACKER: LazyLock<Mutex<BurnTracker>> =
     LazyLock::new(|| Mutex::new(BurnTracker::new()));
 
 const QUOTA_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
-const QUOTA_WATCH_BROADCAST_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-fn should_broadcast_quota_snapshot(
-    since_last_broadcast: Option<Duration>,
-    previous_alarm: Option<bool>,
-    alarm: bool,
-) -> bool {
-    let interval_elapsed = since_last_broadcast
-        .map(|elapsed| elapsed >= QUOTA_WATCH_BROADCAST_INTERVAL)
-        .unwrap_or(true);
-    let alarm_changed = previous_alarm
-        .map(|previous| previous != alarm)
-        .unwrap_or(false);
-    interval_elapsed || alarm_changed
+#[derive(Clone)]
+struct QuotaBurnSnapshot {
+    seconds_to_reset: Option<u64>,
+    tokens_used_this_week: u64,
+    tokens_limit: Option<u64>,
+    tokens_remaining: Option<u64>,
+    budget_source: Option<String>,
+    projected_exhaustion_secs: Option<u64>,
+}
+
+fn quota_burn_snapshot(per_sec: Option<f64>) -> QuotaBurnSnapshot {
+    let used_this_week = this_week_tokens_used();
+    let weekly = env_u64("CC_BLACKBOX_WEEKLY_TOKEN_BUDGET", 0);
+    let (tokens_limit, budget_source) = if weekly > 0 {
+        (Some(weekly), Some("env".to_string()))
+    } else if let Some(auto) = auto_weekly_budget_suggestion() {
+        (Some(auto.tokens_limit), Some("auto_p95_4w".to_string()))
+    } else {
+        (None, None)
+    };
+    let tokens_remaining = tokens_limit.map(|limit| limit.saturating_sub(used_this_week));
+    let projected_exhaustion_secs = match (tokens_remaining, per_sec) {
+        (Some(remaining), Some(rate)) if rate > 0.0 && remaining > 0 => {
+            Some((remaining as f64 / rate).round() as u64)
+        }
+        _ => None,
+    };
+
+    QuotaBurnSnapshot {
+        seconds_to_reset: Some(seconds_until_weekly_reset()),
+        tokens_used_this_week: used_this_week,
+        tokens_limit,
+        tokens_remaining,
+        budget_source,
+        projected_exhaustion_secs,
+    }
+}
+
+fn quota_burn_watch_event(snapshot: QuotaBurnSnapshot) -> watch::WatchEvent {
+    watch::WatchEvent::RateLimitStatus {
+        seconds_to_reset: snapshot.seconds_to_reset,
+        requests_remaining: None,
+        requests_limit: None,
+        input_tokens_remaining: None,
+        output_tokens_remaining: None,
+        tokens_used_this_week: Some(snapshot.tokens_used_this_week),
+        tokens_limit: snapshot.tokens_limit,
+        tokens_remaining: snapshot.tokens_remaining,
+        budget_source: snapshot.budget_source,
+        projected_exhaustion_secs: snapshot.projected_exhaustion_secs,
+    }
+}
+
+fn current_quota_burn_watch_event() -> Option<watch::WatchEvent> {
+    let total_tokens = {
+        let runtime = lock_or_recover(&RUNTIME_STATE, "runtime_state");
+        runtime.total_tokens
+    };
+    let per_sec = {
+        let t = lock_or_recover(&BURN_TRACKER, "burn_tracker");
+        t.tokens_per_sec()
+    };
+    let snapshot = quota_burn_snapshot(per_sec);
+    if total_tokens == 0 && snapshot.tokens_used_this_week == 0 {
+        return None;
+    }
+    Some(quota_burn_watch_event(snapshot))
 }
 
 #[derive(Clone)]
@@ -8745,6 +8919,7 @@ async fn handle_watch(
     let session_filter = params.get("session").cloned();
 
     let (history, mut rx) = watch::BROADCASTER.subscribe_with_history();
+    let quota_start_snapshot = current_quota_burn_watch_event();
 
     // Look up stored session info synchronously before the stream starts.
     let synthetic_start = session_filter.as_ref().and_then(|sid| {
@@ -8768,6 +8943,15 @@ async fn handle_watch(
     });
 
     let stream = async_stream::stream! {
+        // Show the local weekly burn once when a watcher connects. The
+        // background monitor keeps Prometheus gauges fresh without repeatedly
+        // printing the same quota line to the terminal.
+        if let Some(ev) = quota_start_snapshot {
+            if let Ok(json) = serde_json::to_string(&ev) {
+                yield Ok(Event::default().data(json));
+            }
+        }
+
         // Synthetic SessionStart first if we're filtered to a session.
         if let Some(ev) = synthetic_start {
             if let Ok(json) = serde_json::to_string(&ev) {
@@ -8777,6 +8961,9 @@ async fn handle_watch(
 
         // Replay recent history, filtered if a session is specified.
         for event in history {
+            if matches!(event, watch::WatchEvent::RateLimitStatus { .. }) {
+                continue;
+            }
             if !event_matches_session(&event, session_filter.as_deref()) {
                 continue;
             }
@@ -8796,6 +8983,9 @@ async fn handle_watch(
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    if matches!(event, watch::WatchEvent::RateLimitStatus { .. }) {
+                        continue;
+                    }
                     if !event_matches_session(&event, session_filter.as_deref()) {
                         continue;
                     }
@@ -9716,17 +9906,14 @@ async fn cleanup_stale_requests() {
 }
 
 /// Sample quota burn every 30s so the burn-rate projection and Prometheus
-/// gauges stay fresh, but only broadcast the user-facing watch snapshot every
-/// five minutes unless the exhaustion alarm flips state. Anthropic does not
-/// return rate-limit headers on subscription (OAuth) traffic, so this is
-/// computed entirely from our own counters. If the user sets
+/// gauges stay fresh. The terminal watch renders quota once on connection
+/// instead of receiving recurring quota broadcasts. Anthropic does not return
+/// rate-limit headers on subscription (OAuth) traffic, so this is computed
+/// entirely from our own counters. If the user sets
 /// `CC_BLACKBOX_WEEKLY_TOKEN_BUDGET` we can also surface remaining + projected
 /// exhaustion; otherwise we auto-suggest a weekly cap from the last four
 /// completed weeks of SQLite history.
 async fn quota_burn_monitor() {
-    let mut last_broadcast_at: Option<Instant> = None;
-    let mut last_alarm: Option<bool> = None;
-
     loop {
         tokio::time::sleep(QUOTA_SAMPLE_INTERVAL).await;
 
@@ -9741,65 +9928,15 @@ async fn quota_burn_monitor() {
             t.record(total_tokens);
             t.tokens_per_sec()
         };
-        let used_this_week = this_week_tokens_used();
-        let weekly = env_u64("CC_BLACKBOX_WEEKLY_TOKEN_BUDGET", 0);
-        let (tokens_limit, budget_source) = if weekly > 0 {
-            (Some(weekly), Some("env".to_string()))
-        } else if let Some(auto) = auto_weekly_budget_suggestion() {
-            (Some(auto.tokens_limit), Some("auto_p95_4w".to_string()))
-        } else {
-            (None, None)
-        };
-        let remaining = tokens_limit.map(|limit| limit.saturating_sub(used_this_week));
-        let projected_exhaustion_secs = match (remaining, per_sec) {
-            (Some(r), Some(rate)) if rate > 0.0 && r > 0 => Some((r as f64 / rate).round() as u64),
-            _ => None,
-        };
+        let snapshot = quota_burn_snapshot(per_sec);
 
         metrics::update_weekly_budget_gauges(
-            used_this_week,
-            remaining,
-            tokens_limit,
-            budget_source.as_deref(),
-            projected_exhaustion_secs,
+            snapshot.tokens_used_this_week,
+            snapshot.tokens_remaining,
+            snapshot.tokens_limit,
+            snapshot.budget_source.as_deref(),
+            snapshot.projected_exhaustion_secs,
         );
-
-        // Skip watch broadcast until we've actually seen traffic — no point
-        // telling the orchestrator "0 tokens, 0 burn" before the first turn.
-        if total_tokens == 0 {
-            continue;
-        }
-
-        let _ = per_sec; // currently displayed indirectly via projection
-        let seconds_to_reset = Some(seconds_until_weekly_reset());
-        let alarm = projected_exhaustion_secs
-            .zip(seconds_to_reset)
-            .map(|(exhaustion, reset)| exhaustion < reset)
-            .unwrap_or(false);
-        let now = Instant::now();
-        let should_broadcast = should_broadcast_quota_snapshot(
-            last_broadcast_at.map(|sent_at| now.duration_since(sent_at)),
-            last_alarm,
-            alarm,
-        );
-        last_alarm = Some(alarm);
-        if !should_broadcast {
-            continue;
-        }
-        last_broadcast_at = Some(now);
-
-        watch::BROADCASTER.broadcast(watch::WatchEvent::RateLimitStatus {
-            seconds_to_reset,
-            requests_remaining: None,
-            requests_limit: None,
-            input_tokens_remaining: None,
-            output_tokens_remaining: None,
-            tokens_used_this_week: Some(used_this_week),
-            tokens_limit,
-            tokens_remaining: remaining,
-            budget_source,
-            projected_exhaustion_secs,
-        });
     }
 }
 
@@ -10134,15 +10271,15 @@ mod tests {
         request_context_window_hint_from_headers, request_guard_policy, request_uses_1m_context,
         resolve_context_window_tokens, resolve_context_window_tokens_with_config,
         response_cache_ttl_secs, score_recall_doc, seed_live_metric_labels_from_db,
-        session_state_if_still_expired, session_timeout_secs, should_broadcast_quota_snapshot,
-        skill_name_from_skill_file, skill_name_from_tool_input_json, strip_model_1m_alias,
-        summarize_hook_tool_input, tokenize_search_text, tool_recall_context, truncate_detail,
+        session_state_if_still_expired, session_timeout_secs, skill_name_from_skill_file,
+        skill_name_from_tool_input_json, strip_model_1m_alias, summarize_hook_tool_input,
+        tokenize_search_text, tool_recall_context, truncate_detail,
         upstream_request_adjustment_for_body, BillingReconciliationInput,
         BillingReconciliationWriteError, CacheTracker, CacheTtlEvidence, DbCommand,
         ExtProcResponse, HttpHeaders, ParsedToolResult, PersistedDiagnosis, PersistedRecall,
         PostmortemError, ProtoHeaderValue, ResponseAccumulator, SessionBudgetState,
-        SummaryWindowData, ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS,
-        QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA, SESSION_BUDGETS, STANDARD_CONTEXT_WINDOW_TOKENS,
+        SummaryWindowData, ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS, SCHEMA,
+        SESSION_BUDGETS, STANDARD_CONTEXT_WINDOW_TOKENS,
     };
 
     static METRICS_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -16429,37 +16566,5 @@ action = "page_the_user"
         assert_eq!(count, 0);
 
         cleanup_test_db(&path);
-    }
-
-    #[test]
-    fn quota_snapshot_broadcasts_immediately_before_any_prior_send() {
-        assert!(should_broadcast_quota_snapshot(None, None, false));
-    }
-
-    #[test]
-    fn quota_snapshot_stays_quiet_inside_broadcast_window_when_alarm_is_stable() {
-        assert!(!should_broadcast_quota_snapshot(
-            Some(Duration::from_secs(120)),
-            Some(false),
-            false,
-        ));
-    }
-
-    #[test]
-    fn quota_snapshot_broadcasts_when_window_elapses() {
-        assert!(should_broadcast_quota_snapshot(
-            Some(QUOTA_WATCH_BROADCAST_INTERVAL),
-            Some(false),
-            false,
-        ));
-    }
-
-    #[test]
-    fn quota_snapshot_broadcasts_when_alarm_flips_before_window_elapses() {
-        assert!(should_broadcast_quota_snapshot(
-            Some(Duration::from_secs(120)),
-            Some(false),
-            true,
-        ));
     }
 }

@@ -601,6 +601,65 @@ fn core_billing_reconciliation_api_validates_and_persists_payloads() {
 }
 
 #[test]
+fn core_finalize_sessions_api_is_process_visible_and_idempotent() {
+    let _guard = CORE_PROCESS_TEST_LOCK
+        .lock()
+        .expect("lock core process test");
+    let http_addr = unused_loopback_addr();
+    let grpc_addr = unused_loopback_addr();
+    let db_path = unique_db_path();
+    let mut core = start_core(&http_addr, &grpc_addr, &db_path);
+    wait_for_health(&mut core, &http_addr);
+
+    let conn = open_db_after_schema_ready(&db_path);
+    conn.execute(
+        "INSERT INTO sessions (session_id, started_at, ended_at, model, initial_prompt)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            "session_http_finalized",
+            "2999-01-01T00:00:00Z",
+            "2999-01-01T00:05:00Z",
+            "claude-sonnet",
+            "already done"
+        ],
+    )
+    .expect("insert finalized session");
+
+    let (status, body) = http_post_json(
+        &http_addr,
+        "/api/sessions/finalize",
+        r#"{
+          "session_ids": ["session_http_finalized", "session_http_missing"],
+          "reason": "child_exit",
+          "child_exit_code": 0
+        }"#,
+    )
+    .expect("POST finalize sessions");
+    assert_eq!(status, 200, "body: {body}");
+    let body: Value = serde_json::from_str(&body).expect("finalize JSON");
+    assert_eq!(body["reason"], "child_exit");
+    assert_eq!(body["results"][0]["session_id"], "session_http_finalized");
+    assert_eq!(body["results"][0]["outcome"], "already_finalized");
+    assert_eq!(body["results"][1]["session_id"], "session_http_missing");
+    assert_eq!(body["results"][1]["outcome"], "not_found");
+
+    let (status, body) = http_post_json(
+        &http_addr,
+        "/api/sessions/finalize",
+        r#"{"session_ids":[],"reason":"child_exit"}"#,
+    )
+    .expect("POST invalid finalize sessions");
+    assert_eq!(status, 400);
+    assert!(body.contains("session_ids must not be empty"));
+
+    drop(conn);
+    drop(core);
+    let _ = fs::remove_file(&db_path);
+    let _ = fs::remove_file(format!("{}-wal", db_path.display()));
+    let _ = fs::remove_file(format!("{}-shm", db_path.display()));
+}
+
+#[test]
 fn core_watch_replays_hook_events_for_late_subscribers() {
     let _guard = CORE_PROCESS_TEST_LOCK
         .lock()

@@ -6,6 +6,7 @@ use std::io::{self, ErrorKind, IsTerminal, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
@@ -519,6 +520,83 @@ enum RunLiveMode {
     SplitCurrentTmux,
     TemporaryTmuxSession,
     TmuxUnavailableFallback,
+}
+
+#[derive(Clone, Default)]
+struct RunOwnedSessions {
+    session_ids: Arc<Mutex<HashSet<String>>>,
+}
+
+impl RunOwnedSessions {
+    fn apply_event(&self, event: &WatchEvent, origin: RunGuardEventOrigin) {
+        if origin == RunGuardEventOrigin::Replay {
+            return;
+        }
+        if let WatchEvent::SessionStart { session_id, .. } = event {
+            self.session_ids
+                .lock()
+                .expect("run-owned session lock")
+                .insert(session_id.clone());
+        }
+    }
+
+    fn session_ids(&self) -> Vec<String> {
+        let mut ids = self
+            .session_ids
+            .lock()
+            .expect("run-owned session lock")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+}
+
+struct RunOwnedSessionMonitor {
+    sessions: RunOwnedSessions,
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    ready_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RunOwnedSessionMonitor {
+    #[cfg(test)]
+    fn noop() -> Self {
+        Self {
+            sessions: RunOwnedSessions::default(),
+            stop_tx: None,
+            ready_rx: None,
+            task: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn from_sessions(sessions: RunOwnedSessions) -> Self {
+        Self {
+            sessions,
+            stop_tx: None,
+            ready_rx: None,
+            task: None,
+        }
+    }
+
+    async fn wait_ready(&mut self) {
+        let Some(ready_rx) = self.ready_rx.take() else {
+            return;
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(750), ready_rx).await;
+    }
+
+    async fn finish(mut self) -> Vec<String> {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+        }
+        self.sessions.session_ids()
+    }
 }
 
 fn select_run_live_mode(
@@ -1430,6 +1508,143 @@ fn run_command_with_env(
     Ok(exit_code(status))
 }
 
+async fn run_child_command_with_lifecycle_deps<
+    Detect,
+    Ensure,
+    EnsureFut,
+    Split,
+    Temp,
+    Start,
+    Run,
+    Fallback,
+    Render,
+    RenderFut,
+    Track,
+    Finalize,
+    FinalizeFut,
+>(
+    watch_flag: bool,
+    no_live_flag: bool,
+    command: Vec<String>,
+    detect_terminal: Detect,
+    ensure_stack: Ensure,
+    split_current_tmux: Split,
+    run_temporary_tmux: Temp,
+    start_watcher_fn: Start,
+    run_command_fn: Run,
+    render_fallback: Fallback,
+    render_final_postmortem: Render,
+    start_owned_session_monitor: Track,
+    finalize_owned_sessions: Finalize,
+) -> i32
+where
+    Detect: FnOnce() -> RunTerminalState,
+    Ensure: FnOnce() -> EnsureFut,
+    EnsureFut: std::future::Future<Output = Result<(), String>>,
+    Split: FnOnce() -> Result<(), String>,
+    Temp: FnOnce(&str, &[String], &[(&str, &str)]) -> Result<i32, String>,
+    Start: FnOnce(bool) -> Result<WatchHandle, String>,
+    Run: FnOnce(&str, &[String], &[(&str, &str)]) -> Result<i32, String>,
+    Fallback: FnOnce(),
+    Render: FnOnce(String) -> RenderFut,
+    RenderFut: std::future::Future<Output = ()>,
+    Track: FnOnce(&str) -> RunOwnedSessionMonitor,
+    Finalize: FnOnce(String, Vec<String>, Option<i32>) -> FinalizeFut,
+    FinalizeFut: std::future::Future<Output = Result<(), String>>,
+{
+    let (mut watch, child_command) = extract_run_watch(watch_flag, command);
+    if no_live_flag {
+        watch = false;
+    }
+    if child_command.is_empty() {
+        eprintln!("Error: missing command after `cc-blackbox run`");
+        return 1;
+    }
+
+    if let Err(err) = ensure_stack().await {
+        eprintln!("Error: {err}");
+        return 1;
+    }
+
+    let live_mode = select_run_live_mode(watch, no_live_flag, detect_terminal());
+    let command_name = &child_command[0];
+    let command_args = &child_command[1..];
+    let core_url = cc_blackbox_core_url();
+    let proxy_url = envoy_proxy_url();
+    let proxy_env = [("ANTHROPIC_BASE_URL", proxy_url.as_str())];
+
+    let mut render_postmortem_after_run = false;
+    let mut monitor;
+    let result = match live_mode {
+        RunLiveMode::SplitCurrentTmux => {
+            if let Err(err) = split_current_tmux() {
+                eprintln!("Error: {err}");
+                return 1;
+            }
+            monitor = start_owned_session_monitor(&core_url);
+            monitor.wait_ready().await;
+            run_command_fn(command_name, command_args, &proxy_env)
+        }
+        RunLiveMode::TemporaryTmuxSession => {
+            monitor = start_owned_session_monitor(&core_url);
+            monitor.wait_ready().await;
+            run_temporary_tmux(command_name, command_args, &proxy_env)
+        }
+        RunLiveMode::TmuxUnavailableFallback => {
+            render_fallback();
+            monitor = start_owned_session_monitor(&core_url);
+            monitor.wait_ready().await;
+            run_command_fn(command_name, command_args, &proxy_env)
+        }
+        RunLiveMode::SingleTerminal => {
+            let mut watcher = if watch {
+                match start_watcher_fn(false) {
+                    Ok(handle) => Some(handle),
+                    Err(err) => {
+                        eprintln!("Error: {err}");
+                        return 1;
+                    }
+                }
+            } else {
+                None
+            };
+
+            monitor = start_owned_session_monitor(&core_url);
+            monitor.wait_ready().await;
+            let result = run_command_fn(command_name, command_args, &proxy_env);
+
+            if let Some(handle) = watcher.as_mut() {
+                handle.stop();
+            }
+            render_postmortem_after_run = watch && result.is_ok();
+            result
+        }
+    };
+
+    let owned_session_ids = monitor.finish().await;
+    if !owned_session_ids.is_empty() {
+        let exit_code = result.as_ref().ok().copied();
+        if let Err(err) =
+            finalize_owned_sessions(core_url.clone(), owned_session_ids, exit_code).await
+        {
+            eprintln!("Error: {err}");
+        }
+    }
+
+    if render_postmortem_after_run {
+        render_final_postmortem(core_url).await;
+    }
+
+    match result {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            1
+        }
+    }
+}
+
+#[cfg(test)]
 async fn run_child_command_with_deps<
     Detect,
     Ensure,
@@ -1466,95 +1681,26 @@ where
     Render: FnOnce(String) -> RenderFut,
     RenderFut: std::future::Future<Output = ()>,
 {
-    let (mut watch, child_command) = extract_run_watch(watch_flag, command);
-    if no_live_flag {
-        watch = false;
-    }
-    if child_command.is_empty() {
-        eprintln!("Error: missing command after `cc-blackbox run`");
-        return 1;
-    }
-
-    if let Err(err) = ensure_stack().await {
-        eprintln!("Error: {err}");
-        return 1;
-    }
-
-    let live_mode = select_run_live_mode(watch, no_live_flag, detect_terminal());
-    let command_name = &child_command[0];
-    let command_args = &child_command[1..];
-    let proxy_url = envoy_proxy_url();
-    let proxy_env = [("ANTHROPIC_BASE_URL", proxy_url.as_str())];
-
-    match live_mode {
-        RunLiveMode::SplitCurrentTmux => {
-            if let Err(err) = split_current_tmux() {
-                eprintln!("Error: {err}");
-                return 1;
-            }
-            return match run_command_fn(command_name, command_args, &proxy_env) {
-                Ok(code) => code,
-                Err(err) => {
-                    eprintln!("Error: {err}");
-                    1
-                }
-            };
-        }
-        RunLiveMode::TemporaryTmuxSession => {
-            return match run_temporary_tmux(command_name, command_args, &proxy_env) {
-                Ok(code) => code,
-                Err(err) => {
-                    eprintln!("Error: {err}");
-                    1
-                }
-            };
-        }
-        RunLiveMode::TmuxUnavailableFallback => {
-            render_fallback();
-            return match run_command_fn(command_name, command_args, &proxy_env) {
-                Ok(code) => code,
-                Err(err) => {
-                    eprintln!("Error: {err}");
-                    1
-                }
-            };
-        }
-        RunLiveMode::SingleTerminal => {}
-    }
-
-    let mut watcher = if watch {
-        match start_watcher_fn(false) {
-            Ok(handle) => Some(handle),
-            Err(err) => {
-                eprintln!("Error: {err}");
-                return 1;
-            }
-        }
-    } else {
-        None
-    };
-
-    let result = run_command_fn(command_name, command_args, &proxy_env);
-
-    if let Some(handle) = watcher.as_mut() {
-        handle.stop();
-    }
-
-    if watch && result.is_ok() {
-        render_final_postmortem(cc_blackbox_core_url()).await;
-    }
-
-    match result {
-        Ok(code) => code,
-        Err(err) => {
-            eprintln!("Error: {err}");
-            1
-        }
-    }
+    run_child_command_with_lifecycle_deps(
+        watch_flag,
+        no_live_flag,
+        command,
+        detect_terminal,
+        ensure_stack,
+        split_current_tmux,
+        run_temporary_tmux,
+        start_watcher_fn,
+        run_command_fn,
+        render_fallback,
+        render_final_postmortem,
+        |_base_url| RunOwnedSessionMonitor::noop(),
+        |_base_url, _session_ids, _exit_code| async { Ok(()) },
+    )
+    .await
 }
 
 async fn run_child_command(watch_flag: bool, no_live_flag: bool, command: Vec<String>) -> i32 {
-    run_child_command_with_deps(
+    run_child_command_with_lifecycle_deps(
         watch_flag,
         no_live_flag,
         command,
@@ -1570,6 +1716,8 @@ async fn run_child_command(watch_flag: bool, no_live_flag: bool, command: Vec<St
         |base_url| async move {
             render_run_final_postmortem(&base_url).await;
         },
+        start_run_owned_session_monitor,
+        finalize_run_owned_sessions,
     )
     .await
 }
@@ -2515,6 +2663,169 @@ fn render_run_guard_panel(panel: &RunGuardPanel) -> String {
 
 fn run_owned_watch_url(base_url: &str) -> String {
     format!("{}/watch?replay=false", base_url.trim_end_matches('/'))
+}
+
+fn start_run_owned_session_monitor(base_url: &str) -> RunOwnedSessionMonitor {
+    let sessions = RunOwnedSessions::default();
+    let url = run_owned_watch_url(base_url);
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let task_sessions = sessions.clone();
+    let task = tokio::spawn(async move {
+        run_owned_session_monitor_loop(url, task_sessions, stop_rx, ready_tx).await;
+    });
+    RunOwnedSessionMonitor {
+        sessions,
+        stop_tx: Some(stop_tx),
+        ready_rx: Some(ready_rx),
+        task: Some(task),
+    }
+}
+
+async fn run_owned_session_monitor_loop(
+    url: String,
+    sessions: RunOwnedSessions,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    ready_tx: tokio::sync::oneshot::Sender<()>,
+) {
+    let client = reqwest::Client::new();
+    let mut ready_tx = Some(ready_tx);
+    loop {
+        let response = tokio::select! {
+            _ = &mut stop_rx => break,
+            response = client.get(&url).header("Accept", "text/event-stream").send() => response,
+        };
+        let Ok(response) = response else {
+            if wait_or_stop(&mut stop_rx, Duration::from_millis(250)).await {
+                break;
+            }
+            continue;
+        };
+        if !response.status().is_success() {
+            if wait_or_stop(&mut stop_rx, Duration::from_millis(250)).await {
+                break;
+            }
+            continue;
+        }
+        if let Some(ready_tx) = ready_tx.take() {
+            let _ = ready_tx.send(());
+        }
+
+        let mut stream = response.bytes_stream();
+        use futures_util::StreamExt;
+        let mut line_buffer = Vec::new();
+        let mut data_buffer = String::new();
+
+        loop {
+            let chunk = tokio::select! {
+                _ = &mut stop_rx => return,
+                chunk = stream.next() => chunk,
+            };
+            let Some(Ok(chunk)) = chunk else {
+                break;
+            };
+            line_buffer.extend_from_slice(&chunk);
+
+            while let Some(newline_pos) = line_buffer.iter().position(|byte| *byte == b'\n') {
+                let line_bytes = line_buffer[..newline_pos].to_vec();
+                line_buffer.drain(..=newline_pos);
+                let Ok(line) = std::str::from_utf8(&line_bytes) else {
+                    continue;
+                };
+                let line = line.trim_end_matches('\r');
+
+                if let Some(data) = line.strip_prefix("data: ") {
+                    data_buffer.push_str(data);
+                } else if line.starts_with(": ") || line.starts_with(':') {
+                    continue;
+                } else if line.is_empty() && !data_buffer.is_empty() {
+                    if let Ok(event) = serde_json::from_str::<WatchEvent>(&data_buffer) {
+                        sessions.apply_event(&event, RunGuardEventOrigin::Live);
+                    }
+                    data_buffer.clear();
+                }
+            }
+        }
+
+        if wait_or_stop(&mut stop_rx, Duration::from_millis(250)).await {
+            break;
+        }
+    }
+}
+
+async fn wait_or_stop(
+    stop_rx: &mut tokio::sync::oneshot::Receiver<()>,
+    duration: Duration,
+) -> bool {
+    tokio::select! {
+        _ = stop_rx => true,
+        _ = tokio::time::sleep(duration) => false,
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct FinalizeRunSessionsRequest {
+    session_ids: Vec<String>,
+    reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    child_exit_code: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FinalizeRunSessionsResponse {
+    results: Vec<FinalizeRunSessionResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FinalizeRunSessionResult {
+    session_id: String,
+    outcome: String,
+}
+
+async fn finalize_run_owned_sessions(
+    base_url: String,
+    session_ids: Vec<String>,
+    child_exit_code: Option<i32>,
+) -> Result<(), String> {
+    if session_ids.is_empty() {
+        return Ok(());
+    }
+    let url = format!("{}/api/sessions/finalize", base_url.trim_end_matches('/'));
+    let payload = FinalizeRunSessionsRequest {
+        session_ids,
+        reason: "child_exit".to_string(),
+        child_exit_code,
+    };
+    let response = reqwest::Client::new()
+        .post(&url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| format!("failed to call session finalization API: {err}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "session finalization API returned HTTP {}",
+            response.status()
+        ));
+    }
+    let body = response
+        .json::<FinalizeRunSessionsResponse>()
+        .await
+        .map_err(|err| format!("invalid session finalization response: {err}"))?;
+    let failed = body
+        .results
+        .iter()
+        .filter(|result| matches!(result.outcome.as_str(), "failed" | "not_found"))
+        .map(|result| format!("{}:{}", result.session_id, result.outcome))
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "session finalization failed for {}",
+            failed.join(", ")
+        ))
+    }
 }
 
 /// Extract session_id from any WatchEvent variant. Returns None for global
@@ -6466,17 +6777,19 @@ mod tests {
         connect_and_guard_stream, connect_and_run_guard_stream, event_session_id,
         extract_run_watch, fetch_guard_policy_report, fetch_guard_status_report,
         fetch_postmortem_json, fetch_run_final_postmortem_markdown,
-        fetch_run_final_postmortem_markdown_with_retry, format_duration_coarse, format_tokens,
-        local_time_from_iso, parse_mcp_tool_name, postmortem_progress_message,
-        postmortem_separator_line_for_width, push_unique, render_guard_policy_report,
-        render_guard_status_report, render_guard_watch_line, render_postmortem_markdown,
-        render_postmortem_markdown_with_optional_analysis, render_postmortem_terminal_for_width,
-        render_run_guard_panel, render_tmux_unavailable_fallback, run_child_command_with_deps,
-        run_claude_postmortem_analysis_with_command, run_claude_postmortem_analysis_with_lookup,
-        run_guard_start_with_deps, run_owned_watch_url, select_run_live_mode, shell_join,
-        shell_quote, truncate_for_box, watcher_args, yaml_quote, ActiveSessions, Cli, Commands,
-        GuardCommands, GuardStackReadiness, RunGuardEventOrigin, RunGuardPanel, RunLiveMode,
-        RunTerminalState, WatchEvent, WatchPostmortemState,
+        fetch_run_final_postmortem_markdown_with_retry, finalize_run_owned_sessions,
+        format_duration_coarse, format_tokens, local_time_from_iso, parse_mcp_tool_name,
+        postmortem_progress_message, postmortem_separator_line_for_width, push_unique,
+        render_guard_policy_report, render_guard_status_report, render_guard_watch_line,
+        render_postmortem_markdown, render_postmortem_markdown_with_optional_analysis,
+        render_postmortem_terminal_for_width, render_run_guard_panel,
+        render_tmux_unavailable_fallback, run_child_command_with_deps,
+        run_child_command_with_lifecycle_deps, run_claude_postmortem_analysis_with_command,
+        run_claude_postmortem_analysis_with_lookup, run_guard_start_with_deps, run_owned_watch_url,
+        select_run_live_mode, shell_join, shell_quote, truncate_for_box, watcher_args, yaml_quote,
+        ActiveSessions, Cli, Commands, GuardCommands, GuardStackReadiness, RunGuardEventOrigin,
+        RunGuardPanel, RunLiveMode, RunOwnedSessionMonitor, RunOwnedSessions, RunTerminalState,
+        WatchEvent, WatchPostmortemState,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
@@ -6582,6 +6895,66 @@ mod tests {
             }
         }
         String::from_utf8_lossy(&request).into_owned()
+    }
+
+    fn read_http_request_with_body(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut buffer).expect("read request");
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..n]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let headers = String::from_utf8_lossy(&request).into_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|pos| pos + 4)
+            .unwrap_or(request.len());
+        while request.len().saturating_sub(header_end) < content_length {
+            let n = stream.read(&mut buffer).expect("read body");
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..n]);
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    fn serve_finalize_once() -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind finalize server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept finalize request");
+            let request = read_http_request_with_body(&mut stream);
+            tx.send(request).expect("send captured request");
+            let body = r#"{"reason":"child_exit","results":[{"session_id":"session-child-a","outcome":"finalized"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write finalize response");
+        });
+
+        (url, rx)
     }
 
     fn serve_watch_and_postmortem_once(
@@ -7268,6 +7641,92 @@ mod tests {
 
         assert_eq!(exit_code, 7);
         assert_eq!(*events.lock().expect("test events lock"), vec!["run"]);
+    }
+
+    #[tokio::test]
+    async fn run_finalizes_live_sessions_started_by_child() {
+        let owned = RunOwnedSessions::default();
+        let owned_for_run = owned.clone();
+        let finalized = Arc::new(Mutex::new(Vec::new()));
+        let finalized_for_assert = finalized.clone();
+
+        let exit_code = run_child_command_with_lifecycle_deps(
+            false,
+            true,
+            vec!["fake-child".to_string()],
+            || RunTerminalState {
+                interactive: true,
+                tmux_available: true,
+                inside_tmux: true,
+            },
+            || async { Ok(()) },
+            || panic!("--no-live should not split tmux"),
+            |_command, _args, _envs| panic!("--no-live should not create temporary tmux"),
+            |_postmortem| panic!("--no-live should not start legacy watcher"),
+            move |_command, _args, _envs| {
+                owned_for_run.apply_event(
+                    &WatchEvent::SessionStart {
+                        session_id: "session-child-b".to_string(),
+                        display_name: "child-b".to_string(),
+                        model: "sonnet".to_string(),
+                        initial_prompt: None,
+                    },
+                    RunGuardEventOrigin::Live,
+                );
+                owned_for_run.apply_event(
+                    &WatchEvent::SessionStart {
+                        session_id: "session-child-a".to_string(),
+                        display_name: "child-a".to_string(),
+                        model: "sonnet".to_string(),
+                        initial_prompt: None,
+                    },
+                    RunGuardEventOrigin::Live,
+                );
+                Ok(17)
+            },
+            || panic!("tmux is available; fallback should not render"),
+            |_base_url| async move {
+                panic!("--no-live should not render final postmortem");
+            },
+            {
+                let owned = owned.clone();
+                move |_base_url| {
+                    owned.apply_event(
+                        &WatchEvent::SessionStart {
+                            session_id: "session-replayed-old".to_string(),
+                            display_name: "old".to_string(),
+                            model: "sonnet".to_string(),
+                            initial_prompt: None,
+                        },
+                        RunGuardEventOrigin::Replay,
+                    );
+                    RunOwnedSessionMonitor::from_sessions(owned.clone())
+                }
+            },
+            {
+                let finalized = finalized.clone();
+                move |_base_url, session_ids, exit_code| {
+                    let finalized = finalized.clone();
+                    async move {
+                        finalized
+                            .lock()
+                            .expect("finalized lock")
+                            .push((session_ids, exit_code));
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(exit_code, 17);
+        assert_eq!(
+            *finalized_for_assert.lock().expect("finalized lock"),
+            vec![(
+                vec!["session-child-a".to_string(), "session-child-b".to_string()],
+                Some(17)
+            )]
+        );
     }
 
     #[tokio::test]
@@ -8330,6 +8789,23 @@ mod tests {
                 .contains("accept: text/event-stream"),
             "missing SSE accept header:\n{request}"
         );
+    }
+
+    #[tokio::test]
+    async fn finalize_run_owned_sessions_posts_child_exit_payload() {
+        let (url, request_rx) = serve_finalize_once();
+
+        finalize_run_owned_sessions(url, vec!["session-child-a".to_string()], Some(23))
+            .await
+            .expect("finalize request succeeds");
+
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured finalize request");
+        assert!(request.starts_with("POST /api/sessions/finalize "));
+        assert!(request.contains("\"session_ids\":[\"session-child-a\"]"));
+        assert!(request.contains("\"reason\":\"child_exit\""));
+        assert!(request.contains("\"child_exit_code\":23"));
     }
 
     #[test]

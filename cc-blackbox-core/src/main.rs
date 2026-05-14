@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use regex::Regex;
 use rusqlite::{Connection, OptionalExtension};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -893,6 +893,12 @@ fn guard_finding_watch_event(finding: guard::GuardFinding) -> watch::WatchEvent 
 }
 
 fn broadcast_guard_finding(finding: guard::GuardFinding) {
+    metrics::record_guard_finding(
+        &finding.rule_id.to_string(),
+        &serialized_label(finding.severity),
+        &serialized_label(finding.action),
+        &serialized_label(finding.source),
+    );
     let _ = DB_TX.send(DbCommand::WriteGuardFinding {
         finding: finding.clone(),
     });
@@ -2998,6 +3004,24 @@ fn session_state_if_still_expired(
         session_inserted: state.session_inserted,
         model: state.model.clone(),
         initial_prompt: state.initial_prompt.clone(),
+    })
+}
+
+#[derive(Clone, Debug)]
+struct LiveSessionSnapshot {
+    session_inserted: bool,
+    model: String,
+    initial_prompt: Option<String>,
+}
+
+fn live_session_snapshot_by_id(session_id: &str) -> Option<LiveSessionSnapshot> {
+    diagnosis::SESSIONS.iter().find_map(|entry| {
+        let state = entry.value();
+        (state.session_id == session_id).then(|| LiveSessionSnapshot {
+            session_inserted: state.session_inserted,
+            model: state.model.clone(),
+            initial_prompt: state.initial_prompt.clone(),
+        })
     })
 }
 
@@ -6802,7 +6826,9 @@ fn end_session(
     session_model: Option<String>,
     initial_prompt: Option<String>,
 ) -> bool {
-    end_session_with_db_tx(session_id, session_model, initial_prompt, &DB_TX)
+    let finalized = end_session_with_db_tx(session_id, session_model, initial_prompt, &DB_TX);
+    metrics::record_session_finalization("timeout", if finalized { "finalized" } else { "failed" });
+    finalized
 }
 
 fn end_session_with_db_tx(
@@ -6811,10 +6837,26 @@ fn end_session_with_db_tx(
     initial_prompt: Option<String>,
     db_tx: &std_mpsc::Sender<DbCommand>,
 ) -> bool {
-    let Some(turns) = diagnosis::SESSION_TURNS
+    end_session_with_db_tx_and_outcome(session_id, session_model, initial_prompt, db_tx, None)
+}
+
+fn end_session_with_db_tx_and_outcome(
+    session_id: &str,
+    session_model: Option<String>,
+    initial_prompt: Option<String>,
+    db_tx: &std_mpsc::Sender<DbCommand>,
+    forced_outcome: Option<&str>,
+) -> bool {
+    let live_snapshot = live_session_snapshot_by_id(session_id);
+    let turns = diagnosis::SESSION_TURNS
         .get(session_id)
         .map(|entry| entry.clone())
-    else {
+        .unwrap_or_default();
+    if turns.is_empty()
+        && !live_snapshot
+            .as_ref()
+            .is_some_and(|state| state.session_inserted)
+    {
         let removed_state = remove_session_state_by_id(session_id);
         if removed_state
             .as_ref()
@@ -6825,10 +6867,19 @@ fn end_session_with_db_tx(
         SESSION_BUDGETS.remove(session_id);
         CACHE_TRACKERS.remove(session_id);
         return true;
-    };
+    }
 
-    let report = diagnosis::analyze_session(session_id, &turns);
-    let recall_initial_prompt = initial_prompt.unwrap_or_default();
+    let mut report = diagnosis::analyze_session(session_id, &turns);
+    if let Some(outcome) = forced_outcome {
+        report.outcome = outcome.to_string();
+    }
+    let recall_initial_prompt = initial_prompt
+        .or_else(|| {
+            live_snapshot
+                .as_ref()
+                .and_then(|state| state.initial_prompt.clone())
+        })
+        .unwrap_or_default();
     let recall_summary = last_session_response_summary(&turns);
     let recall = PersistedRecall {
         initial_prompt: recall_initial_prompt,
@@ -6906,9 +6957,12 @@ fn end_session_with_db_tx(
         total_tokens: report.total_tokens,
         total_turns: report.total_turns,
     });
+    let model_for_metrics = session_model
+        .as_deref()
+        .or(live_snapshot.as_ref().map(|state| state.model.as_str()));
     metrics::record_session_end(
         &report.outcome,
-        session_model.as_deref(),
+        model_for_metrics,
         report.estimated_total_cost_dollars,
         report.total_turns,
     );
@@ -6928,6 +6982,170 @@ fn end_session_with_db_tx(
     }
 
     true
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct FinalizeSessionResult {
+    session_id: String,
+    outcome: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct FinalizeSessionsResponse {
+    reason: String,
+    results: Vec<FinalizeSessionResult>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct FinalizeSessionsRequest {
+    session_ids: Vec<String>,
+    reason: String,
+    child_exit_code: Option<i32>,
+    rule_id: Option<String>,
+    metadata: Option<Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoredFinalizationState {
+    Active,
+    Ended,
+}
+
+fn stored_finalization_state(
+    db_path: &str,
+    session_id: &str,
+) -> Result<Option<StoredFinalizationState>, String> {
+    let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
+    let ended_at = conn
+        .query_row(
+            "SELECT ended_at FROM sessions WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|err| err.to_string())?;
+    Ok(ended_at.map(|ended_at| {
+        if ended_at
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        {
+            StoredFinalizationState::Ended
+        } else {
+            StoredFinalizationState::Active
+        }
+    }))
+}
+
+fn normalize_finalization_reason(reason: &str) -> &'static str {
+    match reason {
+        "child_exit" => "child_exit",
+        "budget_block" => "budget_block",
+        "timeout" => "timeout",
+        "explicit_api" => "explicit_api",
+        _ => "other",
+    }
+}
+
+fn finalize_one_session_with_db_tx(
+    session_id: &str,
+    reason: &str,
+    db_tx: &std_mpsc::Sender<DbCommand>,
+    db_path: &str,
+) -> FinalizeSessionResult {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return FinalizeSessionResult {
+            session_id: String::new(),
+            outcome: "not_found".to_string(),
+        };
+    }
+
+    if session_is_live(session_id) {
+        let snapshot = live_session_snapshot_by_id(session_id);
+        let forced_outcome =
+            (normalize_finalization_reason(reason) == "budget_block").then_some("Budget Exceeded");
+        let finalized = end_session_with_db_tx_and_outcome(
+            session_id,
+            snapshot.as_ref().map(|state| state.model.clone()),
+            snapshot
+                .as_ref()
+                .and_then(|state| state.initial_prompt.clone()),
+            db_tx,
+            forced_outcome,
+        );
+        return FinalizeSessionResult {
+            session_id: session_id.to_string(),
+            outcome: if finalized {
+                "finalized".to_string()
+            } else {
+                "failed".to_string()
+            },
+        };
+    }
+
+    let outcome = match stored_finalization_state(db_path, session_id) {
+        Ok(Some(StoredFinalizationState::Ended)) => "already_finalized",
+        Ok(Some(StoredFinalizationState::Active)) => "failed",
+        Ok(None) => "not_found",
+        Err(_) => "failed",
+    };
+    FinalizeSessionResult {
+        session_id: session_id.to_string(),
+        outcome: outcome.to_string(),
+    }
+}
+
+fn finalize_sessions_with_db_tx(
+    session_ids: &[String],
+    reason: &str,
+    db_tx: &std_mpsc::Sender<DbCommand>,
+    db_path: &str,
+) -> FinalizeSessionsResponse {
+    let reason = normalize_finalization_reason(reason).to_string();
+    let mut results = Vec::with_capacity(session_ids.len());
+    for session_id in session_ids {
+        let result = finalize_one_session_with_db_tx(session_id, &reason, db_tx, db_path);
+        metrics::record_session_finalization(&reason, &result.outcome);
+        results.push(result);
+    }
+    FinalizeSessionsResponse { reason, results }
+}
+
+fn is_terminal_budget_rule(rule_id: guard::RuleId) -> bool {
+    matches!(
+        rule_id,
+        guard::RuleId::PerSessionTokenBudgetExceeded
+            | guard::RuleId::PerSessionTrustedDollarBudgetExceeded
+    )
+}
+
+fn finalize_terminal_budget_block_with_db_tx(
+    block: &guard::GuardBlock,
+    db_tx: &std_mpsc::Sender<DbCommand>,
+    db_path: &str,
+) -> Option<FinalizeSessionResult> {
+    if !is_terminal_budget_rule(block.rule_id) {
+        return None;
+    }
+    let session_id = block.session_id.as_deref()?;
+    let response =
+        finalize_sessions_with_db_tx(&[session_id.to_string()], "budget_block", db_tx, db_path);
+    response.results.into_iter().next()
+}
+
+fn finalize_terminal_budget_block(block: &guard::GuardBlock) -> Option<FinalizeSessionResult> {
+    let result = finalize_terminal_budget_block_with_db_tx(block, &DB_TX, &db_path());
+    if let Some(result) = result.as_ref() {
+        if result.outcome == "failed" {
+            warn!(
+                session_id = %result.session_id,
+                rule_id = %block.rule_id,
+                "failed to finalize terminal budget-blocked session"
+            );
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -8632,6 +8850,7 @@ impl ExternalProcessor for CcBlackboxProcessor {
                                     let finding = decision.finding.clone();
                                     if let Some(block) = decision.block.as_ref() {
                                         warn!(request_id = %request_id, error_type = %block.error_type, rule_id = %block.rule_id, "request blocked");
+                                        metrics::record_guard_block(&block.rule_id.to_string());
                                         ensure_session_inserted(
                                             parsed.sys_prompt_hash,
                                             &session_id,
@@ -8647,6 +8866,7 @@ impl ExternalProcessor for CcBlackboxProcessor {
                                         if let Some(finding) = finding {
                                             broadcast_guard_finding(finding);
                                         }
+                                        let _ = finalize_terminal_budget_block(block);
                                         blocked = true;
                                     }
                                 }
@@ -8903,6 +9123,46 @@ async fn handle_guard_status(
         [("content-type", "application/json")],
         serde_json::to_string_pretty(&report).unwrap_or_default(),
     )
+}
+
+async fn handle_finalize_sessions(
+    Json(payload): Json<FinalizeSessionsRequest>,
+) -> impl IntoResponse {
+    if payload.session_ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            [("content-type", "application/json")],
+            serde_json::json!({"error": "session_ids must not be empty"}).to_string(),
+        )
+            .into_response();
+    }
+    if payload.reason.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            [("content-type", "application/json")],
+            serde_json::json!({"error": "reason must not be empty"}).to_string(),
+        )
+            .into_response();
+    }
+
+    let session_ids = payload.session_ids;
+    let reason = payload.reason;
+    let _metadata = (payload.child_exit_code, payload.rule_id, payload.metadata);
+    let db_tx = DB_TX.clone();
+    let path = db_path();
+    let response = tokio::task::spawn_blocking(move || {
+        finalize_sessions_with_db_tx(&session_ids, &reason, &db_tx, &path)
+    })
+    .await
+    .unwrap_or_else(|_err| FinalizeSessionsResponse {
+        reason: "other".to_string(),
+        results: vec![FinalizeSessionResult {
+            session_id: String::new(),
+            outcome: "failed".to_string(),
+        }],
+    });
+
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 async fn handle_watch(
@@ -9883,6 +10143,7 @@ async fn http_server() {
         .route("/api/degradation/:session_id", get(handle_degradation))
         .route("/api/cache-rebuilds", get(handle_cache_rebuilds))
         .route("/api/sessions", get(handle_sessions))
+        .route("/api/sessions/finalize", post(handle_finalize_sessions))
         .route("/watch", get(handle_watch));
 
     let addr =
@@ -11249,6 +11510,46 @@ mod tests {
         .expect("insert session");
     }
 
+    fn insert_live_session_for_finalization(
+        db_path: &str,
+        session_id: &str,
+        hash: u64,
+        prompt: &str,
+    ) {
+        {
+            let conn = Connection::open(db_path).expect("open test db");
+            conn.execute_batch(SCHEMA).expect("create schema");
+            insert_session(
+                &conn,
+                session_id,
+                "2026-01-01T00:00:00Z",
+                None,
+                "claude-sonnet",
+                Some(prompt),
+            );
+        }
+        let _ = diagnosis::SESSION_TURNS.remove(session_id);
+        let _ = diagnosis::SESSIONS.remove(&hash);
+        diagnosis::SESSIONS.insert(
+            hash,
+            diagnosis::SessionState {
+                session_id: session_id.to_string(),
+                display_name: "finalization-test".to_string(),
+                model: "claude-sonnet".to_string(),
+                initial_prompt: Some(prompt.to_string()),
+                created_at: Instant::now(),
+                last_activity: Instant::now(),
+                session_inserted: true,
+                cache_warning_sent: false,
+                idle_postmortem_sent: false,
+            },
+        );
+        diagnosis::SESSION_TURNS.insert(
+            session_id.to_string(),
+            vec![test_live_turn(1, Some("Budgeted response."))],
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn insert_request(
         conn: &Connection,
@@ -12604,6 +12905,56 @@ mod tests {
             ],
             " 2"
         ));
+    }
+
+    #[test]
+    fn guard_and_finalization_metrics_are_low_cardinality() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        metrics::init();
+
+        metrics::record_guard_finding(
+            "per_session_token_budget_exceeded",
+            "critical",
+            "block",
+            "proxy",
+        );
+        metrics::record_guard_block("per_session_token_budget_exceeded");
+        metrics::record_session_finalization("child_exit", "finalized");
+
+        let (_, body) = metrics::render().expect("render metrics");
+        assert!(metric_line_has(
+            &body,
+            "cc_blackbox_guard_findings_total",
+            &[
+                "rule_id=\"per_session_token_budget_exceeded\"",
+                "severity=\"critical\"",
+                "action=\"block\"",
+                "source=\"proxy\""
+            ],
+            ""
+        ));
+        assert!(metric_line_has(
+            &body,
+            "cc_blackbox_guard_blocks_total",
+            &["rule_id=\"per_session_token_budget_exceeded\""],
+            ""
+        ));
+        assert!(metric_line_has(
+            &body,
+            "cc_blackbox_session_finalizations_total",
+            &["reason=\"child_exit\"", "outcome=\"finalized\""],
+            ""
+        ));
+        for line in body.lines().filter(|line| {
+            line.starts_with("cc_blackbox_guard_findings_total")
+                || line.starts_with("cc_blackbox_guard_blocks_total")
+                || line.starts_with("cc_blackbox_session_finalizations_total")
+        }) {
+            assert!(
+                !line.contains("session_id="),
+                "unexpected session_id label: {line}"
+            );
+        }
     }
 
     #[test]
@@ -14612,6 +14963,104 @@ mod tests {
     }
 
     #[test]
+    fn explicit_session_finalization_persists_artifacts_and_is_idempotent() {
+        let path = unique_test_db_path("explicit-finalization");
+        let (tx, rx) = std_mpsc::channel();
+        let writer_path = path.clone();
+        let handle = std::thread::spawn(move || db_writer_loop(&writer_path, rx));
+        let session_id = "session-explicit-finalization";
+        let hash = 0x51d0_f1a4_u64;
+        let _ = diagnosis::SESSION_TURNS.remove(session_id);
+        let _ = diagnosis::SESSIONS.remove(&hash);
+
+        {
+            let conn = Connection::open(&path).expect("open test db");
+            conn.execute_batch(SCHEMA).expect("create schema");
+            insert_session(
+                &conn,
+                session_id,
+                "2026-01-01T00:00:00Z",
+                None,
+                "claude-sonnet",
+                Some("Implement the finalization API"),
+            );
+        }
+
+        diagnosis::SESSIONS.insert(
+            hash,
+            diagnosis::SessionState {
+                session_id: session_id.to_string(),
+                display_name: "explicit-finalization".to_string(),
+                model: "claude-sonnet".to_string(),
+                initial_prompt: Some("Implement the finalization API".to_string()),
+                created_at: Instant::now(),
+                last_activity: Instant::now(),
+                session_inserted: true,
+                cache_warning_sent: false,
+                idle_postmortem_sent: false,
+            },
+        );
+        diagnosis::SESSION_TURNS.insert(
+            session_id.to_string(),
+            vec![test_live_turn(1, Some("Final response summary."))],
+        );
+
+        let response = super::finalize_sessions_with_db_tx(
+            &[session_id.to_string()],
+            "child_exit",
+            &tx,
+            &path,
+        );
+        assert_eq!(response.results[0].outcome, "finalized");
+        assert!(diagnosis::SESSIONS.get(&hash).is_none());
+        assert!(diagnosis::SESSION_TURNS.get(session_id).is_none());
+
+        let conn = Connection::open(&path).expect("open finalized db");
+        let ended_at: Option<String> = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                |row| row.get(0),
+            )
+            .expect("query ended_at");
+        assert!(ended_at.is_some());
+        let diagnosis_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_diagnoses WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                |row| row.get(0),
+            )
+            .expect("count diagnoses");
+        assert_eq!(diagnosis_rows, 1);
+        let postmortem =
+            build_postmortem_response_from_db(&conn, session_id, false).expect("postmortem");
+        assert_eq!(
+            postmortem.get("partial").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+
+        let retry = super::finalize_sessions_with_db_tx(
+            &[session_id.to_string()],
+            "child_exit",
+            &tx,
+            &path,
+        );
+        assert_eq!(retry.results[0].outcome, "already_finalized");
+
+        let missing = super::finalize_sessions_with_db_tx(
+            &["session-missing-finalization".to_string()],
+            "child_exit",
+            &tx,
+            &path,
+        );
+        assert_eq!(missing.results[0].outcome, "not_found");
+
+        drop(tx);
+        handle.join().expect("db writer exits");
+        cleanup_test_db(&path);
+    }
+
+    #[test]
     fn final_session_artifact_persistence_rolls_back_on_partial_failure() {
         let conn = Connection::open_in_memory().expect("open sqlite");
         conn.execute_batch(
@@ -14994,6 +15443,174 @@ mod tests {
         assert_eq!(block.configured_threshold_or_limit, "100 tokens");
 
         SESSION_BUDGETS.remove(session_id);
+    }
+
+    #[test]
+    fn token_budget_block_finalizes_affected_session() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
+        let _dollar_budget = EnvVarGuard::remove("CC_BLACKBOX_SESSION_BUDGET_DOLLARS");
+        let _token_budget = EnvVarGuard::set("CC_BLACKBOX_SESSION_BUDGET_TOKENS", "100");
+        let path = unique_test_db_path("token-budget-finalization");
+        let (tx, rx) = std_mpsc::channel();
+        let writer_path = path.clone();
+        let handle = std::thread::spawn(move || db_writer_loop(&writer_path, rx));
+        let session_id = "session-token-budget-final";
+        let hash = 0x7b0d_9e7u64;
+        let _ = diagnosis::SESSION_TURNS.remove(session_id);
+        let _ = diagnosis::SESSIONS.remove(&hash);
+
+        {
+            let conn = Connection::open(&path).expect("open test db");
+            conn.execute_batch(SCHEMA).expect("create schema");
+            insert_session(
+                &conn,
+                session_id,
+                "2026-01-01T00:00:00Z",
+                None,
+                "claude-sonnet",
+                Some("Stay within budget"),
+            );
+        }
+        diagnosis::SESSIONS.insert(
+            hash,
+            diagnosis::SessionState {
+                session_id: session_id.to_string(),
+                display_name: "token-budget-final".to_string(),
+                model: "claude-sonnet".to_string(),
+                initial_prompt: Some("Stay within budget".to_string()),
+                created_at: Instant::now(),
+                last_activity: Instant::now(),
+                session_inserted: true,
+                cache_warning_sent: false,
+                idle_postmortem_sent: false,
+            },
+        );
+        diagnosis::SESSION_TURNS.insert(
+            session_id.to_string(),
+            vec![test_live_turn(1, Some("Budgeted response."))],
+        );
+        SESSION_BUDGETS.insert(
+            session_id.to_string(),
+            SessionBudgetState {
+                total_spend: 0.0,
+                trusted_spend: 0.0,
+                untrusted_spend: 0.0,
+                total_tokens: 100,
+                request_count: 1,
+                estimated_cache_waste_dollars: 0.0,
+            },
+        );
+
+        let policy = request_guard_policy().expect("default policy loads");
+        let decision = evaluate_request_guard_for_session(Some(session_id), Some(&policy))
+            .expect("token budget blocks");
+        let block = decision.block.expect("block metadata");
+        let result =
+            super::finalize_terminal_budget_block_with_db_tx(&block, &tx, &path).expect("result");
+
+        assert_eq!(result.outcome, "finalized");
+        assert!(diagnosis::SESSIONS.get(&hash).is_none());
+        assert!(diagnosis::SESSION_TURNS.get(session_id).is_none());
+        assert!(SESSION_BUDGETS.get(session_id).is_none());
+
+        let conn = Connection::open(&path).expect("open finalized db");
+        let (ended_at, outcome): (Option<String>, String) = conn
+            .query_row(
+                "SELECT s.ended_at, d.outcome \
+                 FROM sessions s JOIN session_diagnoses d ON d.session_id = s.session_id \
+                 WHERE s.session_id = ?1",
+                rusqlite::params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query final state");
+        assert!(ended_at.is_some());
+        assert_eq!(outcome, "Budget Exceeded");
+
+        drop(tx);
+        handle.join().expect("db writer exits");
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn trusted_dollar_budget_block_finalizes_affected_session() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
+        let path = unique_test_db_path("trusted-budget-finalization");
+        let (tx, rx) = std_mpsc::channel();
+        let writer_path = path.clone();
+        let handle = std::thread::spawn(move || db_writer_loop(&writer_path, rx));
+        let session_id = "session-trusted-budget-final";
+        let hash = 0x7b0d_7011u64;
+        insert_live_session_for_finalization(&path, session_id, hash, "Stay within dollar budget");
+        let block = guard::GuardBlock {
+            error_type: "budget_exceeded".to_string(),
+            reason: "Session trusted-dollar budget exceeded.".to_string(),
+            rule_id: guard::RuleId::PerSessionTrustedDollarBudgetExceeded,
+            configured_threshold_or_limit: "$10.00 trusted spend".to_string(),
+            current_observed_value: "$12.00 trusted spend".to_string(),
+            session_id: Some(session_id.to_string()),
+            suggested_next_action: "Start a fresh session.".to_string(),
+            cooldown_remaining_secs: None,
+        };
+
+        let result =
+            super::finalize_terminal_budget_block_with_db_tx(&block, &tx, &path).expect("result");
+
+        assert_eq!(result.outcome, "finalized");
+        let conn = Connection::open(&path).expect("open finalized db");
+        let outcome: String = conn
+            .query_row(
+                "SELECT outcome FROM session_diagnoses WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                |row| row.get(0),
+            )
+            .expect("query diagnosis outcome");
+        assert_eq!(outcome, "Budget Exceeded");
+        assert!(diagnosis::SESSIONS.get(&hash).is_none());
+
+        drop(tx);
+        handle.join().expect("db writer exits");
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn api_cooldown_block_does_not_finalize_an_arbitrary_session() {
+        let path = unique_test_db_path("cooldown-no-finalization");
+        let (tx, rx) = std_mpsc::channel();
+        let writer_path = path.clone();
+        let handle = std::thread::spawn(move || db_writer_loop(&writer_path, rx));
+        let session_id = "session-cooldown-not-final";
+        let hash = 0x7b0d_c001u64;
+        insert_live_session_for_finalization(&path, session_id, hash, "Wait for cooldown");
+        let block = guard::GuardBlock {
+            error_type: "circuit_breaker".to_string(),
+            reason: "API error cooldown active.".to_string(),
+            rule_id: guard::RuleId::ApiErrorCircuitBreakerCooldown,
+            configured_threshold_or_limit: "2 consecutive API errors; cooldown 60s".to_string(),
+            current_observed_value: "60s remaining".to_string(),
+            session_id: Some(session_id.to_string()),
+            suggested_next_action: "Wait for the cooldown to expire.".to_string(),
+            cooldown_remaining_secs: Some(60),
+        };
+
+        assert!(super::finalize_terminal_budget_block_with_db_tx(&block, &tx, &path).is_none());
+        assert!(diagnosis::SESSIONS.get(&hash).is_some());
+        let conn = Connection::open(&path).expect("open db");
+        let ended_at: Option<String> = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                |row| row.get(0),
+            )
+            .expect("query ended_at");
+        assert!(ended_at.is_none());
+
+        let _ = diagnosis::SESSION_TURNS.remove(session_id);
+        let _ = diagnosis::SESSIONS.remove(&hash);
+        drop(tx);
+        handle.join().expect("db writer exits");
+        cleanup_test_db(&path);
     }
 
     #[test]

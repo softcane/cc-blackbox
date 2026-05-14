@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -338,6 +338,17 @@ pub fn build_temporary_run_child_split_args(
     ]
 }
 
+const TEMPORARY_RUN_CHILD_EXIT_STATUS_OPTION: &str = "@cc_blackbox_child_exit_status";
+
+pub fn build_temporary_run_child_status_command(session_name: &str, child_command: &str) -> String {
+    let script = format!(
+        "{child_command}\nstatus=$?\ntmux set-option -q -t {} {} \"$status\"\nexit \"$status\"",
+        shell_quote(session_name),
+        shell_quote(TEMPORARY_RUN_CHILD_EXIT_STATUS_OPTION),
+    );
+    shell_join(&["sh".to_string(), "-c".to_string(), script])
+}
+
 fn run_tmux_status(args: &[String]) -> Result<(), String> {
     let output = Command::new("tmux")
         .args(args)
@@ -376,6 +387,83 @@ fn run_tmux_output(args: &[String]) -> Result<String, String> {
     Err("unknown tmux error".into())
 }
 
+fn read_temporary_run_child_exit_status(session_name: &str) -> Option<i32> {
+    let output = Command::new("tmux")
+        .args([
+            "show-options",
+            "-qv",
+            "-t",
+            session_name,
+            TEMPORARY_RUN_CHILD_EXIT_STATUS_OPTION,
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<i32>()
+        .ok()
+}
+
+fn stop_temporary_run_tmux_session(session_name: &str, attach: &mut Child) {
+    let _ = Command::new("tmux")
+        .args(["detach-client", "-s", session_name])
+        .output();
+    let _ = Command::new("tmux")
+        .args(["kill-session", "-t", session_name])
+        .output();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match attach.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => return,
+        }
+    }
+
+    let _ = attach.kill();
+    let _ = attach.wait();
+}
+
+fn wait_for_temporary_run_child_exit(
+    session_name: &str,
+    attach: &mut Child,
+) -> Result<i32, String> {
+    let mut attach_exit_code = None;
+    loop {
+        if let Some(code) = read_temporary_run_child_exit_status(session_name) {
+            stop_temporary_run_tmux_session(session_name, attach);
+            return Ok(code);
+        }
+
+        if attach_exit_code.is_none() {
+            match attach.try_wait() {
+                Ok(Some(status)) => {
+                    attach_exit_code = Some(status.code().unwrap_or(0));
+                }
+                Ok(None) => {}
+                Err(err) => return Err(format!("failed to poll tmux attach-session: {err}")),
+            }
+        }
+
+        if let Some(code) = attach_exit_code {
+            let session_exists = Command::new("tmux")
+                .args(["has-session", "-t", session_name])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if !session_exists {
+                return Ok(code);
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 pub fn split_current_window_for_run(core_url: &str) -> Result<(), String> {
     let cli_path = resolve_cli_path();
     let guard_command = build_run_guard_command(&cli_path, core_url);
@@ -397,6 +485,8 @@ pub fn run_in_temporary_session_for_run(
     let guard_command = build_run_guard_command(&cli_path, core_url);
     let child_command = build_proxied_child_command(command, args, envs);
     let session_name = format!("cc-blackbox-run-{}", std::process::id());
+    let tracked_child_command =
+        build_temporary_run_child_status_command(&session_name, &child_command);
 
     run_tmux_status(&build_temporary_run_new_session_args(
         &session_name,
@@ -404,7 +494,7 @@ pub fn run_in_temporary_session_for_run(
     ))?;
     let child_pane = run_tmux_output(&build_temporary_run_child_split_args(
         &session_name,
-        &child_command,
+        &tracked_child_command,
     ))?;
     if !child_pane.is_empty() {
         let _ = Command::new("tmux")
@@ -418,11 +508,11 @@ pub fn run_in_temporary_session_for_run(
         .args(["select-layout", "-t", &session_name, "even-horizontal"])
         .output();
 
-    let status = Command::new("tmux")
+    let mut attach = Command::new("tmux")
         .args(["attach-session", "-t", &session_name])
-        .status()
+        .spawn()
         .map_err(|err| format!("failed to attach tmux session: {err}"))?;
-    Ok(status.code().unwrap_or(0))
+    wait_for_temporary_run_child_exit(&session_name, &mut attach)
 }
 
 impl ManagedPane {
@@ -1196,8 +1286,52 @@ mod tests {
     use super::{format_count, format_duration, format_observed_tool_calls, Activity, ManagedPane};
     use crate::WatchEvent;
     use std::collections::HashMap;
+    use std::ffi::{OsStr, OsString};
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::LazyLock;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    static TMUX_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &OsStr) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "cc-blackbox-tmux-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("create test dir");
+        path
+    }
 
     fn pane_with_last_activity(last_activity: Instant, ended: bool) -> ManagedPane {
         ManagedPane {
@@ -1331,8 +1465,14 @@ mod tests {
             super::build_temporary_run_new_session_args("cc-run-1", "guard cmd"),
             vec!["new-session", "-d", "-s", "cc-run-1", "guard cmd"]
         );
+        let tracked_child_command =
+            super::build_temporary_run_child_status_command("cc-run-1", &child_command);
+        assert!(tracked_child_command.starts_with("sh -c "));
+        assert!(tracked_child_command
+            .contains("env ANTHROPIC_BASE_URL=http://127.0.0.1:10000 claude --model opus"));
+        assert!(tracked_child_command.contains("@cc_blackbox_child_exit_status"));
         assert_eq!(
-            super::build_temporary_run_child_split_args("cc-run-1", &child_command),
+            super::build_temporary_run_child_split_args("cc-run-1", &tracked_child_command),
             vec![
                 "split-window",
                 "-h",
@@ -1342,9 +1482,132 @@ mod tests {
                 "-P",
                 "-F",
                 "#{pane_id}",
-                "env ANTHROPIC_BASE_URL=http://127.0.0.1:10000 claude --model opus"
+                tracked_child_command.as_str()
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_run_returns_when_child_pane_exits_before_guard_session() {
+        let _lock = TMUX_ENV_LOCK.lock().expect("tmux env lock");
+        let dir = unique_test_dir("child-exit");
+        let bin_dir = dir.join("bin");
+        fs::create_dir_all(&bin_dir).expect("create fake tmux bin dir");
+        let tmux_path = bin_dir.join("tmux");
+        fs::write(
+            &tmux_path,
+            r#"#!/bin/sh
+set -eu
+log="${CC_BLACKBOX_TMUX_LOG:?}"
+printf '%s\n' "$*" >> "$log"
+cmd="${1:-}"
+case "$cmd" in
+  -V)
+    echo "tmux 3.4"
+    exit 0
+    ;;
+  new-session|select-pane|select-layout|set-option|has-session)
+    exit 0
+    ;;
+  split-window)
+    echo "%7"
+    exit 0
+    ;;
+  show-options)
+    count_file="${CC_BLACKBOX_TMUX_SHOW_COUNT:?}"
+    count=0
+    if [ -f "$count_file" ]; then
+      count=$(cat "$count_file")
+    fi
+    count=$((count + 1))
+    echo "$count" > "$count_file"
+    if [ "$count" -ge 2 ]; then
+      echo "23"
+      exit 0
+    fi
+    exit 1
+    ;;
+  attach-session)
+    i=0
+    while [ "$i" -lt 20 ]; do
+      if [ -f "${CC_BLACKBOX_TMUX_DETACHED:?}" ]; then
+        exit 0
+      fi
+      sleep 0.05
+      i=$((i + 1))
+    done
+    exit 97
+    ;;
+  detach-client)
+    touch "${CC_BLACKBOX_TMUX_DETACHED:?}"
+    exit 0
+    ;;
+  kill-session)
+    touch "${CC_BLACKBOX_TMUX_DETACHED:?}"
+    touch "${CC_BLACKBOX_TMUX_KILLED:?}"
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+        )
+        .expect("write fake tmux");
+        let mut permissions = fs::metadata(&tmux_path)
+            .expect("fake tmux metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux_path, permissions).expect("chmod fake tmux");
+
+        let old_path = std::env::var_os("PATH");
+        let mut paths = vec![bin_dir.clone()];
+        if let Some(path) = old_path.as_ref() {
+            paths.extend(std::env::split_paths(path));
+        }
+        let path_guard = EnvVarGuard::set(
+            "PATH",
+            std::env::join_paths(paths)
+                .expect("join fake tmux PATH")
+                .as_os_str(),
+        );
+        let log_path = dir.join("tmux.log");
+        let show_count_path = dir.join("show-count");
+        let detached_path = dir.join("detached");
+        let killed_path = dir.join("killed");
+        let log_guard = EnvVarGuard::set("CC_BLACKBOX_TMUX_LOG", log_path.as_os_str());
+        let show_guard =
+            EnvVarGuard::set("CC_BLACKBOX_TMUX_SHOW_COUNT", show_count_path.as_os_str());
+        let detached_guard =
+            EnvVarGuard::set("CC_BLACKBOX_TMUX_DETACHED", detached_path.as_os_str());
+        let killed_guard = EnvVarGuard::set("CC_BLACKBOX_TMUX_KILLED", killed_path.as_os_str());
+
+        let started = Instant::now();
+        let exit_code = super::run_in_temporary_session_for_run(
+            "claude",
+            &["--model".to_string(), "opus".to_string()],
+            &[("ANTHROPIC_BASE_URL", "http://127.0.0.1:10000")],
+            "http://127.0.0.1:9091",
+        )
+        .expect("temporary run succeeds");
+
+        assert_eq!(exit_code, 23);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "temporary run should not wait for attach-session timeout"
+        );
+        let log = fs::read_to_string(&log_path).expect("read fake tmux log");
+        assert!(log.contains("attach-session -t cc-blackbox-run-"));
+        assert!(log.contains("show-options -qv -t cc-blackbox-run-"));
+        assert!(log.contains("@cc_blackbox_child_exit_status"));
+        assert!(log.contains("kill-session -t cc-blackbox-run-"));
+        assert!(log.contains("env ANTHROPIC_BASE_URL=http://127.0.0.1:10000 claude --model opus"));
+
+        drop(killed_guard);
+        drop(detached_guard);
+        drop(show_guard);
+        drop(log_guard);
+        drop(path_guard);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

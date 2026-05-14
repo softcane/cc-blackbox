@@ -1671,6 +1671,7 @@ fn run_command_with_env(
     Ok(exit_code(status))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_child_command_with_lifecycle_deps<
     Detect,
     Ensure,
@@ -6705,50 +6706,57 @@ async fn resolve_footer_decision(
         match footer_recent_sessions(base_url).await {
             Ok(sessions_report) => {
                 let matches = active_sessions_matching_dirs(&sessions_report, &dirs);
-                if matches.len() == 1 {
-                    let session_id = matches[0].clone();
-                    match footer_decision_for_session(base_url, &session_id).await {
-                        Ok(Some(decision)) => {
-                            return (
-                                decision,
-                                FooterCorrelation {
-                                    mode: "working_dir".to_string(),
-                                    matched_session_id: Some(session_id),
-                                    ambiguous: false,
-                                    detail: "matched one active session by working directory"
-                                        .to_string(),
-                                },
-                            );
-                        }
-                        Ok(None) => {}
-                        Err(err) => {
-                            return (
-                                SessionDecision::fallback("core unavailable", "continue carefully"),
-                                FooterCorrelation {
-                                    mode: "core_unavailable".to_string(),
-                                    matched_session_id: None,
-                                    ambiguous: false,
-                                    detail: err,
-                                },
-                            );
+                match matches.len().cmp(&1) {
+                    std::cmp::Ordering::Equal => {
+                        let session_id = matches[0].clone();
+                        match footer_decision_for_session(base_url, &session_id).await {
+                            Ok(Some(decision)) => {
+                                return (
+                                    decision,
+                                    FooterCorrelation {
+                                        mode: "working_dir".to_string(),
+                                        matched_session_id: Some(session_id),
+                                        ambiguous: false,
+                                        detail: "matched one active session by working directory"
+                                            .to_string(),
+                                    },
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                return (
+                                    SessionDecision::fallback(
+                                        "core unavailable",
+                                        "continue carefully",
+                                    ),
+                                    FooterCorrelation {
+                                        mode: "core_unavailable".to_string(),
+                                        matched_session_id: None,
+                                        ambiguous: false,
+                                        detail: err,
+                                    },
+                                );
+                            }
                         }
                     }
-                } else if matches.len() > 1 {
-                    return (
-                        SessionDecision::fallback(
-                            "multiple sessions in this directory",
-                            "check guard status",
-                        ),
-                        FooterCorrelation {
-                            mode: "working_dir".to_string(),
-                            matched_session_id: None,
-                            ambiguous: true,
-                            detail: format!(
-                                "{} active cc-blackbox sessions matched the same directory",
-                                matches.len()
+                    std::cmp::Ordering::Greater => {
+                        return (
+                            SessionDecision::fallback(
+                                "multiple sessions in this directory",
+                                "check guard status",
                             ),
-                        },
-                    );
+                            FooterCorrelation {
+                                mode: "working_dir".to_string(),
+                                matched_session_id: None,
+                                ambiguous: true,
+                                detail: format!(
+                                    "{} active cc-blackbox sessions matched the same directory",
+                                    matches.len()
+                                ),
+                            },
+                        );
+                    }
+                    std::cmp::Ordering::Less => {}
                 }
             }
             Err(err) => {

@@ -193,6 +193,43 @@ fn http_get_stream_until(addr: &str, path: &str, expected: &str) -> Result<Strin
     ))
 }
 
+fn http_get_stream_for(addr: &str, path: &str, duration: Duration) -> Result<String, String> {
+    let mut stream = TcpStream::connect(addr).map_err(|err| err.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .map_err(|err| err.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| err.to_string())?;
+
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n"
+    )
+    .map_err(|err| err.to_string())?;
+
+    let deadline = Instant::now() + duration;
+    let mut response = Vec::new();
+    let mut buffer = [0u8; 1024];
+    while Instant::now() < deadline {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buffer[..n]),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+
+    Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
 fn parse_http_response(response: &str) -> Result<(u16, String), String> {
     let status = response
         .lines()
@@ -599,6 +636,54 @@ fn core_watch_replays_hook_events_for_late_subscribers() {
     assert!(stream.contains(r#""type":"skill_event""#));
     assert!(stream.contains(r#""event_type":"fired""#));
     assert!(stream.contains(r#""source":"hook""#));
+
+    drop(core);
+    let _ = fs::remove_file(&db_path);
+    let _ = fs::remove_file(format!("{}-wal", db_path.display()));
+    let _ = fs::remove_file(format!("{}-shm", db_path.display()));
+}
+
+#[test]
+fn core_watch_replay_false_suppresses_history_for_run_owned_watchers() {
+    let _guard = CORE_PROCESS_TEST_LOCK
+        .lock()
+        .expect("lock core process test");
+    let http_addr = unused_loopback_addr();
+    let grpc_addr = unused_loopback_addr();
+    let db_path = unique_db_path();
+    let mut core = start_core(&http_addr, &grpc_addr, &db_path);
+    wait_for_health(&mut core, &http_addr);
+
+    let (status, body) = http_post_json(
+        &http_addr,
+        "/api/hooks/claude-code",
+        r#"{
+          "session_id": "session_watch_no_replay",
+          "hook_event_name": "PreToolUse",
+          "tool_name": "Skill",
+          "tool_input": {
+            "skill_name": "tdd",
+            "prompt": "write one failing test"
+          }
+        }"#,
+    )
+    .expect("POST hook event");
+    assert_eq!(status, 204, "body: {body}");
+
+    let stream = http_get_stream_for(
+        &http_addr,
+        "/watch?session=session_watch_no_replay&replay=false",
+        Duration::from_millis(250),
+    )
+    .expect("watch stream with replay disabled");
+    assert!(
+        stream.starts_with("HTTP/1.1 200 OK"),
+        "unexpected stream response:\n{stream}"
+    );
+    assert!(
+        !stream.contains(r#""type":"skill_event""#),
+        "replay=false should suppress prior history:\n{stream}"
+    );
 
     drop(core);
     let _ = fs::remove_file(&db_path);

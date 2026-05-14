@@ -115,6 +115,7 @@ fn run_help_documents_watch_and_trailing_child_command() {
     let out = stdout(&output);
     assert!(out.contains("Run a command through the local cc-blackbox proxy"));
     assert!(out.contains("--watch"));
+    assert!(out.contains("--no-live"));
     assert!(out.contains("Command and arguments to run"));
 }
 

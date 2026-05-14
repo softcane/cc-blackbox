@@ -272,6 +272,159 @@ fn build_child_watch_command(
     shell_join(&cmd_parts)
 }
 
+pub fn build_run_guard_command(cli_path: &str, core_url: &str) -> String {
+    shell_join(&[
+        cli_path.to_string(),
+        "guard".to_string(),
+        "watch".to_string(),
+        "--run-owned".to_string(),
+        "--url".to_string(),
+        core_url.to_string(),
+    ])
+}
+
+pub fn build_run_guard_split_args(guard_command: &str) -> Vec<String> {
+    vec![
+        "split-window".to_string(),
+        "-h".to_string(),
+        "-d".to_string(),
+        "-l".to_string(),
+        "38%".to_string(),
+        guard_command.to_string(),
+    ]
+}
+
+pub fn build_proxied_child_command(
+    command: &str,
+    args: &[String],
+    envs: &[(&str, &str)],
+) -> String {
+    let mut parts = vec!["env".to_string()];
+    for (key, value) in envs {
+        parts.push(format!("{key}={value}"));
+    }
+    parts.push(command.to_string());
+    parts.extend(args.iter().cloned());
+    shell_join(&parts)
+}
+
+pub fn build_temporary_run_new_session_args(
+    session_name: &str,
+    guard_command: &str,
+) -> Vec<String> {
+    vec![
+        "new-session".to_string(),
+        "-d".to_string(),
+        "-s".to_string(),
+        session_name.to_string(),
+        guard_command.to_string(),
+    ]
+}
+
+pub fn build_temporary_run_child_split_args(
+    session_name: &str,
+    child_command: &str,
+) -> Vec<String> {
+    vec![
+        "split-window".to_string(),
+        "-h".to_string(),
+        "-b".to_string(),
+        "-t".to_string(),
+        format!("{session_name}:0"),
+        "-P".to_string(),
+        "-F".to_string(),
+        "#{pane_id}".to_string(),
+        child_command.to_string(),
+    ]
+}
+
+fn run_tmux_status(args: &[String]) -> Result<(), String> {
+    let output = Command::new("tmux")
+        .args(args)
+        .output()
+        .map_err(|e| format!("tmux command failed: {}", e))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return Err(stderr);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return Err(stdout);
+    }
+    Err("unknown tmux error".into())
+}
+
+fn run_tmux_output(args: &[String]) -> Result<String, String> {
+    let output = Command::new("tmux")
+        .args(args)
+        .output()
+        .map_err(|e| format!("tmux command failed: {}", e))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return Err(stderr);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return Err(stdout);
+    }
+    Err("unknown tmux error".into())
+}
+
+pub fn split_current_window_for_run(core_url: &str) -> Result<(), String> {
+    let cli_path = resolve_cli_path();
+    let guard_command = build_run_guard_command(&cli_path, core_url);
+    let args = build_run_guard_split_args(&guard_command);
+    run_tmux_status(&args)?;
+    let _ = Command::new("tmux")
+        .args(["select-pane", "-T", "Claude"])
+        .output();
+    Ok(())
+}
+
+pub fn run_in_temporary_session_for_run(
+    command: &str,
+    args: &[String],
+    envs: &[(&str, &str)],
+    core_url: &str,
+) -> Result<i32, String> {
+    let cli_path = resolve_cli_path();
+    let guard_command = build_run_guard_command(&cli_path, core_url);
+    let child_command = build_proxied_child_command(command, args, envs);
+    let session_name = format!("cc-blackbox-run-{}", std::process::id());
+
+    run_tmux_status(&build_temporary_run_new_session_args(
+        &session_name,
+        &guard_command,
+    ))?;
+    let child_pane = run_tmux_output(&build_temporary_run_child_split_args(
+        &session_name,
+        &child_command,
+    ))?;
+    if !child_pane.is_empty() {
+        let _ = Command::new("tmux")
+            .args(["select-pane", "-t", &child_pane, "-T", "Claude"])
+            .output();
+        let _ = Command::new("tmux")
+            .args(["select-pane", "-t", &child_pane])
+            .output();
+    }
+    let _ = Command::new("tmux")
+        .args(["select-layout", "-t", &session_name, "even-horizontal"])
+        .output();
+
+    let status = Command::new("tmux")
+        .args(["attach-session", "-t", &session_name])
+        .status()
+        .map_err(|err| format!("failed to attach tmux session: {err}"))?;
+    Ok(status.code().unwrap_or(0))
+}
+
 impl ManagedPane {
     fn activity(&self) -> Activity {
         if self.ended {
@@ -1132,6 +1285,65 @@ mod tests {
                 true,
             ),
             "'/tmp/cc-blackbox cli' watch --session 'session with spaces' --url 'http://localhost:9091/watch?session=session with spaces' --no-cache --no-signals --postmortem --no-analyze-with-claude"
+        );
+    }
+
+    #[test]
+    fn run_guard_command_uses_internal_run_owned_guard_watch_mode() {
+        assert_eq!(
+            super::build_run_guard_command("cc-blackbox", "http://localhost:9091"),
+            "cc-blackbox guard watch --run-owned --url http://localhost:9091"
+        );
+        assert_eq!(
+            super::build_run_guard_command("/tmp/cc blackbox", "http://core with space"),
+            "'/tmp/cc blackbox' guard watch --run-owned --url 'http://core with space'"
+        );
+    }
+
+    #[test]
+    fn run_split_args_create_side_guard_pane_without_stealing_focus() {
+        assert_eq!(
+            super::build_run_guard_split_args("cc-blackbox guard watch --run-owned"),
+            vec![
+                "split-window",
+                "-h",
+                "-d",
+                "-l",
+                "38%",
+                "cc-blackbox guard watch --run-owned"
+            ]
+        );
+    }
+
+    #[test]
+    fn temporary_run_session_commands_start_guard_before_child_and_select_child() {
+        let child_command = super::build_proxied_child_command(
+            "claude",
+            &["--model".to_string(), "opus".to_string()],
+            &[("ANTHROPIC_BASE_URL", "http://127.0.0.1:10000")],
+        );
+
+        assert_eq!(
+            child_command,
+            "env ANTHROPIC_BASE_URL=http://127.0.0.1:10000 claude --model opus"
+        );
+        assert_eq!(
+            super::build_temporary_run_new_session_args("cc-run-1", "guard cmd"),
+            vec!["new-session", "-d", "-s", "cc-run-1", "guard cmd"]
+        );
+        assert_eq!(
+            super::build_temporary_run_child_split_args("cc-run-1", &child_command),
+            vec![
+                "split-window",
+                "-h",
+                "-b",
+                "-t",
+                "cc-run-1:0",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "env ANTHROPIC_BASE_URL=http://127.0.0.1:10000 claude --model opus"
+            ]
         );
     }
 

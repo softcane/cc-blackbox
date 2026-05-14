@@ -2,7 +2,7 @@ mod tmux;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, IsTerminal, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -51,6 +51,10 @@ enum Commands {
         /// Start cc-blackbox watch alongside the child command
         #[arg(long)]
         watch: bool,
+
+        /// Disable the default live guard split for interactive terminals
+        #[arg(long, conflicts_with = "watch")]
+        no_live: bool,
 
         /// Command and arguments to run
         #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
@@ -229,6 +233,10 @@ enum GuardCommands {
         /// Render redacted postmortems automatically in guard watch output
         #[arg(long)]
         postmortem: bool,
+
+        /// Internal mode for `cc-blackbox run` guard panes
+        #[arg(long, hide = true, conflicts_with = "postmortem")]
+        run_owned: bool,
     },
 }
 
@@ -486,6 +494,60 @@ impl WatchHandle {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunTerminalState {
+    interactive: bool,
+    tmux_available: bool,
+    inside_tmux: bool,
+}
+
+impl RunTerminalState {
+    fn detect() -> Self {
+        Self {
+            interactive: io::stdin().is_terminal() && io::stdout().is_terminal(),
+            tmux_available: command_exists("tmux"),
+            inside_tmux: std::env::var_os("TMUX").is_some(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunLiveMode {
+    SingleTerminal,
+    SplitCurrentTmux,
+    TemporaryTmuxSession,
+    TmuxUnavailableFallback,
+}
+
+fn select_run_live_mode(
+    legacy_watch: bool,
+    no_live: bool,
+    terminal: RunTerminalState,
+) -> RunLiveMode {
+    if legacy_watch || no_live || !terminal.interactive {
+        return RunLiveMode::SingleTerminal;
+    }
+    if !terminal.tmux_available {
+        return RunLiveMode::TmuxUnavailableFallback;
+    }
+    if terminal.inside_tmux {
+        RunLiveMode::SplitCurrentTmux
+    } else {
+        RunLiveMode::TemporaryTmuxSession
+    }
+}
+
+fn render_tmux_unavailable_fallback() -> String {
+    [
+        "Live guard cannot split this terminal because tmux is not installed.",
+        "Open another terminal and run `cc-blackbox guard watch`.",
+        "Severe policy blocks still appear inside Claude before the next request.",
+        "After the run, use `cc-blackbox postmortem latest`.",
+        "Claude is launching normally.",
+    ]
+    .join("\n")
 }
 
 fn envoy_proxy_url() -> String {
@@ -1368,19 +1430,39 @@ fn run_command_with_env(
     Ok(exit_code(status))
 }
 
-async fn run_child_command_with_deps<Ensure, EnsureFut, Start, Run, Render, RenderFut>(
+async fn run_child_command_with_deps<
+    Detect,
+    Ensure,
+    EnsureFut,
+    Split,
+    Temp,
+    Start,
+    Run,
+    Fallback,
+    Render,
+    RenderFut,
+>(
     watch_flag: bool,
+    no_live_flag: bool,
     command: Vec<String>,
+    detect_terminal: Detect,
     ensure_stack: Ensure,
+    split_current_tmux: Split,
+    run_temporary_tmux: Temp,
     start_watcher_fn: Start,
     run_command_fn: Run,
+    render_fallback: Fallback,
     render_final_postmortem: Render,
 ) -> i32
 where
+    Detect: FnOnce() -> RunTerminalState,
     Ensure: FnOnce() -> EnsureFut,
     EnsureFut: std::future::Future<Output = Result<(), String>>,
+    Split: FnOnce() -> Result<(), String>,
+    Temp: FnOnce(&str, &[String], &[(&str, &str)]) -> Result<i32, String>,
     Start: FnOnce(bool) -> Result<WatchHandle, String>,
     Run: FnOnce(&str, &[String], &[(&str, &str)]) -> Result<i32, String>,
+    Fallback: FnOnce(),
     Render: FnOnce(String) -> RenderFut,
     RenderFut: std::future::Future<Output = ()>,
 {
@@ -1395,6 +1477,48 @@ where
         return 1;
     }
 
+    let live_mode = select_run_live_mode(watch, no_live_flag, detect_terminal());
+    let command_name = &child_command[0];
+    let command_args = &child_command[1..];
+    let proxy_url = envoy_proxy_url();
+    let proxy_env = [("ANTHROPIC_BASE_URL", proxy_url.as_str())];
+
+    match live_mode {
+        RunLiveMode::SplitCurrentTmux => {
+            if let Err(err) = split_current_tmux() {
+                eprintln!("Error: {err}");
+                return 1;
+            }
+            return match run_command_fn(command_name, command_args, &proxy_env) {
+                Ok(code) => code,
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    1
+                }
+            };
+        }
+        RunLiveMode::TemporaryTmuxSession => {
+            return match run_temporary_tmux(command_name, command_args, &proxy_env) {
+                Ok(code) => code,
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    1
+                }
+            };
+        }
+        RunLiveMode::TmuxUnavailableFallback => {
+            render_fallback();
+            return match run_command_fn(command_name, command_args, &proxy_env) {
+                Ok(code) => code,
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    1
+                }
+            };
+        }
+        RunLiveMode::SingleTerminal => {}
+    }
+
     let mut watcher = if watch {
         match start_watcher_fn(false) {
             Ok(handle) => Some(handle),
@@ -1407,14 +1531,7 @@ where
         None
     };
 
-    let command_name = &child_command[0];
-    let command_args = &child_command[1..];
-    let proxy_url = envoy_proxy_url();
-    let result = run_command_fn(
-        command_name,
-        command_args,
-        &[("ANTHROPIC_BASE_URL", proxy_url.as_str())],
-    );
+    let result = run_command_fn(command_name, command_args, &proxy_env);
 
     if let Some(handle) = watcher.as_mut() {
         handle.stop();
@@ -1433,13 +1550,20 @@ where
     }
 }
 
-async fn run_child_command(watch_flag: bool, command: Vec<String>) -> i32 {
+async fn run_child_command(watch_flag: bool, no_live_flag: bool, command: Vec<String>) -> i32 {
     run_child_command_with_deps(
         watch_flag,
+        no_live_flag,
         command,
+        RunTerminalState::detect,
         ensure_stack_running,
+        || tmux::split_current_window_for_run(&cc_blackbox_core_url()),
+        |command, args, envs| {
+            tmux::run_in_temporary_session_for_run(command, args, envs, &cc_blackbox_core_url())
+        },
         start_watcher,
         run_command_with_env,
+        || eprintln!("{}", render_tmux_unavailable_fallback().yellow()),
         |base_url| async move {
             render_run_final_postmortem(&base_url).await;
         },
@@ -2005,6 +2129,370 @@ fn render_guard_watch_line(event: &WatchEvent) -> Option<String> {
         ),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunGuardEventOrigin {
+    Replay,
+    Live,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunGuardPanelState {
+    Waiting,
+    Watching,
+    Warning,
+    Critical,
+    Blocked,
+    Cooldown,
+    Ended,
+}
+
+impl RunGuardPanelState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Waiting => "Watching",
+            Self::Watching => "Watching",
+            Self::Warning => "Warning",
+            Self::Critical => "Critical",
+            Self::Blocked => "Blocked",
+            Self::Cooldown => "Cooldown",
+            Self::Ended => "Ended",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RunGuardNotice {
+    level: &'static str,
+    title: String,
+    detail: String,
+    evidence: String,
+    next: String,
+    postmortem_ready: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RunGuardPanel {
+    session_id: Option<String>,
+    display_name: Option<String>,
+    model: Option<String>,
+    state: RunGuardPanelState,
+    notice: Option<RunGuardNotice>,
+}
+
+impl RunGuardPanel {
+    fn waiting() -> Self {
+        Self {
+            session_id: None,
+            display_name: None,
+            model: None,
+            state: RunGuardPanelState::Waiting,
+            notice: None,
+        }
+    }
+
+    fn apply_event(&mut self, event: &WatchEvent, origin: RunGuardEventOrigin) -> bool {
+        if self.session_id.is_none() {
+            if origin == RunGuardEventOrigin::Replay {
+                return false;
+            }
+            if let WatchEvent::SessionStart {
+                session_id,
+                display_name,
+                model,
+                ..
+            } = event
+            {
+                self.session_id = Some(session_id.clone());
+                self.display_name = Some(display_name.clone());
+                self.model = Some(model.clone());
+                self.state = RunGuardPanelState::Watching;
+                self.notice = None;
+                return true;
+            }
+            return false;
+        }
+
+        if let Some(event_session) = event_session_id(event) {
+            if self.session_id.as_deref() != Some(event_session) {
+                return false;
+            }
+        }
+
+        match event {
+            WatchEvent::SessionStart {
+                display_name,
+                model,
+                ..
+            } => {
+                self.display_name = Some(display_name.clone());
+                self.model = Some(model.clone());
+                self.state = RunGuardPanelState::Watching;
+                true
+            }
+            WatchEvent::SessionEnd { .. } => {
+                self.state = RunGuardPanelState::Ended;
+                true
+            }
+            WatchEvent::PostmortemReady { .. } => {
+                self.state = RunGuardPanelState::Ended;
+                self.notice = Some(RunGuardNotice {
+                    level: "Postmortem",
+                    title: "ready".to_string(),
+                    detail: "The session has enough evidence for an after-run report.".to_string(),
+                    evidence: String::new(),
+                    next: "cc-blackbox postmortem latest".to_string(),
+                    postmortem_ready: true,
+                });
+                true
+            }
+            WatchEvent::GuardFinding {
+                rule_id,
+                severity,
+                action,
+                evidence_level,
+                detail,
+                suggested_action,
+                ..
+            } => {
+                self.state = match action.as_str() {
+                    "block" => RunGuardPanelState::Blocked,
+                    "cooldown" => RunGuardPanelState::Cooldown,
+                    "critical" => RunGuardPanelState::Critical,
+                    _ if severity == "critical" => RunGuardPanelState::Critical,
+                    _ => RunGuardPanelState::Warning,
+                };
+                let level = self.state.label();
+                let next = suggested_action
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| match action.as_str() {
+                        "block" => "start a fresh session.",
+                        "cooldown" => "wait for the cooldown, fix the error cause, then retry.",
+                        _ => "keep going, but avoid repeating the same failing action.",
+                    });
+                self.notice = Some(RunGuardNotice {
+                    level,
+                    title: rule_id.replace('_', " "),
+                    detail: detail.clone(),
+                    evidence: evidence_level.replace('_', " "),
+                    next: next.to_string(),
+                    postmortem_ready: false,
+                });
+                true
+            }
+            WatchEvent::ContextStatus {
+                fill_percent,
+                turns_to_compact,
+                ..
+            } if *fill_percent >= 60.0 => {
+                self.state = if *fill_percent >= 80.0 {
+                    RunGuardPanelState::Critical
+                } else {
+                    RunGuardPanelState::Warning
+                };
+                let risk = match turns_to_compact {
+                    Some(0) => "compaction risk is high".to_string(),
+                    Some(1) => "about 1 turn to auto-compaction".to_string(),
+                    Some(turns) => format!("about {turns} turns to auto-compaction"),
+                    None => "compaction timing is uncertain".to_string(),
+                };
+                let level = self.state.label();
+                self.notice = Some(RunGuardNotice {
+                    level,
+                    title: "context pressure".to_string(),
+                    detail: format!("Context is about {:.0}% full; {risk}.", fill_percent),
+                    evidence: "derived proxy estimate".to_string(),
+                    next: if *fill_percent >= 80.0 {
+                        "restart from a short summary.".to_string()
+                    } else {
+                        "narrow the next request.".to_string()
+                    },
+                    postmortem_ready: false,
+                });
+                true
+            }
+            WatchEvent::ModelFallback {
+                requested, actual, ..
+            } => {
+                self.state = RunGuardPanelState::Warning;
+                self.notice = Some(RunGuardNotice {
+                    level: "Warning",
+                    title: "model route mismatch".to_string(),
+                    detail: format!("Requested {requested}, but the response reported {actual}."),
+                    evidence: "direct proxy".to_string(),
+                    next: "record the mismatch; do not treat it as provider-quota evidence."
+                        .to_string(),
+                    postmortem_ready: false,
+                });
+                true
+            }
+            WatchEvent::CacheEvent {
+                event_type,
+                estimated_rebuild_cost_dollars,
+                ..
+            } if matches!(
+                event_type.as_str(),
+                "miss_rebuild" | "miss_ttl" | "miss_thrash"
+            ) =>
+            {
+                self.state = RunGuardPanelState::Warning;
+                let cost = estimated_rebuild_cost_dollars
+                    .map(|value| format!("; rebuild ${value:.2}"))
+                    .unwrap_or_default();
+                self.notice = Some(RunGuardNotice {
+                    level: "Warning",
+                    title: "cache rebuild".to_string(),
+                    detail: format!(
+                        "Prompt cache {} detected{cost}.",
+                        event_type.replace('_', " ")
+                    ),
+                    evidence: "direct proxy".to_string(),
+                    next: "avoid restarting or idling before the next turn if cache reuse matters."
+                        .to_string(),
+                    postmortem_ready: false,
+                });
+                true
+            }
+            WatchEvent::RateLimitStatus {
+                tokens_used_this_week,
+                tokens_limit,
+                tokens_remaining,
+                projected_exhaustion_secs,
+                ..
+            } => {
+                let Some(used) = tokens_used_this_week else {
+                    return false;
+                };
+                self.state = RunGuardPanelState::Warning;
+                let limit = tokens_limit
+                    .map(format_tokens)
+                    .unwrap_or_else(|| "uncapped".to_string());
+                let remaining = tokens_remaining
+                    .map(|value| format!("; {} left", format_tokens(value)))
+                    .unwrap_or_default();
+                let projected = projected_exhaustion_secs
+                    .map(|secs| {
+                        format!("; projected exhaustion in {}", format_duration_coarse(secs))
+                    })
+                    .unwrap_or_default();
+                self.notice = Some(RunGuardNotice {
+                    level: "Warning",
+                    title: "quota burn".to_string(),
+                    detail: format!(
+                        "Used {} tokens this week against {limit}{remaining}{projected}.",
+                        format_tokens(*used)
+                    ),
+                    evidence: "derived proxy estimate".to_string(),
+                    next: "narrow the next request or pause before starting another large turn."
+                        .to_string(),
+                    postmortem_ready: false,
+                });
+                true
+            }
+            WatchEvent::RequestError { error_type, .. } => {
+                self.state = RunGuardPanelState::Warning;
+                self.notice = Some(RunGuardNotice {
+                    level: "Warning",
+                    title: "request error".to_string(),
+                    detail: format!("The proxy observed API error {error_type}."),
+                    evidence: "direct proxy".to_string(),
+                    next: "check API status or credentials before retrying repeatedly.".to_string(),
+                    postmortem_ready: false,
+                });
+                true
+            }
+            WatchEvent::CacheWarning { ttl_secs, .. } => {
+                self.state = RunGuardPanelState::Warning;
+                self.notice = Some(RunGuardNotice {
+                    level: "Warning",
+                    title: "cache expiry".to_string(),
+                    detail: format!(
+                        "Prompt cache is estimated to expire in about {}.",
+                        format_duration_coarse(*ttl_secs)
+                    ),
+                    evidence: "derived proxy estimate".to_string(),
+                    next: "send the next useful request before the cache expires.".to_string(),
+                    postmortem_ready: false,
+                });
+                true
+            }
+            WatchEvent::CompactionLoop {
+                consecutive,
+                wasted_tokens,
+                ..
+            } => {
+                self.state = RunGuardPanelState::Warning;
+                self.notice = Some(RunGuardNotice {
+                    level: "Warning",
+                    title: "possible compaction loop".to_string(),
+                    detail: format!(
+                        "{consecutive} rapid turns may have wasted about {} tokens.",
+                        format_tokens(*wasted_tokens)
+                    ),
+                    evidence: "derived proxy estimate".to_string(),
+                    next: "stop the loop and restart from a compact summary.".to_string(),
+                    postmortem_ready: false,
+                });
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+fn render_run_guard_panel(panel: &RunGuardPanel) -> String {
+    if panel.state == RunGuardPanelState::Waiting {
+        return [
+            "Watching Claude Code",
+            "",
+            "Waiting for first prompt...",
+            "Live guard will attach when Claude sends its first request.",
+        ]
+        .join("\n");
+    }
+
+    if let Some(notice) = &panel.notice {
+        if notice.postmortem_ready {
+            return [
+                "Postmortem ready".to_string(),
+                String::new(),
+                notice.detail.clone(),
+                format!("Next: {}", notice.next),
+            ]
+            .join("\n");
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("Watching Claude Code\n\n");
+    out.push_str(&format!(
+        "Session: {}\n",
+        panel.display_name.as_deref().unwrap_or("unknown")
+    ));
+    out.push_str(&format!("State: {}\n", panel.state.label()));
+    if let Some(model) = &panel.model {
+        out.push_str(&format!("Model: {model}\n"));
+    }
+    if let Some(notice) = &panel.notice {
+        out.push('\n');
+        out.push_str(&format!("{}: {}\n", notice.level, notice.title));
+        if !notice.detail.is_empty() {
+            out.push_str(&format!("{}\n\n", notice.detail));
+        }
+        if !notice.evidence.is_empty() {
+            out.push_str(&format!("Evidence: {}\n", notice.evidence));
+        }
+        if !notice.next.is_empty() {
+            out.push_str(&format!("Next: {}", notice.next));
+        }
+    }
+    out
+}
+
+fn run_owned_watch_url(base_url: &str) -> String {
+    format!("{}/watch?replay=false", base_url.trim_end_matches('/'))
 }
 
 /// Extract session_id from any WatchEvent variant. Returns None for global
@@ -5031,7 +5519,31 @@ async fn main() {
                     url,
                     session,
                     postmortem,
+                    run_owned,
                 } => {
+                    if run_owned {
+                        let watch_url = run_owned_watch_url(&url);
+                        let mut panel = RunGuardPanel::waiting();
+                        loop {
+                            match connect_and_run_guard_stream_with_panel(&watch_url, &mut panel)
+                                .await
+                            {
+                                Ok(()) => {
+                                    eprintln!(
+                                        "{}",
+                                        "Run guard stream closed. Reconnecting in 3s...".dimmed()
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "{}",
+                                        format!("Waiting for cc-blackbox-core... ({})", e).dimmed()
+                                    );
+                                }
+                            }
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                        }
+                    }
                     let watch_url = match &session {
                         Some(sid) => format!("{}/watch?session={}", url.trim_end_matches('/'), sid),
                         None => format!("{}/watch", url.trim_end_matches('/')),
@@ -5064,8 +5576,12 @@ async fn main() {
         Commands::Up { no_grafana } => {
             std::process::exit(run_up(no_grafana).await);
         }
-        Commands::Run { watch, command } => {
-            std::process::exit(run_child_command(watch, command).await);
+        Commands::Run {
+            watch,
+            no_live,
+            command,
+        } => {
+            std::process::exit(run_child_command(watch, no_live, command).await);
         }
         Commands::Watch {
             url,
@@ -5843,6 +6359,66 @@ async fn connect_and_guard_stream(
     Ok(())
 }
 
+#[cfg(test)]
+async fn connect_and_run_guard_stream(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut panel = RunGuardPanel::waiting();
+    connect_and_run_guard_stream_with_panel(url, &mut panel).await
+}
+
+async fn connect_and_run_guard_stream_with_panel(
+    url: &str,
+    panel: &mut RunGuardPanel,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resp = reqwest::Client::new()
+        .get(url)
+        .header("Accept", "text/event-stream")
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()).into());
+    }
+
+    print!("\x1b[2J\x1b[H{}", render_run_guard_panel(panel));
+    io::stdout().flush().ok();
+
+    let mut stream = resp.bytes_stream();
+    use futures_util::StreamExt;
+
+    let mut line_buffer = Vec::new();
+    let mut data_buffer = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        line_buffer.extend_from_slice(&chunk);
+
+        while let Some(newline_pos) = line_buffer.iter().position(|byte| *byte == b'\n') {
+            let line_bytes = line_buffer[..newline_pos].to_vec();
+            line_buffer.drain(..=newline_pos);
+            let Ok(line) = std::str::from_utf8(&line_bytes) else {
+                continue;
+            };
+            let line = line.trim_end_matches('\r');
+
+            if let Some(data) = line.strip_prefix("data: ") {
+                data_buffer.push_str(data);
+            } else if line.starts_with(": ") || line.starts_with(':') {
+                continue;
+            } else if line.is_empty() && !data_buffer.is_empty() {
+                if let Ok(event) = serde_json::from_str::<WatchEvent>(&data_buffer) {
+                    if panel.apply_event(&event, RunGuardEventOrigin::Live) {
+                        print!("\x1b[2J\x1b[H{}", render_run_guard_panel(panel));
+                        io::stdout().flush().ok();
+                    }
+                }
+                data_buffer.clear();
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn auto_postmortem_target(event: &WatchEvent) -> Option<(String, String)> {
     match event {
         WatchEvent::SessionEnd { session_id, .. } => {
@@ -5865,17 +6441,20 @@ mod tests {
     use super::{
         append_claude_analysis_section, auto_postmortem_target, build_claude_analysis_prompt,
         claude_analysis_enabled, colorize_postmortem_for_terminal, compact_datetime_from_iso,
-        connect_and_guard_stream, event_session_id, extract_run_watch, fetch_guard_policy_report,
-        fetch_guard_status_report, fetch_postmortem_json, fetch_run_final_postmortem_markdown,
+        connect_and_guard_stream, connect_and_run_guard_stream, event_session_id,
+        extract_run_watch, fetch_guard_policy_report, fetch_guard_status_report,
+        fetch_postmortem_json, fetch_run_final_postmortem_markdown,
         fetch_run_final_postmortem_markdown_with_retry, format_duration_coarse, format_tokens,
         local_time_from_iso, parse_mcp_tool_name, postmortem_progress_message,
         postmortem_separator_line_for_width, push_unique, render_guard_policy_report,
         render_guard_status_report, render_guard_watch_line, render_postmortem_markdown,
         render_postmortem_markdown_with_optional_analysis, render_postmortem_terminal_for_width,
-        run_child_command_with_deps, run_claude_postmortem_analysis_with_command,
-        run_claude_postmortem_analysis_with_lookup, run_guard_start_with_deps, shell_join,
+        render_run_guard_panel, render_tmux_unavailable_fallback, run_child_command_with_deps,
+        run_claude_postmortem_analysis_with_command, run_claude_postmortem_analysis_with_lookup,
+        run_guard_start_with_deps, run_owned_watch_url, select_run_live_mode, shell_join,
         shell_quote, truncate_for_box, watcher_args, yaml_quote, ActiveSessions, Cli, Commands,
-        GuardCommands, GuardStackReadiness, WatchEvent, WatchPostmortemState,
+        GuardCommands, GuardStackReadiness, RunGuardEventOrigin, RunGuardPanel, RunLiveMode,
+        RunTerminalState, WatchEvent, WatchPostmortemState,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
@@ -6296,9 +6875,15 @@ mod tests {
     fn run_watch_after_child_command_is_cc_blackbox_flag() {
         let cli = Cli::try_parse_from(["cc-blackbox", "run", "claude", "--watch"])
             .expect("run command parses");
-        let Commands::Run { watch, command } = cli.command else {
+        let Commands::Run {
+            watch,
+            no_live,
+            command,
+        } = cli.command
+        else {
             panic!("expected run command");
         };
+        assert!(!no_live);
         let (watch, command) = extract_run_watch(watch, command);
         assert!(watch);
         assert_eq!(command, vec!["claude"]);
@@ -6308,11 +6893,34 @@ mod tests {
     fn run_watch_before_child_command_is_cc_blackbox_flag() {
         let cli = Cli::try_parse_from(["cc-blackbox", "run", "--watch", "claude"])
             .expect("run command parses");
-        let Commands::Run { watch, command } = cli.command else {
+        let Commands::Run {
+            watch,
+            no_live,
+            command,
+        } = cli.command
+        else {
             panic!("expected run command");
         };
+        assert!(!no_live);
         let (watch, command) = extract_run_watch(watch, command);
         assert!(watch);
+        assert_eq!(command, vec!["claude"]);
+    }
+
+    #[test]
+    fn run_no_live_before_child_command_is_cc_blackbox_flag() {
+        let cli = Cli::try_parse_from(["cc-blackbox", "run", "--no-live", "claude"])
+            .expect("run command parses");
+        let Commands::Run {
+            watch,
+            no_live,
+            command,
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+        assert!(!watch);
+        assert!(no_live);
         assert_eq!(command, vec!["claude"]);
     }
 
@@ -6327,9 +6935,15 @@ mod tests {
             "opus",
         ])
         .expect("run command parses");
-        let Commands::Run { watch, command } = cli.command else {
+        let Commands::Run {
+            watch,
+            no_live,
+            command,
+        } = cli.command
+        else {
             panic!("expected run command");
         };
+        assert!(!no_live);
         let (watch, command) = extract_run_watch(watch, command);
         assert!(!watch);
         assert_eq!(
@@ -6343,14 +6957,109 @@ mod tests {
         );
     }
 
+    #[test]
+    fn run_live_mode_depends_on_interactivity_tmux_and_no_live() {
+        assert_eq!(
+            select_run_live_mode(
+                false,
+                false,
+                RunTerminalState {
+                    interactive: true,
+                    tmux_available: true,
+                    inside_tmux: true,
+                },
+            ),
+            RunLiveMode::SplitCurrentTmux
+        );
+        assert_eq!(
+            select_run_live_mode(
+                false,
+                false,
+                RunTerminalState {
+                    interactive: true,
+                    tmux_available: true,
+                    inside_tmux: false,
+                },
+            ),
+            RunLiveMode::TemporaryTmuxSession
+        );
+        assert_eq!(
+            select_run_live_mode(
+                false,
+                false,
+                RunTerminalState {
+                    interactive: true,
+                    tmux_available: false,
+                    inside_tmux: false,
+                },
+            ),
+            RunLiveMode::TmuxUnavailableFallback
+        );
+        assert_eq!(
+            select_run_live_mode(
+                false,
+                false,
+                RunTerminalState {
+                    interactive: false,
+                    tmux_available: true,
+                    inside_tmux: false,
+                },
+            ),
+            RunLiveMode::SingleTerminal
+        );
+        assert_eq!(
+            select_run_live_mode(
+                false,
+                true,
+                RunTerminalState {
+                    interactive: true,
+                    tmux_available: true,
+                    inside_tmux: true,
+                },
+            ),
+            RunLiveMode::SingleTerminal
+        );
+        assert_eq!(
+            select_run_live_mode(
+                true,
+                false,
+                RunTerminalState {
+                    interactive: true,
+                    tmux_available: true,
+                    inside_tmux: true,
+                },
+            ),
+            RunLiveMode::SingleTerminal
+        );
+    }
+
+    #[test]
+    fn tmux_unavailable_fallback_documents_manual_live_and_postmortem_paths() {
+        let message = render_tmux_unavailable_fallback();
+
+        assert!(message.contains("tmux is not installed"));
+        assert!(message.contains("cc-blackbox guard watch"));
+        assert!(message.contains("Severe policy blocks still appear inside Claude"));
+        assert!(message.contains("cc-blackbox postmortem latest"));
+        assert!(message.contains("Claude is launching normally"));
+    }
+
     #[tokio::test]
     async fn run_watch_preserves_child_exit_code_and_renders_final_postmortem() {
         let events = Arc::new(Mutex::new(Vec::new()));
 
         let exit_code = run_child_command_with_deps(
             true,
+            false,
             vec!["fake-child".to_string(), "--flag".to_string()],
+            || RunTerminalState {
+                interactive: true,
+                tmux_available: true,
+                inside_tmux: true,
+            },
             || async { Ok(()) },
+            || panic!("explicit --watch should not start default live split"),
+            |_command, _args, _envs| panic!("explicit --watch should not start temporary tmux"),
             {
                 let events = events.clone();
                 move |postmortem| {
@@ -6377,6 +7086,7 @@ mod tests {
                     Ok(23)
                 }
             },
+            || panic!("explicit --watch should not render tmux fallback"),
             {
                 let events = events.clone();
                 move |_base_url| async move {
@@ -6393,6 +7103,235 @@ mod tests {
         assert_eq!(
             *events.lock().expect("test events lock"),
             vec!["start", "run", "stop", "render"]
+        );
+    }
+
+    #[tokio::test]
+    async fn default_interactive_run_in_tmux_splits_guard_and_skips_postmortem() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let exit_code = run_child_command_with_deps(
+            false,
+            false,
+            vec!["fake-child".to_string(), "--flag".to_string()],
+            || RunTerminalState {
+                interactive: true,
+                tmux_available: true,
+                inside_tmux: true,
+            },
+            || async { Ok(()) },
+            {
+                let events = events.clone();
+                move || {
+                    events
+                        .lock()
+                        .expect("test events lock")
+                        .push("split".to_string());
+                    Ok(())
+                }
+            },
+            |_command, _args, _envs| panic!("inside tmux should not create a temporary session"),
+            |_postmortem| panic!("default live run should not start legacy watcher"),
+            {
+                let events = events.clone();
+                move |command, args, envs| {
+                    assert_eq!(command, "fake-child");
+                    assert_eq!(args, &[String::from("--flag")]);
+                    assert!(envs
+                        .iter()
+                        .any(|(key, value)| *key == "ANTHROPIC_BASE_URL" && !value.is_empty()));
+                    events
+                        .lock()
+                        .expect("test events lock")
+                        .push("run".to_string());
+                    Ok(23)
+                }
+            },
+            || panic!("tmux is available; fallback should not render"),
+            {
+                let events = events.clone();
+                move |_base_url| async move {
+                    events
+                        .lock()
+                        .expect("test events lock")
+                        .push("render".to_string());
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(exit_code, 23);
+        assert_eq!(
+            *events.lock().expect("test events lock"),
+            vec!["split", "run"]
+        );
+    }
+
+    #[tokio::test]
+    async fn default_interactive_run_outside_tmux_uses_temporary_tmux_session() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let exit_code = run_child_command_with_deps(
+            false,
+            false,
+            vec!["fake-child".to_string(), "--flag".to_string()],
+            || RunTerminalState {
+                interactive: true,
+                tmux_available: true,
+                inside_tmux: false,
+            },
+            || async { Ok(()) },
+            || panic!("outside tmux should not split current window"),
+            {
+                let events = events.clone();
+                move |command, args, envs| {
+                    assert_eq!(command, "fake-child");
+                    assert_eq!(args, &[String::from("--flag")]);
+                    assert!(envs
+                        .iter()
+                        .any(|(key, value)| *key == "ANTHROPIC_BASE_URL" && !value.is_empty()));
+                    events
+                        .lock()
+                        .expect("test events lock")
+                        .push("temporary".to_string());
+                    Ok(19)
+                }
+            },
+            |_postmortem| panic!("default live run should not start legacy watcher"),
+            |_command, _args, _envs| panic!("temporary tmux should own child process"),
+            || panic!("tmux is available; fallback should not render"),
+            |_base_url| async move {
+                panic!("default live run should not render final postmortem");
+            },
+        )
+        .await;
+
+        assert_eq!(exit_code, 19);
+        assert_eq!(*events.lock().expect("test events lock"), vec!["temporary"]);
+    }
+
+    #[tokio::test]
+    async fn no_live_interactive_run_restores_single_terminal_behavior() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let exit_code = run_child_command_with_deps(
+            false,
+            true,
+            vec!["fake-child".to_string()],
+            || RunTerminalState {
+                interactive: true,
+                tmux_available: true,
+                inside_tmux: true,
+            },
+            || async { Ok(()) },
+            || panic!("--no-live should not split tmux"),
+            |_command, _args, _envs| panic!("--no-live should not create temporary tmux"),
+            |_postmortem| panic!("--no-live should not start legacy watcher"),
+            {
+                let events = events.clone();
+                move |_command, _args, _envs| {
+                    events
+                        .lock()
+                        .expect("test events lock")
+                        .push("run".to_string());
+                    Ok(7)
+                }
+            },
+            || panic!("tmux is available; fallback should not render"),
+            |_base_url| async move {
+                panic!("single-terminal run without --watch should not render final postmortem");
+            },
+        )
+        .await;
+
+        assert_eq!(exit_code, 7);
+        assert_eq!(*events.lock().expect("test events lock"), vec!["run"]);
+    }
+
+    #[tokio::test]
+    async fn noninteractive_run_does_not_force_tmux_live_mode() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let exit_code = run_child_command_with_deps(
+            false,
+            false,
+            vec!["fake-child".to_string()],
+            || RunTerminalState {
+                interactive: false,
+                tmux_available: true,
+                inside_tmux: false,
+            },
+            || async { Ok(()) },
+            || panic!("noninteractive run should not split tmux"),
+            |_command, _args, _envs| panic!("noninteractive run should not create temporary tmux"),
+            |_postmortem| panic!("noninteractive run should not start legacy watcher"),
+            {
+                let events = events.clone();
+                move |_command, _args, _envs| {
+                    events
+                        .lock()
+                        .expect("test events lock")
+                        .push("run".to_string());
+                    Ok(11)
+                }
+            },
+            || panic!("noninteractive run should not render tmux fallback"),
+            |_base_url| async move {
+                panic!("single-terminal run without --watch should not render final postmortem");
+            },
+        )
+        .await;
+
+        assert_eq!(exit_code, 11);
+        assert_eq!(*events.lock().expect("test events lock"), vec!["run"]);
+    }
+
+    #[tokio::test]
+    async fn interactive_run_without_tmux_prints_fallback_and_launches_child_normally() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let exit_code = run_child_command_with_deps(
+            false,
+            false,
+            vec!["fake-child".to_string()],
+            || RunTerminalState {
+                interactive: true,
+                tmux_available: false,
+                inside_tmux: false,
+            },
+            || async { Ok(()) },
+            || panic!("tmux unavailable should not split"),
+            |_command, _args, _envs| panic!("tmux unavailable should not create temporary tmux"),
+            |_postmortem| panic!("default live run should not start legacy watcher"),
+            {
+                let events = events.clone();
+                move |_command, _args, _envs| {
+                    events
+                        .lock()
+                        .expect("test events lock")
+                        .push("run".to_string());
+                    Ok(13)
+                }
+            },
+            {
+                let events = events.clone();
+                move || {
+                    events
+                        .lock()
+                        .expect("test events lock")
+                        .push("fallback".to_string());
+                }
+            },
+            |_base_url| async move {
+                panic!("fallback run without --watch should not render final postmortem");
+            },
+        )
+        .await;
+
+        assert_eq!(exit_code, 13);
+        assert_eq!(
+            *events.lock().expect("test events lock"),
+            vec!["fallback", "run"]
         );
     }
 
@@ -6699,6 +7638,7 @@ mod tests {
                     url,
                     session,
                     postmortem,
+                    run_owned,
                 },
         } = cli.command
         else {
@@ -6707,6 +7647,7 @@ mod tests {
         assert_eq!(url, "http://localhost:9091");
         assert_eq!(session.as_deref(), Some("s1"));
         assert!(!postmortem);
+        assert!(!run_owned);
 
         let cli =
             Cli::try_parse_from(["cc-blackbox", "guard", "start"]).expect("guard start parses");
@@ -6764,6 +7705,8 @@ mod tests {
 
     #[tokio::test]
     async fn guard_policy_fetches_policy_endpoint_and_renders_report() {
+        let _color_lock = COLOR_OVERRIDE_LOCK.lock().expect("color override lock");
+        colored::control::unset_override();
         let body = serde_json::json!({
             "source": "defaults",
             "warnings": [],
@@ -6978,6 +7921,294 @@ mod tests {
         assert!(line.contains("cap not set"));
         assert!(line.contains("CC_BLACKBOX_WEEKLY_TOKEN_BUDGET"));
         assert!(!line.contains("unknown"));
+    }
+
+    #[test]
+    fn run_owned_watch_url_disables_replay_for_next_session_binding() {
+        assert_eq!(
+            run_owned_watch_url("http://localhost:9091"),
+            "http://localhost:9091/watch?replay=false"
+        );
+        assert_eq!(
+            run_owned_watch_url("http://localhost:9091/"),
+            "http://localhost:9091/watch?replay=false"
+        );
+    }
+
+    #[test]
+    fn run_guard_panel_starts_waiting_for_first_prompt() {
+        let panel = RunGuardPanel::waiting();
+        let rendered = render_run_guard_panel(&panel);
+
+        assert!(rendered.contains("Watching Claude Code"));
+        assert!(rendered.contains("Waiting for first prompt..."));
+        assert!(rendered.contains("Live guard will attach when Claude sends its first request."));
+    }
+
+    #[test]
+    fn run_guard_panel_ignores_replayed_history_until_live_session_start() {
+        let mut panel = RunGuardPanel::waiting();
+        let replayed = WatchEvent::SessionStart {
+            session_id: "session_old".to_string(),
+            display_name: "old".to_string(),
+            model: "opus".to_string(),
+            initial_prompt: Some("old prompt".to_string()),
+        };
+        let live = WatchEvent::SessionStart {
+            session_id: "session_new".to_string(),
+            display_name: "api".to_string(),
+            model: "sonnet".to_string(),
+            initial_prompt: Some("new prompt".to_string()),
+        };
+
+        assert!(!panel.apply_event(&replayed, RunGuardEventOrigin::Replay));
+        assert!(render_run_guard_panel(&panel).contains("Waiting for first prompt"));
+
+        assert!(panel.apply_event(&live, RunGuardEventOrigin::Live));
+        let rendered = render_run_guard_panel(&panel);
+        assert!(rendered.contains("Session: api"));
+        assert!(rendered.contains("State: Watching"));
+        assert!(!rendered.contains("old"));
+    }
+
+    #[test]
+    fn run_guard_panel_filters_to_bound_session_after_binding() {
+        let mut panel = RunGuardPanel::waiting();
+        panel.apply_event(
+            &WatchEvent::SessionStart {
+                session_id: "session_target".to_string(),
+                display_name: "api".to_string(),
+                model: "sonnet".to_string(),
+                initial_prompt: None,
+            },
+            RunGuardEventOrigin::Live,
+        );
+
+        assert!(!panel.apply_event(
+            &WatchEvent::GuardFinding {
+                session_id: "session_other".to_string(),
+                rule_id: "tool_failures".to_string(),
+                severity: "warning".to_string(),
+                action: "warn".to_string(),
+                evidence_level: "direct_proxy".to_string(),
+                source: "proxy".to_string(),
+                confidence: 0.9,
+                timestamp: "2026-05-10T00:00:00Z".to_string(),
+                detail: "Other session failed.".to_string(),
+                suggested_action: Some("Ignore this.".to_string()),
+            },
+            RunGuardEventOrigin::Live,
+        ));
+
+        assert!(panel.apply_event(
+            &WatchEvent::GuardFinding {
+                session_id: "session_target".to_string(),
+                rule_id: "tool_failures".to_string(),
+                severity: "warning".to_string(),
+                action: "warn".to_string(),
+                evidence_level: "direct_proxy".to_string(),
+                source: "proxy".to_string(),
+                confidence: 0.9,
+                timestamp: "2026-05-10T00:00:00Z".to_string(),
+                detail: "6 failed Bash results across recent turns.".to_string(),
+                suggested_action: Some(
+                    "Stop the loop and fix the failing precondition.".to_string()
+                ),
+            },
+            RunGuardEventOrigin::Live,
+        ));
+
+        let rendered = render_run_guard_panel(&panel);
+        assert!(rendered.contains("State: Warning"));
+        assert!(rendered.contains("Warning: tool failures"));
+        assert!(rendered.contains("6 failed Bash results across recent turns."));
+        assert!(rendered.contains("Evidence: direct proxy"));
+        assert!(rendered.contains("Next: Stop the loop and fix the failing precondition."));
+        assert!(!rendered.contains("Other session failed"));
+    }
+
+    #[test]
+    fn run_guard_panel_renders_critical_blocked_cooldown_and_postmortem_ready_states() {
+        let mut panel = RunGuardPanel::waiting();
+        panel.apply_event(
+            &WatchEvent::SessionStart {
+                session_id: "session_target".to_string(),
+                display_name: "api".to_string(),
+                model: "sonnet".to_string(),
+                initial_prompt: None,
+            },
+            RunGuardEventOrigin::Live,
+        );
+
+        panel.apply_event(
+            &WatchEvent::ContextStatus {
+                session_id: "session_target".to_string(),
+                fill_percent: 91.0,
+                context_window_tokens: Some(200_000),
+                turns_to_compact: Some(0),
+            },
+            RunGuardEventOrigin::Live,
+        );
+        let critical = render_run_guard_panel(&panel);
+        assert!(critical.contains("State: Critical"));
+        assert!(critical.contains("Critical: context pressure"));
+        assert!(critical.contains("Context is about 91% full"));
+        assert!(critical.contains("Evidence: derived proxy estimate"));
+        assert!(critical.contains("Next: restart from a short summary."));
+
+        panel.apply_event(
+            &WatchEvent::GuardFinding {
+                session_id: "session_target".to_string(),
+                rule_id: "per_session_token_budget_exceeded".to_string(),
+                severity: "critical".to_string(),
+                action: "block".to_string(),
+                evidence_level: "direct_proxy".to_string(),
+                source: "proxy".to_string(),
+                confidence: 1.0,
+                timestamp: "2026-05-10T00:00:00Z".to_string(),
+                detail: "Session token budget exceeded.".to_string(),
+                suggested_action: Some("Start a fresh session.".to_string()),
+            },
+            RunGuardEventOrigin::Live,
+        );
+        let blocked = render_run_guard_panel(&panel);
+        assert!(blocked.contains("State: Blocked"));
+        assert!(blocked.contains("Blocked: per session token budget exceeded"));
+
+        panel.apply_event(
+            &WatchEvent::GuardFinding {
+                session_id: "session_target".to_string(),
+                rule_id: "api_error_circuit_breaker_cooldown".to_string(),
+                severity: "critical".to_string(),
+                action: "cooldown".to_string(),
+                evidence_level: "direct_proxy".to_string(),
+                source: "proxy".to_string(),
+                confidence: 1.0,
+                timestamp: "2026-05-10T00:00:00Z".to_string(),
+                detail: "Repeated API errors opened a cooldown.".to_string(),
+                suggested_action: Some("Wait 30s, then retry.".to_string()),
+            },
+            RunGuardEventOrigin::Live,
+        );
+        let cooldown = render_run_guard_panel(&panel);
+        assert!(cooldown.contains("State: Cooldown"));
+        assert!(cooldown.contains("Cooldown: api error circuit breaker cooldown"));
+
+        panel.apply_event(
+            &WatchEvent::PostmortemReady {
+                session_id: "session_target".to_string(),
+                idle_secs: 90,
+                total_tokens: 1000,
+                total_turns: 3,
+            },
+            RunGuardEventOrigin::Live,
+        );
+        let ready = render_run_guard_panel(&panel);
+        assert!(ready.contains("Postmortem ready"));
+        assert!(ready.contains("The session has enough evidence for an after-run report."));
+        assert!(ready.contains("Next: cc-blackbox postmortem latest"));
+    }
+
+    #[test]
+    fn run_guard_panel_renders_model_cache_quota_and_request_error_warnings() {
+        let mut panel = RunGuardPanel::waiting();
+        panel.apply_event(
+            &WatchEvent::SessionStart {
+                session_id: "session_target".to_string(),
+                display_name: "api".to_string(),
+                model: "sonnet".to_string(),
+                initial_prompt: None,
+            },
+            RunGuardEventOrigin::Live,
+        );
+
+        panel.apply_event(
+            &WatchEvent::ModelFallback {
+                session_id: "session_target".to_string(),
+                requested: "opus".to_string(),
+                actual: "sonnet".to_string(),
+            },
+            RunGuardEventOrigin::Live,
+        );
+        assert!(render_run_guard_panel(&panel).contains("Warning: model route mismatch"));
+
+        panel.apply_event(
+            &WatchEvent::CacheEvent {
+                session_id: "session_target".to_string(),
+                event_type: "miss_rebuild".to_string(),
+                cache_expires_at_epoch: None,
+                cache_expires_at_latest_epoch: None,
+                cache_ttl_source: None,
+                cache_ttl_mixed: None,
+                estimated_rebuild_cost_dollars: Some(0.24),
+            },
+            RunGuardEventOrigin::Live,
+        );
+        let cache = render_run_guard_panel(&panel);
+        assert!(cache.contains("Warning: cache rebuild"));
+        assert!(cache.contains("rebuild $0.24"));
+
+        panel.apply_event(
+            &WatchEvent::RateLimitStatus {
+                seconds_to_reset: Some(3600),
+                requests_remaining: None,
+                requests_limit: None,
+                input_tokens_remaining: None,
+                output_tokens_remaining: None,
+                tokens_used_this_week: Some(800_000),
+                tokens_limit: Some(900_000),
+                tokens_remaining: Some(100_000),
+                budget_source: Some("env".to_string()),
+                projected_exhaustion_secs: Some(1800),
+            },
+            RunGuardEventOrigin::Live,
+        );
+        assert!(render_run_guard_panel(&panel).contains("Warning: quota burn"));
+
+        panel.apply_event(
+            &WatchEvent::RequestError {
+                session_id: "session_target".to_string(),
+                error_type: "overloaded_error".to_string(),
+                message: "redacted".to_string(),
+            },
+            RunGuardEventOrigin::Live,
+        );
+        let error = render_run_guard_panel(&panel);
+        assert!(error.contains("Warning: request error"));
+        assert!(error.contains("overloaded_error"));
+        assert!(!error.contains("redacted"));
+    }
+
+    #[tokio::test]
+    async fn run_owned_guard_stream_subscribes_to_watch_without_postmortem_fetches() {
+        let chunks = vec![concat!(
+            "data: {\"type\":\"session_start\",\"session_id\":\"session_target\",",
+            "\"display_name\":\"api\",\"model\":\"sonnet\"}\n\n",
+            "data: {\"type\":\"guard_finding\",\"session_id\":\"session_target\",",
+            "\"rule_id\":\"tool_failures\",\"severity\":\"warning\",",
+            "\"action\":\"warn\",\"evidence_level\":\"direct_proxy\",",
+            "\"source\":\"proxy\",\"confidence\":0.9,",
+            "\"timestamp\":\"2026-05-10T00:00:00Z\",",
+            "\"detail\":\"6 failed Bash results across recent turns.\",",
+            "\"suggested_action\":\"Stop the loop.\"}\n\n"
+        )
+        .to_string()];
+        let (url, request_rx) = serve_sse_chunks_once(chunks);
+
+        connect_and_run_guard_stream(&run_owned_watch_url(&url))
+            .await
+            .expect("run-owned guard stream closes cleanly");
+
+        let request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured run guard request");
+        assert!(request.starts_with("GET /watch?replay=false "));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("accept: text/event-stream"),
+            "missing SSE accept header:\n{request}"
+        );
     }
 
     #[test]

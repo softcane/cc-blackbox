@@ -8917,26 +8917,33 @@ async fn handle_watch(
     // lazy-discovered tmux pane, or a reattach after the 30s replay window)
     // still see the session header box + initial prompt.
     let session_filter = params.get("session").cloned();
+    let replay_history = !matches!(
+        params.get("replay").map(|value| value.as_str()),
+        Some("false" | "0" | "no")
+    );
 
     let (history, mut rx) = watch::BROADCASTER.subscribe_with_history();
     let quota_start_snapshot = current_quota_burn_watch_event();
 
     // Look up stored session info synchronously before the stream starts.
-    let synthetic_start = session_filter.as_ref().and_then(|sid| {
-        diagnosis::SESSIONS.iter().find_map(|entry| {
-            let s = entry.value();
-            if s.session_id == *sid && s.session_inserted {
-                Some(watch::WatchEvent::SessionStart {
-                    session_id: s.session_id.clone(),
-                    display_name: s.display_name.clone(),
-                    model: s.model.clone(),
-                    initial_prompt: s.initial_prompt.clone(),
-                })
-            } else {
-                None
-            }
-        })
-    });
+    let synthetic_start = replay_history
+        .then(|| ())
+        .and_then(|_| session_filter.as_ref())
+        .and_then(|sid| {
+            diagnosis::SESSIONS.iter().find_map(|entry| {
+                let s = entry.value();
+                if s.session_id == *sid && s.session_inserted {
+                    Some(watch::WatchEvent::SessionStart {
+                        session_id: s.session_id.clone(),
+                        display_name: s.display_name.clone(),
+                        model: s.model.clone(),
+                        initial_prompt: s.initial_prompt.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+        });
     let synthetic_session_id = synthetic_start.as_ref().map(|event| match event {
         watch::WatchEvent::SessionStart { session_id, .. } => session_id.clone(),
         _ => String::new(),
@@ -8960,24 +8967,26 @@ async fn handle_watch(
         }
 
         // Replay recent history, filtered if a session is specified.
-        for event in history {
-            if matches!(event, watch::WatchEvent::RateLimitStatus { .. }) {
-                continue;
-            }
-            if !event_matches_session(&event, session_filter.as_deref()) {
-                continue;
-            }
-            if let (
-                Some(injected_session_id),
-                watch::WatchEvent::SessionStart { session_id, .. },
-            ) = (&synthetic_session_id, &event)
-            {
-                if session_id == injected_session_id {
+        if replay_history {
+            for event in history {
+                if matches!(event, watch::WatchEvent::RateLimitStatus { .. }) {
                     continue;
                 }
-            }
-            if let Ok(json) = serde_json::to_string(&event) {
-                yield Ok(Event::default().data(json));
+                if !event_matches_session(&event, session_filter.as_deref()) {
+                    continue;
+                }
+                if let (
+                    Some(injected_session_id),
+                    watch::WatchEvent::SessionStart { session_id, .. },
+                ) = (&synthetic_session_id, &event)
+                {
+                    if session_id == injected_session_id {
+                        continue;
+                    }
+                }
+                if let Ok(json) = serde_json::to_string(&event) {
+                    yield Ok(Event::default().data(json));
+                }
             }
         }
         loop {

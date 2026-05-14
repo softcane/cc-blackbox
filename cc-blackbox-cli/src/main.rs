@@ -1466,7 +1466,10 @@ where
     Render: FnOnce(String) -> RenderFut,
     RenderFut: std::future::Future<Output = ()>,
 {
-    let (watch, child_command) = extract_run_watch(watch_flag, command);
+    let (mut watch, child_command) = extract_run_watch(watch_flag, command);
+    if no_live_flag {
+        watch = false;
+    }
     if child_command.is_empty() {
         eprintln!("Error: missing command after `cc-blackbox run`");
         return 1;
@@ -2220,6 +2223,19 @@ impl RunGuardPanel {
             }
         }
 
+        if self
+            .notice
+            .as_ref()
+            .map(|notice| notice.postmortem_ready)
+            .unwrap_or(false)
+            && !matches!(event, WatchEvent::PostmortemReady { .. })
+        {
+            self.notice = None;
+            if !matches!(event, WatchEvent::SessionEnd { .. }) {
+                self.state = RunGuardPanelState::Watching;
+            }
+        }
+
         match event {
             WatchEvent::SessionStart {
                 display_name,
@@ -2236,7 +2252,6 @@ impl RunGuardPanel {
                 true
             }
             WatchEvent::PostmortemReady { .. } => {
-                self.state = RunGuardPanelState::Ended;
                 self.notice = Some(RunGuardNotice {
                     level: "Postmortem",
                     title: "ready".to_string(),
@@ -2437,6 +2452,13 @@ impl RunGuardPanel {
                 });
                 true
             }
+            WatchEvent::ToolUse { .. }
+            | WatchEvent::ToolResult { .. }
+            | WatchEvent::SkillEvent { .. }
+            | WatchEvent::McpEvent { .. }
+            | WatchEvent::FrustrationSignal { .. }
+            | WatchEvent::ContextStatus { .. }
+            | WatchEvent::CacheEvent { .. } => true,
             _ => false,
         }
     }
@@ -7249,6 +7271,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_live_suppresses_child_position_watch_compat_flag() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let exit_code = run_child_command_with_deps(
+            false,
+            true,
+            vec!["fake-child".to_string(), "--watch".to_string()],
+            || RunTerminalState {
+                interactive: true,
+                tmux_available: true,
+                inside_tmux: true,
+            },
+            || async { Ok(()) },
+            || panic!("--no-live should not split tmux"),
+            |_command, _args, _envs| panic!("--no-live should not create temporary tmux"),
+            |_postmortem| panic!("--no-live should suppress legacy watcher"),
+            {
+                let events = events.clone();
+                move |command, args, _envs| {
+                    assert_eq!(command, "fake-child");
+                    assert!(args.is_empty(), "compat --watch should be consumed");
+                    events
+                        .lock()
+                        .expect("test events lock")
+                        .push("run".to_string());
+                    Ok(7)
+                }
+            },
+            || panic!("tmux is available; fallback should not render"),
+            |_base_url| async move {
+                panic!("--no-live should not render final postmortem");
+            },
+        )
+        .await;
+
+        assert_eq!(exit_code, 7);
+        assert_eq!(*events.lock().expect("test events lock"), vec!["run"]);
+    }
+
+    #[tokio::test]
     async fn noninteractive_run_does_not_force_tmux_live_mode() {
         let events = Arc::new(Mutex::new(Vec::new()));
 
@@ -8107,6 +8169,65 @@ mod tests {
         assert!(ready.contains("Postmortem ready"));
         assert!(ready.contains("The session has enough evidence for an after-run report."));
         assert!(ready.contains("Next: cc-blackbox postmortem latest"));
+    }
+
+    #[test]
+    fn run_guard_panel_clears_idle_postmortem_ready_on_later_activity() {
+        let mut panel = RunGuardPanel::waiting();
+        panel.apply_event(
+            &WatchEvent::SessionStart {
+                session_id: "session_target".to_string(),
+                display_name: "api".to_string(),
+                model: "sonnet".to_string(),
+                initial_prompt: None,
+            },
+            RunGuardEventOrigin::Live,
+        );
+        panel.apply_event(
+            &WatchEvent::PostmortemReady {
+                session_id: "session_target".to_string(),
+                idle_secs: 90,
+                total_tokens: 1000,
+                total_turns: 3,
+            },
+            RunGuardEventOrigin::Live,
+        );
+        assert!(render_run_guard_panel(&panel).contains("Postmortem ready"));
+
+        assert!(panel.apply_event(
+            &WatchEvent::ToolUse {
+                session_id: "session_target".to_string(),
+                timestamp: "2026-05-10T00:02:00Z".to_string(),
+                tool_name: "Read".to_string(),
+                summary: "src/main.rs".to_string(),
+            },
+            RunGuardEventOrigin::Live,
+        ));
+        let resumed = render_run_guard_panel(&panel);
+        assert!(resumed.contains("State: Watching"));
+        assert!(!resumed.contains("Postmortem ready"));
+
+        panel.apply_event(
+            &WatchEvent::PostmortemReady {
+                session_id: "session_target".to_string(),
+                idle_secs: 90,
+                total_tokens: 1200,
+                total_turns: 4,
+            },
+            RunGuardEventOrigin::Live,
+        );
+        assert!(panel.apply_event(
+            &WatchEvent::ContextStatus {
+                session_id: "session_target".to_string(),
+                fill_percent: 12.0,
+                context_window_tokens: Some(200_000),
+                turns_to_compact: None,
+            },
+            RunGuardEventOrigin::Live,
+        ));
+        let low_context = render_run_guard_panel(&panel);
+        assert!(low_context.contains("State: Watching"));
+        assert!(!low_context.contains("Postmortem ready"));
     }
 
     #[test]

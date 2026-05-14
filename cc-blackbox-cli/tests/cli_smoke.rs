@@ -103,8 +103,9 @@ fn top_level_help_exposes_user_workflows() {
     assert!(out.contains("run"));
     assert!(out.contains("watch"));
     assert!(out.contains("sessions"));
+    assert!(out.contains("stop-plan"));
     assert!(out.contains("recall"));
-    assert!(out.contains("reconcile"));
+    assert!(!out.contains("reconcile"));
 }
 
 #[test]
@@ -115,6 +116,7 @@ fn run_help_documents_watch_and_trailing_child_command() {
     let out = stdout(&output);
     assert!(out.contains("Run a command through the local cc-blackbox proxy"));
     assert!(out.contains("--watch"));
+    assert!(out.contains("--live"));
     assert!(out.contains("--no-live"));
     assert!(out.contains("Command and arguments to run"));
 }
@@ -330,4 +332,67 @@ fn reconcile_command_reports_api_errors() {
         "unexpected request:\n{request}"
     );
     assert!(stderr(&output).contains("Error: HTTP 404"));
+}
+
+#[test]
+fn stop_plan_command_renders_operational_sections() {
+    let (url, request_rx) = serve_json_once(
+        r#"{
+          "session_id": "session_stop",
+          "redacted": true,
+          "partial": false,
+          "summary": {
+            "duration_secs": 300,
+            "model": "claude-sonnet",
+            "outcome": "Likely Partially Completed",
+            "total_turns": 4,
+            "total_tokens": 123456
+          },
+          "diagnosis": {
+            "likely_cause": "tool_failure_streak",
+            "likely_cause_is_heuristic": false,
+            "detail": "Bash failed repeatedly.",
+            "next_action": "Fix the failing command, then restart."
+          },
+          "impact": {
+            "estimated_likely_wasted_cost_dollars": 0.12
+          },
+          "signals": {
+            "cache": { "cache_hit_ratio": 0.75, "rebuild_turns": 0 },
+            "context": { "max_fill_percent": 82.0, "turns_to_compact": 1 },
+            "tools": [
+              { "tool_name": "Bash", "calls": 5, "failures": 3 }
+            ],
+            "model": { "fallbacks": [] }
+          },
+          "findings": [],
+          "evidence": [
+            { "type": "direct", "label": "tools", "detail": "3 tool failures", "turn": 2 }
+          ],
+          "recommendations": ["Fix the failing command, then restart."]
+        }"#,
+    );
+
+    let output = cc_blackbox(&["stop-plan", "--url", &url, "latest"]);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let request = captured_request(request_rx);
+    assert!(
+        request.starts_with("GET /api/postmortem/last?"),
+        "unexpected request:\n{request}"
+    );
+    assert!(request.contains("redact=true"));
+    let out = stdout(&output);
+    for heading in [
+        "Decision",
+        "Why",
+        "What failed",
+        "Fix before restart",
+        "Restart prompt",
+        "Commands/tests first",
+        "Alternatives",
+    ] {
+        assert!(out.contains(heading), "missing {heading} in:\n{out}");
+    }
+    assert!(out.contains("Stop: 3 Bash failures"));
 }

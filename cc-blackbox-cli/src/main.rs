@@ -1,8 +1,9 @@
+mod decision;
 mod tmux;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, ErrorKind, IsTerminal, Write};
+use std::io::{self, ErrorKind, IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -12,6 +13,11 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use decision::{
+    decision_from_guard_status_session, decision_from_postmortem,
+    guard_watch_state_label_for_reason, reason_from_guard_event, render_footer, DecisionState,
+    SessionDecision, SessionDecisionTracker,
+};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
@@ -53,7 +59,11 @@ enum Commands {
         #[arg(long)]
         watch: bool,
 
-        /// Disable the default live guard split for interactive terminals
+        /// Open the live guard split in tmux for interactive terminals
+        #[arg(long, conflicts_with_all = ["watch", "no_live"])]
+        live: bool,
+
+        /// Compatibility no-op; run defaults to the single terminal
         #[arg(long, conflicts_with = "watch")]
         no_live: bool,
 
@@ -151,6 +161,37 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
+    /// Build a short intervention plan before continuing or restarting
+    StopPlan {
+        /// Base URL of cc-blackbox-core
+        #[arg(long, default_value = "http://localhost:9091")]
+        url: String,
+
+        /// Session id, or "latest"/"last" for the latest session
+        #[arg(default_value = "latest")]
+        target: String,
+
+        /// Emit structured JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Internal Claude Code statusline helper
+    #[command(hide = true)]
+    Footer {
+        /// Base URL of cc-blackbox-core
+        #[arg(long, default_value = "http://localhost:9091")]
+        url: String,
+
+        /// Terminal width to render for
+        #[arg(long)]
+        width: Option<usize>,
+
+        /// Emit structured JSON instead of the footer line
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Search across past session prompts and final summaries
     Recall {
         /// Base URL of cc-blackbox-core
@@ -171,6 +212,7 @@ enum Commands {
     },
 
     /// Import a billed-cost reconciliation for a session
+    #[command(hide = true)]
     Reconcile {
         /// Base URL of cc-blackbox-core
         #[arg(long, default_value = "http://localhost:9091")]
@@ -601,10 +643,11 @@ impl RunOwnedSessionMonitor {
 
 fn select_run_live_mode(
     legacy_watch: bool,
+    live: bool,
     no_live: bool,
     terminal: RunTerminalState,
 ) -> RunLiveMode {
-    if legacy_watch || no_live || !terminal.interactive {
+    if legacy_watch || no_live || !live || !terminal.interactive {
         return RunLiveMode::SingleTerminal;
     }
     if !terminal.tmux_available {
@@ -1382,17 +1425,34 @@ async fn run_guard_start(no_grafana: bool) -> i32 {
     run_guard_start_with_deps(no_grafana, probe_guard_stack_readiness, start_stack).await
 }
 
-fn extract_run_watch(watch_flag: bool, command: Vec<String>) -> (bool, Vec<String>) {
+fn extract_run_flags(
+    watch_flag: bool,
+    live_flag: bool,
+    no_live_flag: bool,
+    command: Vec<String>,
+) -> (bool, bool, bool, Vec<String>) {
     let mut watch = watch_flag;
+    let mut live = live_flag;
+    let mut no_live = no_live_flag;
     let mut child_command = Vec::with_capacity(command.len());
     for arg in command {
         if arg == "--watch" {
             watch = true;
+        } else if arg == "--live" {
+            live = true;
+        } else if arg == "--no-live" {
+            no_live = true;
         } else {
             child_command.push(arg);
         }
     }
-    (watch, child_command)
+    if no_live {
+        watch = false;
+        live = false;
+    } else if watch {
+        live = false;
+    }
+    (watch, live, no_live, child_command)
 }
 
 async fn ensure_stack_running() -> Result<(), String> {
@@ -1430,6 +1490,109 @@ fn current_cli_path() -> String {
     std::env::current_exe()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "cc-blackbox".to_string())
+}
+
+fn claude_settings_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude/settings.json"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FooterStatuslineInstall {
+    SkippedNotClaude,
+    InstalledOrUpdated,
+    PreservedCustom,
+}
+
+fn command_is_claude(command: &str) -> bool {
+    Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name == "claude")
+        .unwrap_or(command == "claude")
+}
+
+fn cc_blackbox_footer_statusline_command(cli_path: &str, core_url: &str) -> String {
+    shell_join(&[
+        cli_path.to_string(),
+        "footer".to_string(),
+        "--url".to_string(),
+        core_url.to_string(),
+    ])
+}
+
+fn statusline_is_cc_blackbox_footer(statusline: &serde_json::Value) -> bool {
+    statusline
+        .get("command")
+        .and_then(|value| value.as_str())
+        .map(|command| {
+            command.contains(" footer")
+                && (command.contains("cc-blackbox") || command.contains("cc_blackbox"))
+        })
+        .unwrap_or(false)
+}
+
+fn ensure_claude_footer_statusline_in_settings(
+    settings_path: &Path,
+    command: &str,
+    core_url: &str,
+    cli_path: &str,
+) -> Result<FooterStatuslineInstall, String> {
+    if !command_is_claude(command) {
+        return Ok(FooterStatuslineInstall::SkippedNotClaude);
+    }
+
+    let mut settings = if settings_path.is_file() {
+        let raw = fs::read_to_string(settings_path)
+            .map_err(|err| format!("failed to read {}: {}", settings_path.display(), err))?;
+        serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|err| format!("failed to parse {}: {}", settings_path.display(), err))?
+    } else {
+        serde_json::json!({})
+    };
+    if !settings.is_object() {
+        return Err(format!(
+            "{} must contain a JSON object",
+            settings_path.display()
+        ));
+    }
+
+    if let Some(existing) = settings.get("statusLine") {
+        if !statusline_is_cc_blackbox_footer(existing) {
+            return Ok(FooterStatuslineInstall::PreservedCustom);
+        }
+    }
+
+    let command = cc_blackbox_footer_statusline_command(cli_path, core_url);
+    if let Some(object) = settings.as_object_mut() {
+        object.insert(
+            "statusLine".to_string(),
+            serde_json::json!({
+                "type": "command",
+                "command": command,
+                "padding": 0
+            }),
+        );
+    }
+    let mut rendered = serde_json::to_string_pretty(&settings)
+        .map_err(|err| format!("failed to render {}: {}", settings_path.display(), err))?;
+    rendered.push('\n');
+    write_if_changed(settings_path, &rendered)?;
+    Ok(FooterStatuslineInstall::InstalledOrUpdated)
+}
+
+fn prepare_claude_footer_statusline_for_run(
+    command: &str,
+    core_url: &str,
+) -> Result<FooterStatuslineInstall, String> {
+    let Some(settings_path) = claude_settings_path() else {
+        return Ok(FooterStatuslineInstall::SkippedNotClaude);
+    };
+    ensure_claude_footer_statusline_in_settings(
+        &settings_path,
+        command,
+        core_url,
+        &current_cli_path(),
+    )
 }
 
 fn tmux_session_name() -> String {
@@ -1515,6 +1678,7 @@ async fn run_child_command_with_lifecycle_deps<
     Split,
     Temp,
     Start,
+    PrepareFooter,
     Run,
     Fallback,
     Render,
@@ -1524,6 +1688,7 @@ async fn run_child_command_with_lifecycle_deps<
     FinalizeFut,
 >(
     watch_flag: bool,
+    live_flag: bool,
     no_live_flag: bool,
     command: Vec<String>,
     detect_terminal: Detect,
@@ -1531,6 +1696,7 @@ async fn run_child_command_with_lifecycle_deps<
     split_current_tmux: Split,
     run_temporary_tmux: Temp,
     start_watcher_fn: Start,
+    prepare_footer_statusline: PrepareFooter,
     run_command_fn: Run,
     render_fallback: Fallback,
     render_final_postmortem: Render,
@@ -1544,6 +1710,7 @@ where
     Split: FnOnce() -> Result<(), String>,
     Temp: FnOnce(&str, &[String], &[(&str, &str)]) -> Result<i32, String>,
     Start: FnOnce(bool) -> Result<WatchHandle, String>,
+    PrepareFooter: FnOnce(&str, &str) -> Result<FooterStatuslineInstall, String>,
     Run: FnOnce(&str, &[String], &[(&str, &str)]) -> Result<i32, String>,
     Fallback: FnOnce(),
     Render: FnOnce(String) -> RenderFut,
@@ -1552,10 +1719,8 @@ where
     Finalize: FnOnce(String, Vec<String>, Option<i32>) -> FinalizeFut,
     FinalizeFut: std::future::Future<Output = Result<(), String>>,
 {
-    let (mut watch, child_command) = extract_run_watch(watch_flag, command);
-    if no_live_flag {
-        watch = false;
-    }
+    let (watch, live, no_live, child_command) =
+        extract_run_flags(watch_flag, live_flag, no_live_flag, command);
     if child_command.is_empty() {
         eprintln!("Error: missing command after `cc-blackbox run`");
         return 1;
@@ -1566,12 +1731,30 @@ where
         return 1;
     }
 
-    let live_mode = select_run_live_mode(watch, no_live_flag, detect_terminal());
+    let live_mode = select_run_live_mode(watch, live, no_live, detect_terminal());
     let command_name = &child_command[0];
     let command_args = &child_command[1..];
     let core_url = cc_blackbox_core_url();
     let proxy_url = envoy_proxy_url();
     let proxy_env = [("ANTHROPIC_BASE_URL", proxy_url.as_str())];
+    match prepare_footer_statusline(command_name, &core_url) {
+        Ok(FooterStatuslineInstall::PreservedCustom) => {
+            eprintln!(
+                "{}",
+                "cc-blackbox footer not installed because Claude already has a custom statusLine."
+                    .dimmed()
+            );
+        }
+        Ok(
+            FooterStatuslineInstall::InstalledOrUpdated | FooterStatuslineInstall::SkippedNotClaude,
+        ) => {}
+        Err(err) => {
+            eprintln!(
+                "{}",
+                format!("cc-blackbox footer not installed: {err}").yellow()
+            );
+        }
+    }
 
     let mut render_postmortem_after_run = false;
     let mut monitor;
@@ -1658,6 +1841,7 @@ async fn run_child_command_with_deps<
     RenderFut,
 >(
     watch_flag: bool,
+    live_flag: bool,
     no_live_flag: bool,
     command: Vec<String>,
     detect_terminal: Detect,
@@ -1683,6 +1867,7 @@ where
 {
     run_child_command_with_lifecycle_deps(
         watch_flag,
+        live_flag,
         no_live_flag,
         command,
         detect_terminal,
@@ -1690,6 +1875,7 @@ where
         split_current_tmux,
         run_temporary_tmux,
         start_watcher_fn,
+        prepare_claude_footer_statusline_for_run,
         run_command_fn,
         render_fallback,
         render_final_postmortem,
@@ -1699,9 +1885,15 @@ where
     .await
 }
 
-async fn run_child_command(watch_flag: bool, no_live_flag: bool, command: Vec<String>) -> i32 {
+async fn run_child_command(
+    watch_flag: bool,
+    live_flag: bool,
+    no_live_flag: bool,
+    command: Vec<String>,
+) -> i32 {
     run_child_command_with_lifecycle_deps(
         watch_flag,
+        live_flag,
         no_live_flag,
         command,
         RunTerminalState::detect,
@@ -1711,6 +1903,7 @@ async fn run_child_command(watch_flag: bool, no_live_flag: bool, command: Vec<St
             tmux::run_in_temporary_session_for_run(command, args, envs, &cc_blackbox_core_url())
         },
         start_watcher,
+        prepare_claude_footer_statusline_for_run,
         run_command_with_env,
         || eprintln!("{}", render_tmux_unavailable_fallback().yellow()),
         |base_url| async move {
@@ -2151,7 +2344,11 @@ fn render_guard_watch_line(event: &WatchEvent) -> Option<String> {
             suggested_action,
             ..
         } => {
-            let state = guard_action_state_label(action, severity);
+            let reason = reason_from_guard_event(event);
+            let state = reason
+                .as_ref()
+                .map(guard_watch_state_label_for_reason)
+                .unwrap_or_else(|| guard_action_state_label(action, severity));
             let mut line = format!(
                 "{state} · {session_id} · {} · {} · {} · evidence {} from {} · confidence {:.0}%",
                 rule_id.replace('_', " "),
@@ -2290,7 +2487,6 @@ enum RunGuardEventOrigin {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunGuardPanelState {
-    Waiting,
     Watching,
     Warning,
     Critical,
@@ -2302,7 +2498,6 @@ enum RunGuardPanelState {
 impl RunGuardPanelState {
     fn label(self) -> &'static str {
         match self {
-            Self::Waiting => "Watching",
             Self::Watching => "Watching",
             Self::Warning => "Warning",
             Self::Critical => "Critical",
@@ -2314,306 +2509,24 @@ impl RunGuardPanelState {
 }
 
 #[derive(Debug, Clone)]
-struct RunGuardNotice {
-    level: &'static str,
-    title: String,
-    detail: String,
-    evidence: String,
-    next: String,
-    postmortem_ready: bool,
-}
-
-#[derive(Debug, Clone)]
 struct RunGuardPanel {
-    session_id: Option<String>,
-    display_name: Option<String>,
-    model: Option<String>,
-    state: RunGuardPanelState,
-    notice: Option<RunGuardNotice>,
+    tracker: SessionDecisionTracker,
 }
 
 impl RunGuardPanel {
     fn waiting() -> Self {
         Self {
-            session_id: None,
-            display_name: None,
-            model: None,
-            state: RunGuardPanelState::Waiting,
-            notice: None,
+            tracker: SessionDecisionTracker::waiting(),
         }
     }
 
     fn apply_event(&mut self, event: &WatchEvent, origin: RunGuardEventOrigin) -> bool {
-        if self.session_id.is_none() {
-            if origin == RunGuardEventOrigin::Replay {
-                return false;
-            }
-            if let WatchEvent::SessionStart {
-                session_id,
-                display_name,
-                model,
-                ..
-            } = event
-            {
-                self.session_id = Some(session_id.clone());
-                self.display_name = Some(display_name.clone());
-                self.model = Some(model.clone());
-                self.state = RunGuardPanelState::Watching;
-                self.notice = None;
-                return true;
-            }
-            return false;
-        }
-
-        if let Some(event_session) = event_session_id(event) {
-            if self.session_id.as_deref() != Some(event_session) {
-                return false;
-            }
-        }
-
-        if self
-            .notice
-            .as_ref()
-            .map(|notice| notice.postmortem_ready)
-            .unwrap_or(false)
-            && !matches!(event, WatchEvent::PostmortemReady { .. })
-        {
-            self.notice = None;
-            if !matches!(event, WatchEvent::SessionEnd { .. }) {
-                self.state = RunGuardPanelState::Watching;
-            }
-        }
-
-        match event {
-            WatchEvent::SessionStart {
-                display_name,
-                model,
-                ..
-            } => {
-                self.display_name = Some(display_name.clone());
-                self.model = Some(model.clone());
-                self.state = RunGuardPanelState::Watching;
-                true
-            }
-            WatchEvent::SessionEnd { .. } => {
-                self.state = RunGuardPanelState::Ended;
-                true
-            }
-            WatchEvent::PostmortemReady { .. } => {
-                self.notice = Some(RunGuardNotice {
-                    level: "Postmortem",
-                    title: "ready".to_string(),
-                    detail: "The session has enough evidence for an after-run report.".to_string(),
-                    evidence: String::new(),
-                    next: "cc-blackbox postmortem latest".to_string(),
-                    postmortem_ready: true,
-                });
-                true
-            }
-            WatchEvent::GuardFinding {
-                rule_id,
-                severity,
-                action,
-                evidence_level,
-                detail,
-                suggested_action,
-                ..
-            } => {
-                self.state = match action.as_str() {
-                    "block" => RunGuardPanelState::Blocked,
-                    "cooldown" => RunGuardPanelState::Cooldown,
-                    "critical" => RunGuardPanelState::Critical,
-                    _ if severity == "critical" => RunGuardPanelState::Critical,
-                    _ => RunGuardPanelState::Warning,
-                };
-                let level = self.state.label();
-                let next = suggested_action
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| match action.as_str() {
-                        "block" => "start a fresh session.",
-                        "cooldown" => "wait for the cooldown, fix the error cause, then retry.",
-                        _ => "keep going, but avoid repeating the same failing action.",
-                    });
-                self.notice = Some(RunGuardNotice {
-                    level,
-                    title: rule_id.replace('_', " "),
-                    detail: detail.clone(),
-                    evidence: evidence_level.replace('_', " "),
-                    next: next.to_string(),
-                    postmortem_ready: false,
-                });
-                true
-            }
-            WatchEvent::ContextStatus {
-                fill_percent,
-                turns_to_compact,
-                ..
-            } if *fill_percent >= 60.0 => {
-                self.state = if *fill_percent >= 80.0 {
-                    RunGuardPanelState::Critical
-                } else {
-                    RunGuardPanelState::Warning
-                };
-                let risk = match turns_to_compact {
-                    Some(0) => "compaction risk is high".to_string(),
-                    Some(1) => "about 1 turn to auto-compaction".to_string(),
-                    Some(turns) => format!("about {turns} turns to auto-compaction"),
-                    None => "compaction timing is uncertain".to_string(),
-                };
-                let level = self.state.label();
-                self.notice = Some(RunGuardNotice {
-                    level,
-                    title: "context pressure".to_string(),
-                    detail: format!("Context is about {:.0}% full; {risk}.", fill_percent),
-                    evidence: "derived proxy estimate".to_string(),
-                    next: if *fill_percent >= 80.0 {
-                        "restart from a short summary.".to_string()
-                    } else {
-                        "narrow the next request.".to_string()
-                    },
-                    postmortem_ready: false,
-                });
-                true
-            }
-            WatchEvent::ModelFallback {
-                requested, actual, ..
-            } => {
-                self.state = RunGuardPanelState::Warning;
-                self.notice = Some(RunGuardNotice {
-                    level: "Warning",
-                    title: "model route mismatch".to_string(),
-                    detail: format!("Requested {requested}, but the response reported {actual}."),
-                    evidence: "direct proxy".to_string(),
-                    next: "record the mismatch; do not treat it as provider-quota evidence."
-                        .to_string(),
-                    postmortem_ready: false,
-                });
-                true
-            }
-            WatchEvent::CacheEvent {
-                event_type,
-                estimated_rebuild_cost_dollars,
-                ..
-            } if matches!(
-                event_type.as_str(),
-                "miss_rebuild" | "miss_ttl" | "miss_thrash"
-            ) =>
-            {
-                self.state = RunGuardPanelState::Warning;
-                let cost = estimated_rebuild_cost_dollars
-                    .map(|value| format!("; rebuild ${value:.2}"))
-                    .unwrap_or_default();
-                self.notice = Some(RunGuardNotice {
-                    level: "Warning",
-                    title: "cache rebuild".to_string(),
-                    detail: format!(
-                        "Prompt cache {} detected{cost}.",
-                        event_type.replace('_', " ")
-                    ),
-                    evidence: "direct proxy".to_string(),
-                    next: "avoid restarting or idling before the next turn if cache reuse matters."
-                        .to_string(),
-                    postmortem_ready: false,
-                });
-                true
-            }
-            WatchEvent::RateLimitStatus {
-                tokens_used_this_week,
-                tokens_limit,
-                tokens_remaining,
-                projected_exhaustion_secs,
-                ..
-            } => {
-                let Some(used) = tokens_used_this_week else {
-                    return false;
-                };
-                self.state = RunGuardPanelState::Warning;
-                let limit = tokens_limit
-                    .map(format_tokens)
-                    .unwrap_or_else(|| "uncapped".to_string());
-                let remaining = tokens_remaining
-                    .map(|value| format!("; {} left", format_tokens(value)))
-                    .unwrap_or_default();
-                let projected = projected_exhaustion_secs
-                    .map(|secs| {
-                        format!("; projected exhaustion in {}", format_duration_coarse(secs))
-                    })
-                    .unwrap_or_default();
-                self.notice = Some(RunGuardNotice {
-                    level: "Warning",
-                    title: "quota burn".to_string(),
-                    detail: format!(
-                        "Used {} tokens this week against {limit}{remaining}{projected}.",
-                        format_tokens(*used)
-                    ),
-                    evidence: "derived proxy estimate".to_string(),
-                    next: "narrow the next request or pause before starting another large turn."
-                        .to_string(),
-                    postmortem_ready: false,
-                });
-                true
-            }
-            WatchEvent::RequestError { error_type, .. } => {
-                self.state = RunGuardPanelState::Warning;
-                self.notice = Some(RunGuardNotice {
-                    level: "Warning",
-                    title: "request error".to_string(),
-                    detail: format!("The proxy observed API error {error_type}."),
-                    evidence: "direct proxy".to_string(),
-                    next: "check API status or credentials before retrying repeatedly.".to_string(),
-                    postmortem_ready: false,
-                });
-                true
-            }
-            WatchEvent::CacheWarning { ttl_secs, .. } => {
-                self.state = RunGuardPanelState::Warning;
-                self.notice = Some(RunGuardNotice {
-                    level: "Warning",
-                    title: "cache expiry".to_string(),
-                    detail: format!(
-                        "Prompt cache is estimated to expire in about {}.",
-                        format_duration_coarse(*ttl_secs)
-                    ),
-                    evidence: "derived proxy estimate".to_string(),
-                    next: "send the next useful request before the cache expires.".to_string(),
-                    postmortem_ready: false,
-                });
-                true
-            }
-            WatchEvent::CompactionLoop {
-                consecutive,
-                wasted_tokens,
-                ..
-            } => {
-                self.state = RunGuardPanelState::Warning;
-                self.notice = Some(RunGuardNotice {
-                    level: "Warning",
-                    title: "possible compaction loop".to_string(),
-                    detail: format!(
-                        "{consecutive} rapid turns may have wasted about {} tokens.",
-                        format_tokens(*wasted_tokens)
-                    ),
-                    evidence: "derived proxy estimate".to_string(),
-                    next: "stop the loop and restart from a compact summary.".to_string(),
-                    postmortem_ready: false,
-                });
-                true
-            }
-            WatchEvent::ToolUse { .. }
-            | WatchEvent::ToolResult { .. }
-            | WatchEvent::SkillEvent { .. }
-            | WatchEvent::McpEvent { .. }
-            | WatchEvent::FrustrationSignal { .. }
-            | WatchEvent::ContextStatus { .. }
-            | WatchEvent::CacheEvent { .. } => true,
-            _ => false,
-        }
+        self.tracker.apply_event(event, origin)
     }
 }
 
 fn render_run_guard_panel(panel: &RunGuardPanel) -> String {
-    if panel.state == RunGuardPanelState::Waiting {
+    if panel.tracker.is_waiting() {
         return [
             "Watching Claude Code",
             "",
@@ -2623,42 +2536,88 @@ fn render_run_guard_panel(panel: &RunGuardPanel) -> String {
         .join("\n");
     }
 
-    if let Some(notice) = &panel.notice {
-        if notice.postmortem_ready {
-            return [
-                "Postmortem ready".to_string(),
-                String::new(),
-                notice.detail.clone(),
-                format!("Next: {}", notice.next),
-            ]
-            .join("\n");
-        }
+    let decision = panel.tracker.decision();
+    if let Some(reason) = decision
+        .reasons
+        .iter()
+        .find(|reason| reason.code == "postmortem_ready")
+    {
+        return [
+            "Postmortem ready".to_string(),
+            String::new(),
+            reason.detail.clone(),
+            "Next: cc-blackbox postmortem latest".to_string(),
+        ]
+        .join("\n");
     }
 
     let mut out = String::new();
     out.push_str("Watching Claude Code\n\n");
     out.push_str(&format!(
         "Session: {}\n",
-        panel.display_name.as_deref().unwrap_or("unknown")
+        panel.tracker.display_name().unwrap_or("unknown")
     ));
-    out.push_str(&format!("State: {}\n", panel.state.label()));
-    if let Some(model) = &panel.model {
+    out.push_str(&format!(
+        "State: {}\n",
+        run_guard_panel_state_label(decision.state)
+    ));
+    if let Some(model) = panel.tracker.model() {
         out.push_str(&format!("Model: {model}\n"));
     }
-    if let Some(notice) = &panel.notice {
+    if let Some(reason) = &decision.main_reason {
         out.push('\n');
-        out.push_str(&format!("{}: {}\n", notice.level, notice.title));
-        if !notice.detail.is_empty() {
-            out.push_str(&format!("{}\n\n", notice.detail));
+        out.push_str(&format!(
+            "{}: {}\n",
+            run_guard_panel_state_label(decision.state),
+            reason.label
+        ));
+        if !reason.detail.is_empty() {
+            out.push_str(&format!("{}\n\n", reason.detail));
         }
-        if !notice.evidence.is_empty() {
-            out.push_str(&format!("Evidence: {}\n", notice.evidence));
+        if !reason.evidence.is_empty() {
+            out.push_str(&format!("Evidence: {}\n", reason.evidence));
         }
-        if !notice.next.is_empty() {
-            out.push_str(&format!("Next: {}", notice.next));
+        let secondary = decision
+            .reasons
+            .iter()
+            .filter(|candidate| {
+                candidate.code != reason.code
+                    && matches!(
+                        candidate.state,
+                        DecisionState::Risky
+                            | DecisionState::StopRecommended
+                            | DecisionState::Blocked
+                            | DecisionState::Cooldown
+                    )
+            })
+            .take(3)
+            .map(|candidate| {
+                format!(
+                    "{}: {}",
+                    run_guard_panel_state_label(candidate.state),
+                    candidate.label
+                )
+            })
+            .collect::<Vec<_>>();
+        if !secondary.is_empty() {
+            out.push_str(&format!("Also: {}\n", secondary.join("; ")));
+        }
+        if !decision.best_action.is_empty() {
+            out.push_str(&format!("Next: {}", decision.best_action));
         }
     }
     out
+}
+
+fn run_guard_panel_state_label(state: DecisionState) -> &'static str {
+    match state {
+        DecisionState::Healthy | DecisionState::Watching => RunGuardPanelState::Watching.label(),
+        DecisionState::Risky => RunGuardPanelState::Warning.label(),
+        DecisionState::StopRecommended => RunGuardPanelState::Critical.label(),
+        DecisionState::Blocked => RunGuardPanelState::Blocked.label(),
+        DecisionState::Cooldown => RunGuardPanelState::Cooldown.label(),
+        DecisionState::Ended => RunGuardPanelState::Ended.label(),
+    }
 }
 
 fn run_owned_watch_url(base_url: &str) -> String {
@@ -5911,10 +5870,11 @@ async fn main() {
         }
         Commands::Run {
             watch,
+            live,
             no_live,
             command,
         } => {
-            std::process::exit(run_child_command(watch, no_live, command).await);
+            std::process::exit(run_child_command(watch, live, no_live, command).await);
         }
         Commands::Watch {
             url,
@@ -6020,6 +5980,12 @@ async fn main() {
             std::process::exit(
                 run_postmortem(&url, &target, redact, analyze_postmortem, output.as_deref()).await,
             );
+        }
+        Commands::StopPlan { url, target, json } => {
+            std::process::exit(run_stop_plan(&url, &target, json).await);
+        }
+        Commands::Footer { url, width, json } => {
+            std::process::exit(run_footer(&url, width, json).await);
         }
         Commands::Sessions { url, limit, days } => {
             let sessions_url = format!(
@@ -6274,6 +6240,588 @@ async fn run_postmortem(
             1
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct StopPlanSection {
+    heading: String,
+    body: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct StopPlan {
+    session_id: String,
+    decision: SessionDecision,
+    sections: Vec<StopPlanSection>,
+}
+
+fn normalize_stop_plan_target(target: &str) -> &str {
+    normalize_postmortem_target(target)
+}
+
+fn stop_plan_main_reason_text(decision: &SessionDecision) -> String {
+    decision
+        .main_reason
+        .as_ref()
+        .map(|reason| reason.short.clone())
+        .unwrap_or_else(|| "no stop signal".to_string())
+}
+
+fn stop_plan_decision_line(decision: &SessionDecision) -> String {
+    let reason = stop_plan_main_reason_text(decision);
+    match decision.state {
+        DecisionState::Healthy => format!("Healthy: {reason}. Continue is reasonable."),
+        DecisionState::Watching => format!("Watching: {reason}. No stop recommendation yet."),
+        DecisionState::Risky => format!("Risky: {reason}. Continue only with a narrow prompt."),
+        DecisionState::StopRecommended => format!("Stop: {reason}. Fix before retry."),
+        DecisionState::Blocked => format!("Blocked: {reason}. Resolve the guard block first."),
+        DecisionState::Cooldown => format!("Cooldown: {reason}. Wait before retrying."),
+        DecisionState::Ended => format!("Ended: {reason}. Inspect only if needed."),
+    }
+}
+
+fn failed_tools_from_postmortem(report: &serde_json::Value) -> Vec<String> {
+    report
+        .pointer("/signals/tools")
+        .and_then(|value| value.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    let failures = tool.get("failures").and_then(|value| value.as_u64())?;
+                    if failures == 0 {
+                        return None;
+                    }
+                    let name = tool
+                        .get("tool_name")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("tool");
+                    Some(format!(
+                        "{name}: {failures} {}",
+                        if failures == 1 { "failure" } else { "failures" }
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn failed_signals_from_postmortem(report: &serde_json::Value) -> Vec<String> {
+    let mut signals = failed_tools_from_postmortem(report);
+    if let Some(findings) = report.get("findings").and_then(|value| value.as_array()) {
+        for finding in findings.iter().take(3) {
+            let title = finding
+                .get("title")
+                .or_else(|| finding.get("rule_id"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("guard finding");
+            let detail = finding
+                .get("detail")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if !detail.trim().is_empty() {
+                push_unique(&mut signals, format!("{title}: {}", table_cell(detail)));
+            }
+        }
+    }
+    signals
+}
+
+fn stop_plan_fix_text(decision: &SessionDecision) -> String {
+    let Some(reason) = decision.main_reason.as_ref() else {
+        return "No pre-restart fix is required by the current evidence.".to_string();
+    };
+    match reason.code.as_str() {
+        "tool_failure_streak" | "jsonl_only_tool_failure_streak" | "tool_failures" => {
+            "Fix the failing command, missing file, credential, service, or test precondition outside Claude before asking it to retry.".to_string()
+        }
+        "context_status" | "context_near_warning_threshold" | "near_compaction" => {
+            "Create a short state summary and either compact or restart before another broad prompt. Context guidance is heuristic.".to_string()
+        }
+        "cache_event" | "cache_warning" | "repeated_cache_rebuilds" | "cache_miss_ttl" => {
+            "Decide whether cache reuse matters. Cache timing is locally inferred; restart intentionally if the cache is already cold.".to_string()
+        }
+        "api_error_circuit_breaker_cooldown" | "request_error" | "api_error" => {
+            "Check API status, credentials, network, and proxy health before retrying.".to_string()
+        }
+        "per_session_token_budget_exceeded" | "per_session_trusted_dollar_budget_exceeded" => {
+            "Start narrower or adjust the guard budget before another large turn.".to_string()
+        }
+        _ => decision.best_action.clone(),
+    }
+}
+
+fn stop_plan_restart_prompt(decision: &SessionDecision, report: &serde_json::Value) -> String {
+    if matches!(
+        decision.state,
+        DecisionState::Healthy | DecisionState::Watching
+    ) {
+        return "No restart needed. Continue with a narrow prompt that names the next concrete step.".to_string();
+    }
+
+    let reason = stop_plan_main_reason_text(decision);
+    let outcome = json_str(report, "/summary/outcome").unwrap_or("unknown outcome");
+    let turns = json_u64(report, "/summary/total_turns").unwrap_or(0);
+    format!(
+        "Continue this work from a clean state. Prior cc-blackbox session {outcome} after {turns} turns; stop reason: {reason}. First verify the precondition, then proceed with the smallest next change."
+    )
+}
+
+fn stop_plan_commands(decision: &SessionDecision) -> Vec<String> {
+    let Some(reason) = decision.main_reason.as_ref() else {
+        return vec!["Run the smallest relevant test or check before a broad prompt.".to_string()];
+    };
+    match reason.code.as_str() {
+        "tool_failure_streak" | "jsonl_only_tool_failure_streak" | "tool_failures" => vec![
+            "Re-run the failing command or test outside Claude after fixing the precondition."
+                .to_string(),
+            "Run the focused test for the file or behavior Claude was changing.".to_string(),
+        ],
+        "api_error_circuit_breaker_cooldown" | "request_error" | "api_error" => vec![
+            "curl localhost:9091/health".to_string(),
+            "Check provider/API status and credentials before retrying.".to_string(),
+        ],
+        "context_status" | "context_near_warning_threshold" | "near_compaction" => vec![
+            "Write or ask for a short state summary before restart.".to_string(),
+            "Run the smallest focused test before asking for more code changes.".to_string(),
+        ],
+        _ => vec!["Run the smallest relevant test or health check before restarting.".to_string()],
+    }
+}
+
+fn build_stop_plan(report: &serde_json::Value) -> StopPlan {
+    let decision = decision_from_postmortem(report);
+    let session_id = json_str(report, "/session_id")
+        .unwrap_or("unknown")
+        .to_string();
+    let mut sections = Vec::new();
+    let main_reason = decision.main_reason.clone();
+    let caveat = main_reason
+        .as_ref()
+        .and_then(|reason| reason.caveat.as_ref())
+        .cloned();
+
+    sections.push(StopPlanSection {
+        heading: "Decision".to_string(),
+        body: vec![stop_plan_decision_line(&decision)],
+    });
+    sections.push(StopPlanSection {
+        heading: "Why".to_string(),
+        body: vec![match &main_reason {
+            Some(reason) => {
+                let mut line = format!("{} Evidence: {}.", reason.detail, reason.evidence);
+                if let Some(caveat) = caveat {
+                    line.push(' ');
+                    line.push_str(&caveat);
+                }
+                line
+            }
+            None => "No stop signal is present in the available evidence.".to_string(),
+        }],
+    });
+
+    let failed = failed_signals_from_postmortem(report);
+    sections.push(StopPlanSection {
+        heading: "What failed".to_string(),
+        body: if failed.is_empty() {
+            vec!["No repeated tool, API, or guard failure was recorded.".to_string()]
+        } else {
+            failed
+        },
+    });
+    sections.push(StopPlanSection {
+        heading: "Fix before restart".to_string(),
+        body: vec![stop_plan_fix_text(&decision)],
+    });
+    sections.push(StopPlanSection {
+        heading: "Restart prompt".to_string(),
+        body: vec![stop_plan_restart_prompt(&decision, report)],
+    });
+    sections.push(StopPlanSection {
+        heading: "Commands/tests first".to_string(),
+        body: stop_plan_commands(&decision),
+    });
+    sections.push(StopPlanSection {
+        heading: "Alternatives".to_string(),
+        body: decision.alternatives.clone(),
+    });
+
+    StopPlan {
+        session_id,
+        decision,
+        sections,
+    }
+}
+
+fn render_stop_plan(plan: &StopPlan) -> String {
+    let mut out = String::new();
+    out.push_str("cc-blackbox stop-plan\n");
+    out.push_str(&format!("Session: {}\n\n", plan.session_id));
+    for section in &plan.sections {
+        out.push_str(&section.heading);
+        out.push('\n');
+        for line in &section.body {
+            out.push_str("  - ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out
+}
+
+async fn run_stop_plan(base_url: &str, target: &str, json_output: bool) -> i32 {
+    match fetch_postmortem_json(base_url, normalize_stop_plan_target(target), true).await {
+        Ok(report) => {
+            let plan = build_stop_plan(&report);
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&plan).unwrap_or_else(|_| "{}".to_string())
+                );
+            } else {
+                print!("{}", render_stop_plan(&plan));
+            }
+            0
+        }
+        Err(err) => {
+            eprintln!("{}", format!("Error: {err}").red());
+            1
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct FooterResponse {
+    footer: String,
+    decision: SessionDecision,
+    correlation: FooterCorrelation,
+}
+
+#[derive(Debug, Serialize)]
+struct FooterCorrelation {
+    mode: String,
+    matched_session_id: Option<String>,
+    ambiguous: bool,
+    detail: String,
+}
+
+async fn fetch_json_endpoint_with_timeout(
+    base_url: &str,
+    path: &str,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path);
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|err| err.to_string())?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| err.to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|err| err.to_string())
+}
+
+fn statusline_session_id(input: &serde_json::Value) -> Option<String> {
+    [
+        "/cc_blackbox/session_id",
+        "/cc_blackbox_session_id",
+        "/session_id",
+        "/session/id",
+        "/workspace/session_id",
+    ]
+    .iter()
+    .filter_map(|pointer| json_str(input, pointer))
+    .find(|value| value.starts_with("session_"))
+    .map(ToString::to_string)
+}
+
+fn statusline_candidate_dirs(input: &serde_json::Value) -> Vec<String> {
+    let mut dirs = Vec::new();
+    for pointer in [
+        "/cwd",
+        "/current_dir",
+        "/project_dir",
+        "/workspace/current_dir",
+        "/workspace/project_dir",
+        "/workspace/root",
+        "/workspace_dir",
+    ] {
+        if let Some(value) = json_str(input, pointer).filter(|value| !value.trim().is_empty()) {
+            push_unique(&mut dirs, value.to_string());
+        }
+    }
+    dirs
+}
+
+fn session_from_guard_status(
+    report: &serde_json::Value,
+    session_id: &str,
+) -> Option<serde_json::Value> {
+    report
+        .get("sessions")
+        .and_then(|value| value.as_array())
+        .and_then(|sessions| {
+            sessions.iter().find_map(|session| {
+                (json_str(session, "/session_id") == Some(session_id)).then(|| session.clone())
+            })
+        })
+}
+
+async fn footer_decision_for_session(
+    base_url: &str,
+    session_id: &str,
+) -> Result<Option<SessionDecision>, String> {
+    let report = fetch_json_endpoint_with_timeout(
+        base_url,
+        &format!("/api/guard/status?session={session_id}"),
+        Duration::from_millis(650),
+    )
+    .await?;
+    let quota = report.get("quota_burn_status");
+    Ok(session_from_guard_status(&report, session_id)
+        .map(|session| decision_from_guard_status_session(&session, quota)))
+}
+
+async fn footer_recent_sessions(base_url: &str) -> Result<serde_json::Value, String> {
+    fetch_json_endpoint_with_timeout(
+        base_url,
+        "/api/sessions?limit=20&days=1",
+        Duration::from_millis(650),
+    )
+    .await
+}
+
+fn active_sessions_matching_dirs(
+    sessions_report: &serde_json::Value,
+    dirs: &[String],
+) -> Vec<String> {
+    let Some(sessions) = sessions_report
+        .get("sessions")
+        .and_then(|value| value.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut matches = Vec::new();
+    for session in sessions {
+        if !json_bool(session, "/active").unwrap_or(false) {
+            continue;
+        }
+        let Some(working_dir) = json_str(session, "/working_dir") else {
+            continue;
+        };
+        if dirs.iter().any(|dir| dir == working_dir) {
+            if let Some(session_id) = json_str(session, "/session_id") {
+                push_unique(&mut matches, session_id.to_string());
+            }
+        }
+    }
+    matches
+}
+
+async fn unambiguous_active_session_from_guard_status(
+    base_url: &str,
+) -> Result<Option<(String, serde_json::Value, serde_json::Value)>, String> {
+    let report =
+        fetch_json_endpoint_with_timeout(base_url, "/api/guard/status", Duration::from_millis(650))
+            .await?;
+    let sessions = report
+        .get("sessions")
+        .and_then(|value| value.as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let active = sessions
+        .iter()
+        .filter(|session| {
+            json_str(session, "/session_id") != Some("guard_global")
+                && json_str(session, "/state") != Some("ended")
+        })
+        .collect::<Vec<_>>();
+    if active.len() != 1 {
+        return Ok(None);
+    }
+    let session = active[0].clone();
+    let session_id = json_str(&session, "/session_id")
+        .unwrap_or("unknown")
+        .to_string();
+    Ok(Some((session_id, session, report)))
+}
+
+async fn resolve_footer_decision(
+    base_url: &str,
+    statusline: &serde_json::Value,
+) -> (SessionDecision, FooterCorrelation) {
+    if let Some(session_id) = statusline_session_id(statusline) {
+        match footer_decision_for_session(base_url, &session_id).await {
+            Ok(Some(decision)) => {
+                return (
+                    decision,
+                    FooterCorrelation {
+                        mode: "direct_session_id".to_string(),
+                        matched_session_id: Some(session_id),
+                        ambiguous: false,
+                        detail: "matched cc-blackbox session id from statusline JSON".to_string(),
+                    },
+                );
+            }
+            Ok(None) => {
+                return (
+                    SessionDecision::fallback(
+                        "no matching cc-blackbox session",
+                        "wait for first request",
+                    ),
+                    FooterCorrelation {
+                        mode: "direct_session_id".to_string(),
+                        matched_session_id: None,
+                        ambiguous: false,
+                        detail: format!("statusline session id {session_id} was not found"),
+                    },
+                );
+            }
+            Err(err) => {
+                return (
+                    SessionDecision::fallback("core unavailable", "continue carefully"),
+                    FooterCorrelation {
+                        mode: "core_unavailable".to_string(),
+                        matched_session_id: None,
+                        ambiguous: false,
+                        detail: err,
+                    },
+                );
+            }
+        }
+    }
+
+    let dirs = statusline_candidate_dirs(statusline);
+    if !dirs.is_empty() {
+        match footer_recent_sessions(base_url).await {
+            Ok(sessions_report) => {
+                let matches = active_sessions_matching_dirs(&sessions_report, &dirs);
+                if matches.len() == 1 {
+                    let session_id = matches[0].clone();
+                    match footer_decision_for_session(base_url, &session_id).await {
+                        Ok(Some(decision)) => {
+                            return (
+                                decision,
+                                FooterCorrelation {
+                                    mode: "working_dir".to_string(),
+                                    matched_session_id: Some(session_id),
+                                    ambiguous: false,
+                                    detail: "matched one active session by working directory"
+                                        .to_string(),
+                                },
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            return (
+                                SessionDecision::fallback("core unavailable", "continue carefully"),
+                                FooterCorrelation {
+                                    mode: "core_unavailable".to_string(),
+                                    matched_session_id: None,
+                                    ambiguous: false,
+                                    detail: err,
+                                },
+                            );
+                        }
+                    }
+                } else if matches.len() > 1 {
+                    return (
+                        SessionDecision::fallback(
+                            "multiple sessions in this directory",
+                            "check guard status",
+                        ),
+                        FooterCorrelation {
+                            mode: "working_dir".to_string(),
+                            matched_session_id: None,
+                            ambiguous: true,
+                            detail: format!(
+                                "{} active cc-blackbox sessions matched the same directory",
+                                matches.len()
+                            ),
+                        },
+                    );
+                }
+            }
+            Err(err) => {
+                return (
+                    SessionDecision::fallback("core unavailable", "continue carefully"),
+                    FooterCorrelation {
+                        mode: "core_unavailable".to_string(),
+                        matched_session_id: None,
+                        ambiguous: false,
+                        detail: err,
+                    },
+                );
+            }
+        }
+    }
+
+    match unambiguous_active_session_from_guard_status(base_url).await {
+        Ok(Some((session_id, session, report))) => (
+            decision_from_guard_status_session(&session, report.get("quota_burn_status")),
+            FooterCorrelation {
+                mode: "single_active_session".to_string(),
+                matched_session_id: Some(session_id),
+                ambiguous: false,
+                detail: "matched the only active cc-blackbox session".to_string(),
+            },
+        ),
+        Ok(None) => (
+            SessionDecision::fallback("no unambiguous session", "wait for first request"),
+            FooterCorrelation {
+                mode: "fallback".to_string(),
+                matched_session_id: None,
+                ambiguous: true,
+                detail: "no statusline session id or unique active session was available"
+                    .to_string(),
+            },
+        ),
+        Err(err) => (
+            SessionDecision::fallback("core unavailable", "continue carefully"),
+            FooterCorrelation {
+                mode: "core_unavailable".to_string(),
+                matched_session_id: None,
+                ambiguous: false,
+                detail: err,
+            },
+        ),
+    }
+}
+
+async fn run_footer(base_url: &str, width: Option<usize>, json_output: bool) -> i32 {
+    let mut input = String::new();
+    let _ = io::stdin().read_to_string(&mut input);
+    let statusline = if input.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str::<serde_json::Value>(&input).unwrap_or(serde_json::Value::Null)
+    };
+    let (decision, correlation) = resolve_footer_decision(base_url, &statusline).await;
+    let width = width.unwrap_or_else(terminal_width);
+    let footer = render_footer(&decision, width);
+    if json_output {
+        let response = FooterResponse {
+            footer,
+            decision,
+            correlation,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&response).unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        println!("{footer}");
+    }
+    0
 }
 
 async fn fetch_sessions(url: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -6773,16 +7321,16 @@ fn auto_postmortem_target(event: &WatchEvent) -> Option<(String, String)> {
 mod tests {
     use super::{
         append_claude_analysis_section, auto_postmortem_target, build_claude_analysis_prompt,
-        claude_analysis_enabled, colorize_postmortem_for_terminal, compact_datetime_from_iso,
-        connect_and_guard_stream, connect_and_run_guard_stream, event_session_id,
-        extract_run_watch, fetch_guard_policy_report, fetch_guard_status_report,
+        build_stop_plan, claude_analysis_enabled, colorize_postmortem_for_terminal,
+        compact_datetime_from_iso, connect_and_guard_stream, connect_and_run_guard_stream,
+        event_session_id, extract_run_flags, fetch_guard_policy_report, fetch_guard_status_report,
         fetch_postmortem_json, fetch_run_final_postmortem_markdown,
         fetch_run_final_postmortem_markdown_with_retry, finalize_run_owned_sessions,
         format_duration_coarse, format_tokens, local_time_from_iso, parse_mcp_tool_name,
         postmortem_progress_message, postmortem_separator_line_for_width, push_unique,
         render_guard_policy_report, render_guard_status_report, render_guard_watch_line,
         render_postmortem_markdown, render_postmortem_markdown_with_optional_analysis,
-        render_postmortem_terminal_for_width, render_run_guard_panel,
+        render_postmortem_terminal_for_width, render_run_guard_panel, render_stop_plan,
         render_tmux_unavailable_fallback, run_child_command_with_deps,
         run_child_command_with_lifecycle_deps, run_claude_postmortem_analysis_with_command,
         run_claude_postmortem_analysis_with_lookup, run_guard_start_with_deps, run_owned_watch_url,
@@ -7203,6 +7751,78 @@ mod tests {
     }
 
     #[test]
+    fn claude_footer_statusline_installs_updates_and_preserves_custom_settings() {
+        let dir = unique_test_dir("footer-statusline");
+        let settings_path = dir.join(".claude/settings.json");
+
+        let installed = super::ensure_claude_footer_statusline_in_settings(
+            &settings_path,
+            "claude",
+            "http://core",
+            "/tmp/cc-blackbox",
+        )
+        .expect("install footer statusline");
+        assert_eq!(
+            installed,
+            super::FooterStatuslineInstall::InstalledOrUpdated
+        );
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))
+                .expect("settings json");
+        assert_eq!(settings["statusLine"]["type"], "command");
+        assert_eq!(settings["statusLine"]["padding"], 0);
+        assert_eq!(
+            settings["statusLine"]["command"],
+            "/tmp/cc-blackbox footer --url http://core"
+        );
+
+        let updated = super::ensure_claude_footer_statusline_in_settings(
+            &settings_path,
+            "claude",
+            "http://core2",
+            "/tmp/cc-blackbox",
+        )
+        .expect("update footer statusline");
+        assert_eq!(updated, super::FooterStatuslineInstall::InstalledOrUpdated);
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))
+                .expect("settings json");
+        assert_eq!(
+            settings["statusLine"]["command"],
+            "/tmp/cc-blackbox footer --url http://core2"
+        );
+
+        fs::write(
+            &settings_path,
+            r#"{"statusLine":{"type":"command","command":"custom-statusline"}}"#,
+        )
+        .expect("write custom settings");
+        let preserved = super::ensure_claude_footer_statusline_in_settings(
+            &settings_path,
+            "claude",
+            "http://core3",
+            "/tmp/cc-blackbox",
+        )
+        .expect("preserve custom statusline");
+        assert_eq!(preserved, super::FooterStatuslineInstall::PreservedCustom);
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))
+                .expect("settings json");
+        assert_eq!(settings["statusLine"]["command"], "custom-statusline");
+
+        let skipped = super::ensure_claude_footer_statusline_in_settings(
+            &settings_path,
+            "not-claude",
+            "http://core",
+            "/tmp/cc-blackbox",
+        )
+        .expect("skip non-claude command");
+        assert_eq!(skipped, super::FooterStatuslineInstall::SkippedNotClaude);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn side_watcher_args_can_enable_auto_postmortem() {
         assert_eq!(
             watcher_args("http://core".to_string(), false, false),
@@ -7272,15 +7892,19 @@ mod tests {
             .expect("run command parses");
         let Commands::Run {
             watch,
+            live,
             no_live,
             command,
         } = cli.command
         else {
             panic!("expected run command");
         };
+        assert!(!live);
         assert!(!no_live);
-        let (watch, command) = extract_run_watch(watch, command);
+        let (watch, live, no_live, command) = extract_run_flags(watch, live, no_live, command);
         assert!(watch);
+        assert!(!live);
+        assert!(!no_live);
         assert_eq!(command, vec!["claude"]);
     }
 
@@ -7290,15 +7914,58 @@ mod tests {
             .expect("run command parses");
         let Commands::Run {
             watch,
+            live,
             no_live,
             command,
         } = cli.command
         else {
             panic!("expected run command");
         };
+        assert!(!live);
         assert!(!no_live);
-        let (watch, command) = extract_run_watch(watch, command);
+        let (watch, live, no_live, command) = extract_run_flags(watch, live, no_live, command);
         assert!(watch);
+        assert!(!live);
+        assert!(!no_live);
+        assert_eq!(command, vec!["claude"]);
+    }
+
+    #[test]
+    fn run_live_before_child_command_is_cc_blackbox_flag() {
+        let cli = Cli::try_parse_from(["cc-blackbox", "run", "--live", "claude"])
+            .expect("run command parses");
+        let Commands::Run {
+            watch,
+            live,
+            no_live,
+            command,
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+        assert!(!watch);
+        assert!(live);
+        assert!(!no_live);
+        assert_eq!(command, vec!["claude"]);
+    }
+
+    #[test]
+    fn run_live_after_child_command_is_cc_blackbox_flag() {
+        let cli = Cli::try_parse_from(["cc-blackbox", "run", "claude", "--live"])
+            .expect("run command parses");
+        let Commands::Run {
+            watch,
+            live,
+            no_live,
+            command,
+        } = cli.command
+        else {
+            panic!("expected run command");
+        };
+        let (watch, live, no_live, command) = extract_run_flags(watch, live, no_live, command);
+        assert!(!watch);
+        assert!(live);
+        assert!(!no_live);
         assert_eq!(command, vec!["claude"]);
     }
 
@@ -7308,6 +7975,7 @@ mod tests {
             .expect("run command parses");
         let Commands::Run {
             watch,
+            live,
             no_live,
             command,
         } = cli.command
@@ -7315,6 +7983,7 @@ mod tests {
             panic!("expected run command");
         };
         assert!(!watch);
+        assert!(!live);
         assert!(no_live);
         assert_eq!(command, vec!["claude"]);
     }
@@ -7332,15 +8001,19 @@ mod tests {
         .expect("run command parses");
         let Commands::Run {
             watch,
+            live,
             no_live,
             command,
         } = cli.command
         else {
             panic!("expected run command");
         };
+        assert!(!live);
         assert!(!no_live);
-        let (watch, command) = extract_run_watch(watch, command);
+        let (watch, live, no_live, command) = extract_run_flags(watch, live, no_live, command);
         assert!(!watch);
+        assert!(!live);
+        assert!(!no_live);
         assert_eq!(
             command,
             vec![
@@ -7353,10 +8026,24 @@ mod tests {
     }
 
     #[test]
-    fn run_live_mode_depends_on_interactivity_tmux_and_no_live() {
+    fn run_live_mode_requires_explicit_live_flag() {
         assert_eq!(
             select_run_live_mode(
                 false,
+                false,
+                false,
+                RunTerminalState {
+                    interactive: true,
+                    tmux_available: true,
+                    inside_tmux: true,
+                },
+            ),
+            RunLiveMode::SingleTerminal
+        );
+        assert_eq!(
+            select_run_live_mode(
+                false,
+                true,
                 false,
                 RunTerminalState {
                     interactive: true,
@@ -7369,6 +8056,7 @@ mod tests {
         assert_eq!(
             select_run_live_mode(
                 false,
+                true,
                 false,
                 RunTerminalState {
                     interactive: true,
@@ -7381,6 +8069,7 @@ mod tests {
         assert_eq!(
             select_run_live_mode(
                 false,
+                true,
                 false,
                 RunTerminalState {
                     interactive: true,
@@ -7393,6 +8082,7 @@ mod tests {
         assert_eq!(
             select_run_live_mode(
                 false,
+                true,
                 false,
                 RunTerminalState {
                     interactive: false,
@@ -7406,6 +8096,7 @@ mod tests {
             select_run_live_mode(
                 false,
                 true,
+                true,
                 RunTerminalState {
                     interactive: true,
                     tmux_available: true,
@@ -7416,6 +8107,7 @@ mod tests {
         );
         assert_eq!(
             select_run_live_mode(
+                true,
                 true,
                 false,
                 RunTerminalState {
@@ -7445,6 +8137,7 @@ mod tests {
 
         let exit_code = run_child_command_with_deps(
             true,
+            false,
             false,
             vec!["fake-child".to_string(), "--flag".to_string()],
             || RunTerminalState {
@@ -7502,11 +8195,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_interactive_run_in_tmux_splits_guard_and_skips_postmortem() {
+    async fn live_interactive_run_in_tmux_splits_guard_and_skips_postmortem() {
         let events = Arc::new(Mutex::new(Vec::new()));
 
         let exit_code = run_child_command_with_deps(
             false,
+            true,
             false,
             vec!["fake-child".to_string(), "--flag".to_string()],
             || RunTerminalState {
@@ -7526,7 +8220,7 @@ mod tests {
                 }
             },
             |_command, _args, _envs| panic!("inside tmux should not create a temporary session"),
-            |_postmortem| panic!("default live run should not start legacy watcher"),
+            |_postmortem| panic!("explicit live run should not start legacy watcher"),
             {
                 let events = events.clone();
                 move |command, args, envs| {
@@ -7563,11 +8257,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_interactive_run_outside_tmux_uses_temporary_tmux_session() {
+    async fn live_interactive_run_outside_tmux_uses_temporary_tmux_session() {
         let events = Arc::new(Mutex::new(Vec::new()));
 
         let exit_code = run_child_command_with_deps(
             false,
+            true,
             false,
             vec!["fake-child".to_string(), "--flag".to_string()],
             || RunTerminalState {
@@ -7592,11 +8287,11 @@ mod tests {
                     Ok(19)
                 }
             },
-            |_postmortem| panic!("default live run should not start legacy watcher"),
+            |_postmortem| panic!("explicit live run should not start legacy watcher"),
             |_command, _args, _envs| panic!("temporary tmux should own child process"),
             || panic!("tmux is available; fallback should not render"),
             |_base_url| async move {
-                panic!("default live run should not render final postmortem");
+                panic!("explicit live run should not render final postmortem");
             },
         )
         .await;
@@ -7606,10 +8301,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_live_interactive_run_restores_single_terminal_behavior() {
+    async fn default_interactive_run_uses_single_terminal_behavior() {
         let events = Arc::new(Mutex::new(Vec::new()));
 
         let exit_code = run_child_command_with_deps(
+            false,
+            false,
+            false,
+            vec!["fake-child".to_string()],
+            || RunTerminalState {
+                interactive: true,
+                tmux_available: true,
+                inside_tmux: true,
+            },
+            || async { Ok(()) },
+            || panic!("default run should not split tmux"),
+            |_command, _args, _envs| panic!("default run should not create temporary tmux"),
+            |_postmortem| panic!("default run should not start legacy watcher"),
+            {
+                let events = events.clone();
+                move |_command, _args, _envs| {
+                    events
+                        .lock()
+                        .expect("test events lock")
+                        .push("run".to_string());
+                    Ok(7)
+                }
+            },
+            || panic!("tmux is available; fallback should not render"),
+            |_base_url| async move {
+                panic!("single-terminal run without --watch should not render final postmortem");
+            },
+        )
+        .await;
+
+        assert_eq!(exit_code, 7);
+        assert_eq!(*events.lock().expect("test events lock"), vec!["run"]);
+    }
+
+    #[tokio::test]
+    async fn no_live_interactive_run_remains_single_terminal_compatibility() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let exit_code = run_child_command_with_deps(
+            false,
             false,
             true,
             vec!["fake-child".to_string()],
@@ -7634,13 +8369,73 @@ mod tests {
             },
             || panic!("tmux is available; fallback should not render"),
             |_base_url| async move {
-                panic!("single-terminal run without --watch should not render final postmortem");
+                panic!("--no-live run without --watch should not render final postmortem");
             },
         )
         .await;
 
         assert_eq!(exit_code, 7);
         assert_eq!(*events.lock().expect("test events lock"), vec!["run"]);
+    }
+
+    #[tokio::test]
+    async fn run_claude_prepares_footer_statusline_before_child_launch() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let exit_code = run_child_command_with_lifecycle_deps(
+            false,
+            false,
+            false,
+            vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "sonnet".to_string(),
+            ],
+            || RunTerminalState {
+                interactive: true,
+                tmux_available: true,
+                inside_tmux: true,
+            },
+            || async { Ok(()) },
+            || panic!("default run should not split tmux"),
+            |_command, _args, _envs| panic!("default run should not create temporary tmux"),
+            |_postmortem| panic!("default run should not start legacy watcher"),
+            {
+                let events = events.clone();
+                move |command, core_url| {
+                    events
+                        .lock()
+                        .expect("events lock")
+                        .push(format!("prepare:{command}:{core_url}"));
+                    Ok(super::FooterStatuslineInstall::InstalledOrUpdated)
+                }
+            },
+            {
+                let events = events.clone();
+                move |command, args, envs| {
+                    assert_eq!(command, "claude");
+                    assert_eq!(args, &[String::from("--model"), String::from("sonnet")]);
+                    assert!(envs
+                        .iter()
+                        .any(|(key, value)| *key == "ANTHROPIC_BASE_URL" && !value.is_empty()));
+                    events.lock().expect("events lock").push("run".to_string());
+                    Ok(0)
+                }
+            },
+            || panic!("tmux is available; fallback should not render"),
+            |_base_url| async move {
+                panic!("default run should not render final postmortem");
+            },
+            |_base_url| RunOwnedSessionMonitor::noop(),
+            |_base_url, _session_ids, _exit_code| async { Ok(()) },
+        )
+        .await;
+
+        assert_eq!(exit_code, 0);
+        let events = events.lock().expect("events lock").clone();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].starts_with("prepare:claude:"));
+        assert_eq!(events[1], "run");
     }
 
     #[tokio::test]
@@ -7651,6 +8446,7 @@ mod tests {
         let finalized_for_assert = finalized.clone();
 
         let exit_code = run_child_command_with_lifecycle_deps(
+            false,
             false,
             true,
             vec!["fake-child".to_string()],
@@ -7663,6 +8459,7 @@ mod tests {
             || panic!("--no-live should not split tmux"),
             |_command, _args, _envs| panic!("--no-live should not create temporary tmux"),
             |_postmortem| panic!("--no-live should not start legacy watcher"),
+            |_command, _core_url| Ok(super::FooterStatuslineInstall::SkippedNotClaude),
             move |_command, _args, _envs| {
                 owned_for_run.apply_event(
                     &WatchEvent::SessionStart {
@@ -7735,6 +8532,7 @@ mod tests {
 
         let exit_code = run_child_command_with_deps(
             false,
+            false,
             true,
             vec!["fake-child".to_string(), "--watch".to_string()],
             || RunTerminalState {
@@ -7776,6 +8574,7 @@ mod tests {
         let exit_code = run_child_command_with_deps(
             false,
             false,
+            false,
             vec!["fake-child".to_string()],
             || RunTerminalState {
                 interactive: false,
@@ -7808,11 +8607,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interactive_run_without_tmux_prints_fallback_and_launches_child_normally() {
+    async fn live_interactive_run_without_tmux_prints_fallback_and_launches_child_normally() {
         let events = Arc::new(Mutex::new(Vec::new()));
 
         let exit_code = run_child_command_with_deps(
             false,
+            true,
             false,
             vec!["fake-child".to_string()],
             || RunTerminalState {
@@ -7823,7 +8623,7 @@ mod tests {
             || async { Ok(()) },
             || panic!("tmux unavailable should not split"),
             |_command, _args, _envs| panic!("tmux unavailable should not create temporary tmux"),
-            |_postmortem| panic!("default live run should not start legacy watcher"),
+            |_postmortem| panic!("explicit live run should not start legacy watcher"),
             {
                 let events = events.clone();
                 move |_command, _args, _envs| {
@@ -8126,6 +8926,30 @@ mod tests {
         assert!(!redact);
         assert!(!no_redact);
         assert_eq!(output, Some(std::path::PathBuf::from("postmortem.md")));
+
+        let cli =
+            Cli::try_parse_from(["cc-blackbox", "stop-plan"]).expect("stop-plan default parses");
+        let Commands::StopPlan { url, target, json } = cli.command else {
+            panic!("expected stop-plan command");
+        };
+        assert_eq!(url, "http://localhost:9091");
+        assert_eq!(target, "latest");
+        assert!(!json);
+
+        let cli = Cli::try_parse_from(["cc-blackbox", "stop-plan", "last", "--json"])
+            .expect("stop-plan last json parses");
+        let Commands::StopPlan { target, json, .. } = cli.command else {
+            panic!("expected stop-plan command");
+        };
+        assert_eq!(target, "last");
+        assert!(json);
+
+        let cli = Cli::try_parse_from(["cc-blackbox", "stop-plan", "session_1234_abcd"])
+            .expect("stop-plan session parses");
+        let Commands::StopPlan { target, .. } = cli.command else {
+            panic!("expected stop-plan command");
+        };
+        assert_eq!(target, "session_1234_abcd");
     }
 
     #[test]
@@ -9271,6 +10095,105 @@ mod tests {
         assert!(markdown.contains("No failed skill events detected"));
         assert!(markdown.contains("No failed MCP calls detected"));
         assert!(!markdown.contains("compaction runway"));
+    }
+
+    #[test]
+    fn stop_plan_renderer_includes_required_sections_and_tool_fix() {
+        let report = serde_json::json!({
+            "session_id": "session_stop",
+            "redacted": true,
+            "partial": false,
+            "summary": {
+                "duration_secs": 300,
+                "model": "claude-sonnet",
+                "outcome": "Likely Partially Completed",
+                "total_turns": 4,
+                "total_tokens": 123456
+            },
+            "diagnosis": {
+                "likely_cause": "tool_failure_streak",
+                "likely_cause_is_heuristic": false,
+                "detail": "Bash failed repeatedly.",
+                "next_action": "Fix the failing command, then restart."
+            },
+            "impact": {
+                "estimated_likely_wasted_cost_dollars": 0.12
+            },
+            "signals": {
+                "cache": { "cache_hit_ratio": 0.75, "rebuild_turns": 0 },
+                "context": { "max_fill_percent": 82.0, "turns_to_compact": 1 },
+                "tools": [
+                    { "tool_name": "Bash", "calls": 5, "failures": 3 }
+                ],
+                "model": { "fallbacks": [] }
+            },
+            "findings": [],
+            "evidence": [
+                { "type": "direct", "label": "tools", "detail": "3 tool failures", "turn": 2 }
+            ],
+            "recommendations": ["Fix the failing command, then restart."]
+        });
+
+        let rendered = render_stop_plan(&build_stop_plan(&report));
+
+        for heading in [
+            "Decision",
+            "Why",
+            "What failed",
+            "Fix before restart",
+            "Restart prompt",
+            "Commands/tests first",
+            "Alternatives",
+        ] {
+            assert!(
+                rendered.contains(heading),
+                "missing {heading} in:\n{rendered}"
+            );
+        }
+        assert!(rendered.contains("Stop: 3 Bash failures"), "{rendered}");
+        assert!(rendered.contains("Fix the failing command"));
+        assert!(rendered.contains("Re-run the failing command"));
+    }
+
+    #[test]
+    fn stop_plan_for_healthy_session_does_not_force_restart() {
+        let report = serde_json::json!({
+            "session_id": "session_healthy",
+            "redacted": true,
+            "partial": true,
+            "summary": {
+                "duration_secs": 120,
+                "model": "claude-sonnet",
+                "outcome": "In Progress",
+                "total_turns": 2,
+                "total_tokens": 12000
+            },
+            "diagnosis": {
+                "likely_cause": "none",
+                "likely_cause_is_heuristic": false,
+                "next_action": "Keep going."
+            },
+            "impact": {
+                "estimated_likely_wasted_cost_dollars": 0.0
+            },
+            "signals": {
+                "cache": { "cache_hit_ratio": 0.96, "rebuild_turns": 0 },
+                "context": { "max_fill_percent": 22.0, "turns_to_compact": 20 },
+                "tools": [
+                    { "tool_name": "Read", "calls": 2, "failures": 0 }
+                ],
+                "model": { "fallbacks": [] }
+            },
+            "findings": [],
+            "evidence": [],
+            "recommendations": ["Keep going."]
+        });
+
+        let rendered = render_stop_plan(&build_stop_plan(&report));
+
+        assert!(rendered.contains("Healthy"));
+        assert!(rendered.contains("No restart needed."));
+        assert!(!rendered.contains("Stop:"));
     }
 
     #[test]

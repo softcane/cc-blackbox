@@ -633,14 +633,68 @@ fn guard_session_status_json(
     model: String,
     base_state: &str,
     findings: Vec<Value>,
+    signals: Option<Value>,
 ) -> Value {
     let state = guard_state_from_findings(base_state, &findings);
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "session_id": session_id,
         "display_name": display_name,
         "model": model,
         "state": state,
         "findings": findings,
+    });
+    if let Some(signals) = signals {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("signals".to_string(), signals);
+        }
+    }
+    value
+}
+
+fn active_session_signals_json(session_id: &str, session: &diagnosis::SessionState) -> Value {
+    let idle_secs = session.last_activity.elapsed().as_secs();
+    let context = diagnosis::SESSION_TURNS.get(session_id).and_then(|turns| {
+        let current = turns.iter().rev().find(|turn| {
+            turn_has_context_usage(
+                turn.input_tokens as u64,
+                turn.cache_read_tokens as u64,
+                turn.cache_creation_tokens as u64,
+            )
+        })?;
+        let fill_percent = context_fill_percent(
+            current.input_tokens as u64,
+            current.cache_read_tokens as u64,
+            current.cache_creation_tokens as u64,
+            current.context_window_tokens,
+        );
+        Some(serde_json::json!({
+            "fill_percent": (fill_percent * 10.0).round() / 10.0,
+            "context_window_tokens": current.context_window_tokens,
+            "turns_to_compact": project_turns_to_compact(session_id, fill_percent),
+            "heuristic": true,
+        }))
+    });
+    let cache = CACHE_TRACKERS.get(session_id).map(|tracker| {
+        let ttl = tracker.last_ttl_min_secs;
+        serde_json::json!({
+            "idle_secs": idle_secs,
+            "ttl_min_secs": tracker.last_ttl_min_secs,
+            "ttl_max_secs": tracker.last_ttl_max_secs,
+            "cache_expires_in_secs": ttl.saturating_sub(idle_secs),
+            "event_type": tracker.last_event_type,
+            "event_age_secs": tracker.last_event_time.map(|time| time.elapsed().as_secs()),
+            "estimated_rebuild_cost_dollars": tracker.last_rebuild_cost_dollars,
+            "heuristic": true,
+        })
+    });
+    let totals = in_memory_postmortem_totals(session_id);
+    serde_json::json!({
+        "idle_secs": idle_secs,
+        "postmortem_ready": session.idle_postmortem_sent,
+        "total_tokens": totals.map(|(tokens, _)| tokens),
+        "total_turns": totals.map(|(_, turns)| turns),
+        "context": context,
+        "cache": cache,
     })
 }
 
@@ -695,7 +749,14 @@ fn load_ended_guard_sessions(
     rows.into_iter()
         .map(|(session_id, model, _ended_at)| {
             let findings = load_guard_findings_for_session(Some(conn), &session_id, 3, policy);
-            guard_session_status_json(session_id.clone(), session_id, model, "ended", findings)
+            guard_session_status_json(
+                session_id.clone(),
+                session_id,
+                model,
+                "ended",
+                findings,
+                None,
+            )
         })
         .collect()
 }
@@ -714,6 +775,7 @@ fn active_global_cooldown_status_json(policy: Option<&guard::GuardPolicy>) -> Op
         "guard".to_string(),
         "cooldown",
         vec![guard_finding_status_json(&finding, policy)],
+        None,
     ))
 }
 
@@ -745,6 +807,7 @@ fn build_guard_status_report_json(session_filter: Option<&str>) -> Value {
                 session.model.clone(),
                 "watching",
                 findings,
+                Some(active_session_signals_json(&session.session_id, session)),
             ))
         })
         .collect::<Vec<_>>();
@@ -785,9 +848,19 @@ fn build_guard_status_report_json(session_filter: Option<&str>) -> Value {
         .max_by_key(|state| guard_state_rank(state))
         .unwrap_or("healthy");
 
+    let quota_burn_status = current_quota_burn_watch_event()
+        .and_then(|event| serde_json::to_value(event).ok())
+        .map(|mut value| {
+            if let Some(object) = value.as_object_mut() {
+                object.remove("type");
+            }
+            value
+        });
+
     serde_json::json!({
         "overall_state": overall_state,
         "sessions": sessions,
+        "quota_burn_status": quota_burn_status,
     })
 }
 
@@ -5037,6 +5110,9 @@ struct CacheTracker {
     last_request_time: Option<Instant>,
     last_ttl_min_secs: u64,
     last_ttl_max_secs: u64,
+    last_event_type: &'static str,
+    last_event_time: Option<Instant>,
+    last_rebuild_cost_dollars: Option<f64>,
 }
 
 impl CacheTracker {
@@ -5046,6 +5122,9 @@ impl CacheTracker {
             last_request_time: None,
             last_ttl_min_secs: CACHE_TTL_SECS,
             last_ttl_max_secs: CACHE_TTL_SECS,
+            last_event_type: "none",
+            last_event_time: None,
+            last_rebuild_cost_dollars: None,
         }
     }
 }
@@ -5121,7 +5200,18 @@ fn classify_cache_event(
         "hit"
     };
     tracker.last_request_time = Some(now);
+    tracker.last_event_type = event;
+    tracker.last_event_time = Some(now);
+    tracker.last_rebuild_cost_dollars = None;
     event
+}
+
+fn record_cache_event_cost(session_id: &str, event_type: &'static str, rebuild_cost: f64) {
+    if let Some(mut tracker) = CACHE_TRACKERS.get_mut(session_id) {
+        tracker.last_event_type = event_type;
+        tracker.last_event_time = Some(Instant::now());
+        tracker.last_rebuild_cost_dollars = Some(rebuild_cost);
+    }
 }
 
 fn response_cache_ttl_evidence(
@@ -6049,6 +6139,7 @@ fn finalize_response(
         if cache_event != "none" && !acc.has_response_error() {
             let rebuild_cost =
                 estimated_rebuild_cost_for_cache_event(acc, &billing_model, &cache_ttl);
+            record_cache_event_cost(&session_id, cache_event, rebuild_cost);
             let now_epoch = now_epoch_secs();
             let expires_at = now_epoch + cache_ttl.min_secs;
             let latest_expires_at = (cache_ttl.max_secs != cache_ttl.min_secs)
@@ -9187,8 +9278,8 @@ async fn handle_watch(
 
     // Look up stored session info synchronously before the stream starts.
     let synthetic_start = replay_history
-        .then(|| ())
-        .and_then(|_| session_filter.as_ref())
+        .then_some(())
+        .and(session_filter.as_ref())
         .and_then(|sid| {
             diagnosis::SESSIONS.iter().find_map(|entry| {
                 let s = entry.value();
@@ -15915,6 +16006,67 @@ action = "warn"
             .is_none());
 
         diagnosis::SESSIONS.remove(&4242);
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn guard_status_report_includes_active_cache_event_signal() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        reset_runtime_state_for_test();
+        let path = unique_test_db_path("guard-status-cache-event");
+        {
+            let conn = Connection::open(&path).expect("open test db");
+            conn.execute_batch(SCHEMA).expect("create schema");
+            conn.execute(
+                "INSERT INTO sessions (session_id, started_at, model, working_dir, first_message_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "session-status-cache",
+                    "2026-05-10T00:00:00Z",
+                    "claude-sonnet",
+                    "/tmp/project",
+                    "hash-cache"
+                ],
+            )
+            .expect("insert session");
+        }
+        let _db_path = EnvVarGuard::set("CC_BLACKBOX_DB_PATH", &path);
+        diagnosis::SESSIONS.insert(
+            4747,
+            diagnosis::SessionState {
+                session_id: "session-status-cache".to_string(),
+                display_name: "api".to_string(),
+                model: "claude-sonnet".to_string(),
+                initial_prompt: None,
+                created_at: Instant::now(),
+                last_activity: Instant::now(),
+                session_inserted: true,
+                cache_warning_sent: false,
+                idle_postmortem_sent: false,
+            },
+        );
+        super::CACHE_TRACKERS.insert(
+            "session-status-cache".to_string(),
+            CacheTracker {
+                consecutive_misses: 0,
+                last_request_time: Some(Instant::now()),
+                last_ttl_min_secs: 300,
+                last_ttl_max_secs: 3600,
+                last_event_type: "miss_rebuild",
+                last_event_time: Some(Instant::now()),
+                last_rebuild_cost_dollars: Some(0.24),
+            },
+        );
+
+        let report = build_guard_status_report_json(Some("session-status-cache"));
+        let cache = &report["sessions"][0]["signals"]["cache"];
+
+        assert_eq!(cache["event_type"], "miss_rebuild");
+        assert_eq!(cache["estimated_rebuild_cost_dollars"], 0.24);
+        assert!(cache["event_age_secs"].as_u64().is_some());
+
+        diagnosis::SESSIONS.remove(&4747);
+        super::CACHE_TRACKERS.remove("session-status-cache");
         cleanup_test_db(&path);
     }
 

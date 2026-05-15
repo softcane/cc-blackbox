@@ -8,7 +8,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -22,6 +22,8 @@ use tokio::io::AsyncWriteExt;
 
 const RUN_FINAL_POSTMORTEM_ATTEMPTS: usize = 30;
 const RUN_FINAL_POSTMORTEM_RETRY_DELAY_MS: u64 = 500;
+const CC_BLACKBOX_RUN_STARTED_AT_ENV: &str = "CC_BLACKBOX_RUN_STARTED_AT";
+const FOOTER_RUN_START_GRACE_SECS: i64 = 5;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -1487,6 +1489,13 @@ fn current_cli_path() -> String {
         .unwrap_or_else(|_| "cc-blackbox".to_string())
 }
 
+fn current_unix_timestamp_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 fn claude_settings_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude/settings.json"))
 }
@@ -1566,7 +1575,8 @@ fn ensure_claude_footer_statusline_in_settings(
             serde_json::json!({
                 "type": "command",
                 "command": command,
-                "padding": 0
+                "padding": 0,
+                "refreshInterval": 5
             }),
         );
     }
@@ -1741,7 +1751,11 @@ where
     let command_args = &child_command[1..];
     let core_url = cc_blackbox_core_url();
     let proxy_url = envoy_proxy_url();
-    let proxy_env = [("ANTHROPIC_BASE_URL", proxy_url.as_str())];
+    let run_started_at = current_unix_timestamp_secs().to_string();
+    let proxy_env = [
+        ("ANTHROPIC_BASE_URL", proxy_url.as_str()),
+        (CC_BLACKBOX_RUN_STARTED_AT_ENV, run_started_at.as_str()),
+    ];
     match prepare_footer_statusline(command_name, &core_url) {
         Ok(FooterStatuslineInstall::PreservedCustom) => {
             eprintln!(
@@ -5574,12 +5588,13 @@ fn build_claude_analysis_prompt(report: &serde_json::Value) -> String {
     format!(
         "You are cc-blackbox's postmortem analyst.\n\
 Use only the redacted JSON evidence below. Do not invent facts, files, commands, or raw prompts.\n\
-Write compact GitHub-flavored Markdown for a tmux pane. Keep it under 120 words.\n\
+Write compact GitHub-flavored Markdown for a tmux pane. Keep Analysis under 120 words; keep Restart Prompt under 180 words.\n\
 Write for the person watching the run. Use plain, direct language. Tell them what happened, whether they need to act, and what to do next.\n\
 Avoid jargon such as signal, runway, or degradation unless it appears in the evidence and is needed.\n\
 Use aligned key/value rows, not Markdown pipe tables. No code fences. No extra caveat block, no extra prose, no bullet lists.\n\
 Preserve direct versus heuristic evidence labels. Do not turn heuristic, inferred, likely, or suspected causes into direct facts.\n\
 Use `summary.outcome` as the resolved report outcome. If `summary.stored_diagnosis_outcome` differs, treat it as older proxy context, not the conclusion.\n\
+Use `handoff_context` as the source for restart guidance. Treat cc-blackbox and JSONL session IDs as provenance only; do not imply a fresh Claude session can look them up.\n\
 If the findings include `jsonl_compaction_boundary`, say the segment ended at compaction and continued afterward; do not call it abandoned.\n\
 When `is_heuristic` is true or evidence type is `heuristic`, mark causal wording with `[heuristic]`, likely, suspected, or inferred. Direct evidence can stay direct.\n\
 Include exactly these sections:\n\
@@ -5588,7 +5603,8 @@ What happened  one plain sentence; if partial, say the session is still running\
 What it means  one plain sentence about whether the user needs to care now\n\
 What to do     one concrete next step; say \"Keep going.\" when no intervention is needed\n\
 ## Restart Prompt\n\
-One short prompt the user can paste into a fresh Claude Code session, or \"No restart needed.\".\n\
+If restart is not useful, write exactly \"No restart needed.\".\n\
+If restart is useful, write one paste-ready handoff prompt for a fresh Claude Code session. Include the current state, the next action, what to preserve from `handoff_context.continue_from`, and what to avoid from `handoff_context.avoid_repeating`. If context is redacted or missing, tell the new session to ask the user for the missing task-specific detail instead of inventing it.\n\
 Keep caveats brief inside the key/value rows only: costs are estimates, context projections are heuristic, and redacted evidence may omit details.\n\n\
 Redacted cc-blackbox postmortem JSON:\n```json\n{bundle}\n```"
     )
@@ -6302,6 +6318,39 @@ fn statusline_session_id(input: &serde_json::Value) -> Option<String> {
     .map(ToString::to_string)
 }
 
+fn jsonl_session_id_from_path(path: &str) -> Option<String> {
+    Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.trim().is_empty())
+        .map(ToString::to_string)
+}
+
+fn statusline_jsonl_session_id(input: &serde_json::Value) -> Option<String> {
+    for pointer in [
+        "/transcript_path",
+        "/transcriptPath",
+        "/workspace/transcript_path",
+        "/workspace/transcriptPath",
+    ] {
+        if let Some(session_id) = json_str(input, pointer).and_then(jsonl_session_id_from_path) {
+            return Some(session_id);
+        }
+    }
+
+    [
+        "/jsonl_session_id",
+        "/claude/session_id",
+        "/session_id",
+        "/session/id",
+        "/workspace/session_id",
+    ]
+    .iter()
+    .filter_map(|pointer| json_str(input, pointer))
+    .find(|value| !value.trim().is_empty() && !value.starts_with("session_"))
+    .map(ToString::to_string)
+}
+
 fn statusline_candidate_dirs(input: &serde_json::Value) -> Vec<String> {
     let mut dirs = Vec::new();
     for pointer in [
@@ -6358,9 +6407,49 @@ async fn footer_recent_sessions(base_url: &str) -> Result<serde_json::Value, Str
     .await
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JsonlSessionResolution {
+    status: String,
+    proxy_session_id: Option<String>,
+}
+
+fn query_escape(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect::<Vec<_>>(),
+        })
+        .collect()
+}
+
+async fn footer_proxy_session_for_jsonl_session(
+    base_url: &str,
+    jsonl_session_id: &str,
+) -> Result<JsonlSessionResolution, String> {
+    let report = fetch_json_endpoint_with_timeout(
+        base_url,
+        &format!(
+            "/api/sessions/resolve-jsonl?jsonl_session_id={}",
+            query_escape(jsonl_session_id)
+        ),
+        Duration::from_millis(650),
+    )
+    .await?;
+    Ok(JsonlSessionResolution {
+        status: json_str(&report, "/status")
+            .unwrap_or("unknown")
+            .to_string(),
+        proxy_session_id: json_str(&report, "/proxy_session_id").map(ToString::to_string),
+    })
+}
+
 fn active_sessions_matching_dirs(
     sessions_report: &serde_json::Value,
     dirs: &[String],
+    launch_started_at_secs: Option<i64>,
 ) -> Vec<String> {
     let Some(sessions) = sessions_report
         .get("sessions")
@@ -6372,6 +6461,11 @@ fn active_sessions_matching_dirs(
     for session in sessions {
         if !json_bool(session, "/active").unwrap_or(false) {
             continue;
+        }
+        if let Some(launch_started_at_secs) = launch_started_at_secs {
+            if !session_started_after_launch(session, launch_started_at_secs) {
+                continue;
+            }
         }
         let Some(working_dir) = json_str(session, "/working_dir") else {
             continue;
@@ -6385,37 +6479,72 @@ fn active_sessions_matching_dirs(
     matches
 }
 
+fn session_started_at_secs(session: &serde_json::Value) -> Option<i64> {
+    json_str(session, "/started_at")
+        .and_then(|started_at| DateTime::parse_from_rfc3339(started_at).ok())
+        .map(|started_at| started_at.timestamp())
+}
+
+fn session_started_after_launch(session: &serde_json::Value, launch_started_at_secs: i64) -> bool {
+    session_started_at_secs(session)
+        .map(|started_at| started_at + FOOTER_RUN_START_GRACE_SECS >= launch_started_at_secs)
+        .unwrap_or(false)
+}
+
+fn footer_launch_started_at_secs() -> Option<i64> {
+    std::env::var(CC_BLACKBOX_RUN_STARTED_AT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+}
+
 async fn unambiguous_active_session_from_guard_status(
     base_url: &str,
 ) -> Result<Option<(String, serde_json::Value, serde_json::Value)>, String> {
     let report =
         fetch_json_endpoint_with_timeout(base_url, "/api/guard/status", Duration::from_millis(650))
             .await?;
+    Ok(unambiguous_active_session_from_guard_report(&report)
+        .map(|(session_id, session)| (session_id, session, report)))
+}
+
+fn unambiguous_active_session_from_guard_report(
+    report: &serde_json::Value,
+) -> Option<(String, serde_json::Value)> {
     let sessions = report
         .get("sessions")
         .and_then(|value| value.as_array())
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let active = sessions
-        .iter()
-        .filter(|session| {
-            json_str(session, "/session_id") != Some("guard_global")
-                && json_str(session, "/state") != Some("ended")
-        })
-        .collect::<Vec<_>>();
-    if active.len() != 1 {
-        return Ok(None);
+    let mut active = sessions.iter().filter(|session| {
+        json_str(session, "/session_id") != Some("guard_global")
+            && json_str(session, "/state") != Some("ended")
+    });
+    let session = active.next()?;
+    if active.next().is_some() {
+        return None;
     }
-    let session = active[0].clone();
-    let session_id = json_str(&session, "/session_id")
+    let session_id = json_str(session, "/session_id")
         .unwrap_or("unknown")
         .to_string();
-    Ok(Some((session_id, session, report)))
+    Some((session_id, (*session).clone()))
 }
 
 async fn resolve_footer_decision(
     base_url: &str,
     statusline: &serde_json::Value,
+) -> (SessionDecision, FooterCorrelation) {
+    resolve_footer_decision_with_launch_started_at(
+        base_url,
+        statusline,
+        footer_launch_started_at_secs(),
+    )
+    .await
+}
+
+async fn resolve_footer_decision_with_launch_started_at(
+    base_url: &str,
+    statusline: &serde_json::Value,
+    launch_started_at_secs: Option<i64>,
 ) -> (SessionDecision, FooterCorrelation) {
     if let Some(session_id) = statusline_session_id(statusline) {
         match footer_decision_for_session(base_url, &session_id).await {
@@ -6458,11 +6587,81 @@ async fn resolve_footer_decision(
         }
     }
 
+    if let Some(jsonl_session_id) = statusline_jsonl_session_id(statusline) {
+        match footer_proxy_session_for_jsonl_session(base_url, &jsonl_session_id).await {
+            Ok(JsonlSessionResolution {
+                proxy_session_id: Some(proxy_session_id),
+                ..
+            }) => match footer_decision_for_session(base_url, &proxy_session_id).await {
+                Ok(Some(decision)) => {
+                    return (
+                        decision,
+                        FooterCorrelation {
+                            mode: "jsonl_session_id".to_string(),
+                            matched_session_id: Some(proxy_session_id),
+                            ambiguous: false,
+                            detail: format!(
+                                "matched Claude JSONL session {jsonl_session_id} to cc-blackbox session"
+                            ),
+                        },
+                    );
+                }
+                Ok(None) => {
+                    return (
+                        SessionDecision::known_session_waiting_for_live_status(
+                            proxy_session_id.clone(),
+                            None,
+                            None,
+                        ),
+                        FooterCorrelation {
+                            mode: "jsonl_session_id".to_string(),
+                            matched_session_id: Some(proxy_session_id.clone()),
+                            ambiguous: false,
+                            detail: format!(
+                                "Claude JSONL session {jsonl_session_id} resolved to {proxy_session_id}, but guard status did not include it"
+                            ),
+                        },
+                    );
+                }
+                Err(err) => {
+                    return (
+                        SessionDecision::fallback("core unavailable", "continue carefully"),
+                        FooterCorrelation {
+                            mode: "core_unavailable".to_string(),
+                            matched_session_id: None,
+                            ambiguous: false,
+                            detail: err,
+                        },
+                    );
+                }
+            },
+            Ok(resolution) => {
+                return (
+                    SessionDecision::fallback("first request pending", "wait for first request"),
+                    FooterCorrelation {
+                        mode: "jsonl_session_id".to_string(),
+                        matched_session_id: None,
+                        ambiguous: resolution.status == "ambiguous",
+                        detail: format!(
+                            "Claude JSONL session {jsonl_session_id} has no live cc-blackbox match yet ({})",
+                            resolution.status
+                        ),
+                    },
+                );
+            }
+            Err(_) => {
+                // Older cores do not expose JSONL resolution; fall through to the
+                // launch/cwd fallbacks so the footer remains useful during upgrades.
+            }
+        }
+    }
+
     let dirs = statusline_candidate_dirs(statusline);
     if !dirs.is_empty() {
         match footer_recent_sessions(base_url).await {
             Ok(sessions_report) => {
-                let matches = active_sessions_matching_dirs(&sessions_report, &dirs);
+                let matches =
+                    active_sessions_matching_dirs(&sessions_report, &dirs, launch_started_at_secs);
                 match matches.len().cmp(&1) {
                     std::cmp::Ordering::Equal => {
                         let session_id = matches[0].clone();
@@ -6497,6 +6696,25 @@ async fn resolve_footer_decision(
                         }
                     }
                     std::cmp::Ordering::Greater => {
+                        if let Ok(Some((session_id, session, report))) =
+                            unambiguous_active_session_from_guard_status(base_url).await
+                        {
+                            if matches.iter().any(|matched| matched == &session_id) {
+                                return (
+                                    decision_from_guard_status_session(
+                                        &session,
+                                        report.get("quota_burn_status"),
+                                    ),
+                                    FooterCorrelation {
+                                        mode: "working_dir_guard_status".to_string(),
+                                        matched_session_id: Some(session_id),
+                                        ambiguous: false,
+                                        detail: "resolved multiple cwd matches with the only active guard session"
+                                            .to_string(),
+                                    },
+                                );
+                            }
+                        }
                         return (
                             SessionDecision::fallback(
                                 "multiple sessions in this directory",
@@ -6513,7 +6731,23 @@ async fn resolve_footer_decision(
                             },
                         );
                     }
-                    std::cmp::Ordering::Less => {}
+                    std::cmp::Ordering::Less => {
+                        if launch_started_at_secs.is_some() {
+                            return (
+                                SessionDecision::fallback(
+                                    "first request pending",
+                                    "wait for first request",
+                                ),
+                                FooterCorrelation {
+                                    mode: "run_launch".to_string(),
+                                    matched_session_id: None,
+                                    ambiguous: false,
+                                    detail: "no cc-blackbox session from this run has made its first proxied request"
+                                        .to_string(),
+                                },
+                            );
+                        }
+                    }
                 }
             }
             Err(err) => {
@@ -6528,6 +6762,19 @@ async fn resolve_footer_decision(
                 );
             }
         }
+    }
+
+    if launch_started_at_secs.is_some() {
+        return (
+            SessionDecision::fallback("first request pending", "wait for first request"),
+            FooterCorrelation {
+                mode: "run_launch".to_string(),
+                matched_session_id: None,
+                ambiguous: false,
+                detail: "cc-blackbox run launched Claude, but no matching proxied session is available yet"
+                    .to_string(),
+            },
+        );
     }
 
     match unambiguous_active_session_from_guard_status(base_url).await {
@@ -6592,6 +6839,28 @@ fn colorize_footer_line(line: &str, state: DecisionState, mode: FooterColorMode)
     }
 }
 
+fn statusline_width(input: &serde_json::Value) -> Option<usize> {
+    [
+        "/terminal/columns",
+        "/terminal_width",
+        "/columns",
+        "/width",
+        "/workspace/terminal_width",
+    ]
+    .iter()
+    .filter_map(|pointer| json_u64(input, pointer))
+    .map(|value| value as usize)
+    .find(|width| (20..=240).contains(width))
+}
+
+fn footer_render_width(explicit_width: Option<usize>, statusline: &serde_json::Value) -> usize {
+    explicit_width
+        .or_else(|| statusline_width(statusline))
+        .or_else(terminal_width_from_stdout)
+        .or_else(terminal_width_from_columns_env)
+        .unwrap_or(160)
+}
+
 async fn run_footer(
     base_url: &str,
     width: Option<usize>,
@@ -6606,7 +6875,7 @@ async fn run_footer(
         serde_json::from_str::<serde_json::Value>(&input).unwrap_or(serde_json::Value::Null)
     };
     let (decision, correlation) = resolve_footer_decision(base_url, &statusline).await;
-    let width = width.unwrap_or_else(terminal_width);
+    let width = footer_render_width(width, &statusline);
     let footer = render_footer(&decision, width);
     if json_output {
         let response = FooterResponse {
@@ -7131,10 +7400,10 @@ mod tests {
         fetch_run_final_postmortem_markdown_with_retry, finalize_run_owned_sessions,
         format_duration_coarse, format_tokens, local_time_from_iso, parse_mcp_tool_name,
         postmortem_progress_message, postmortem_separator_line_for_width, push_unique,
-        render_guard_policy_report, render_guard_status_report, render_guard_watch_line,
-        render_postmortem_markdown, render_postmortem_markdown_with_optional_analysis,
-        render_postmortem_terminal_for_width, render_run_guard_panel,
-        render_tmux_unavailable_fallback, run_child_command_with_deps,
+        render_footer, render_guard_policy_report, render_guard_status_report,
+        render_guard_watch_line, render_postmortem_markdown,
+        render_postmortem_markdown_with_optional_analysis, render_postmortem_terminal_for_width,
+        render_run_guard_panel, render_tmux_unavailable_fallback, run_child_command_with_deps,
         run_child_command_with_lifecycle_deps, run_claude_postmortem_analysis_with_command,
         run_claude_postmortem_analysis_with_lookup, run_guard_start_with_deps, run_owned_watch_url,
         select_run_live_mode, shell_join, shell_quote, truncate_for_box, watcher_args, yaml_quote,
@@ -7609,6 +7878,7 @@ mod tests {
                 .expect("settings json");
         assert_eq!(settings["statusLine"]["type"], "command");
         assert_eq!(settings["statusLine"]["padding"], 0);
+        assert_eq!(settings["statusLine"]["refreshInterval"], 5);
         assert_eq!(
             settings["statusLine"]["command"],
             "/tmp/cc-blackbox footer --url http://core --color always"
@@ -7629,6 +7899,7 @@ mod tests {
             settings["statusLine"]["command"],
             "/tmp/cc-blackbox footer --url http://core2 --color always"
         );
+        assert_eq!(settings["statusLine"]["refreshInterval"], 5);
 
         fs::write(
             &settings_path,
@@ -7658,6 +7929,254 @@ mod tests {
         assert_eq!(skipped, super::FooterStatuslineInstall::SkippedNotClaude);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn footer_resolves_multiple_cwd_matches_with_guard_status() {
+        let sessions = serde_json::json!({
+            "sessions": [
+                {
+                    "active": true,
+                    "session_id": "session_old",
+                    "working_dir": "/repo"
+                },
+                {
+                    "active": true,
+                    "session_id": "session_current",
+                    "working_dir": "/repo"
+                }
+            ]
+        })
+        .to_string();
+        let guard_status = serde_json::json!({
+            "overall_state": "watching",
+            "quota_burn_status": {
+                "seconds_to_reset": 3600,
+                "tokens_used_this_week": 42
+            },
+            "sessions": [{
+                "session_id": "session_current",
+                "display_name": "repo",
+                "model": "sonnet",
+                "state": "watching",
+                "findings": [],
+                "signals": {
+                    "context": { "fill_percent": 10.0 },
+                    "idle_secs": 5,
+                    "cache": {
+                        "event_type": "partial",
+                        "cache_expires_in_secs": 250,
+                        "estimated_rebuild_cost_dollars": 0.0
+                    },
+                    "postmortem_ready": false
+                }
+            }]
+        })
+        .to_string();
+        let (url, request_rx) = serve_postmortem_responses(vec![
+            ("200 OK".to_string(), sessions),
+            ("200 OK".to_string(), guard_status),
+        ]);
+
+        let (decision, correlation) =
+            super::resolve_footer_decision(&url, &serde_json::json!({ "cwd": "/repo" })).await;
+
+        assert_eq!(decision.session_id.as_deref(), Some("session_current"));
+        assert_eq!(correlation.mode, "working_dir_guard_status");
+        assert_eq!(
+            correlation.matched_session_id.as_deref(),
+            Some("session_current")
+        );
+        assert!(!correlation.ambiguous);
+
+        let requests = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured footer requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /api/sessions?limit=20&days=1 "));
+        assert!(requests[1].starts_with("GET /api/guard/status "));
+    }
+
+    #[tokio::test]
+    async fn footer_waits_for_first_request_when_run_launch_only_has_old_sessions() {
+        let sessions = serde_json::json!({
+            "sessions": [
+                {
+                    "active": true,
+                    "session_id": "session_old",
+                    "working_dir": "/repo",
+                    "started_at": "2026-01-01T00:00:00Z"
+                }
+            ]
+        })
+        .to_string();
+        let (url, request_rx) = serve_postmortem_responses(vec![("200 OK".to_string(), sessions)]);
+
+        let (decision, correlation) = super::resolve_footer_decision_with_launch_started_at(
+            &url,
+            &serde_json::json!({ "cwd": "/repo" }),
+            Some(1_767_225_610),
+        )
+        .await;
+
+        assert_eq!(decision.state, DecisionState::Watching);
+        assert_eq!(decision.session_id, None);
+        assert_eq!(correlation.mode, "run_launch");
+        assert_eq!(correlation.matched_session_id, None);
+        assert!(!correlation.ambiguous);
+        assert!(decision
+            .main_reason
+            .as_ref()
+            .expect("fallback reason")
+            .short
+            .contains("first request"));
+
+        let requests = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured footer requests");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /api/sessions?limit=20&days=1 "));
+    }
+
+    #[tokio::test]
+    async fn footer_prefers_claude_jsonl_session_id_over_working_directory() {
+        let resolution = serde_json::json!({
+            "status": "matched",
+            "matched": true,
+            "jsonl_session_id": "claude-jsonl-1",
+            "proxy_session_id": "session_current"
+        })
+        .to_string();
+        let guard_status = serde_json::json!({
+            "overall_state": "watching",
+            "sessions": [{
+                "session_id": "session_current",
+                "display_name": "repo",
+                "model": "sonnet",
+                "state": "watching",
+                "findings": [],
+                "signals": {
+                    "context": { "fill_percent": 12.0 },
+                    "idle_secs": 2,
+                    "cache": {
+                        "event_type": "hit",
+                        "cache_expires_in_secs": 290,
+                        "estimated_rebuild_cost_dollars": 0.0
+                    },
+                    "postmortem_ready": false
+                }
+            }]
+        })
+        .to_string();
+        let (url, request_rx) = serve_postmortem_responses(vec![
+            ("200 OK".to_string(), resolution),
+            ("200 OK".to_string(), guard_status),
+        ]);
+
+        let (decision, correlation) = super::resolve_footer_decision(
+            &url,
+            &serde_json::json!({
+                "session_id": "claude-jsonl-1",
+                "cwd": "/repo"
+            }),
+        )
+        .await;
+
+        assert_eq!(decision.session_id.as_deref(), Some("session_current"));
+        assert_eq!(correlation.mode, "jsonl_session_id");
+        assert_eq!(
+            correlation.matched_session_id.as_deref(),
+            Some("session_current")
+        );
+
+        let requests = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured footer requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0]
+            .starts_with("GET /api/sessions/resolve-jsonl?jsonl_session_id=claude-jsonl-1 "));
+        assert!(requests[1].starts_with("GET /api/guard/status?session=session_current "));
+    }
+
+    #[tokio::test]
+    async fn footer_keeps_jsonl_match_when_guard_status_is_empty_after_restart() {
+        let resolution = serde_json::json!({
+            "status": "matched",
+            "matched": true,
+            "jsonl_session_id": "claude-jsonl-1",
+            "proxy_session_id": "session_current"
+        })
+        .to_string();
+        let guard_status = serde_json::json!({
+            "overall_state": "healthy",
+            "sessions": []
+        })
+        .to_string();
+        let (url, request_rx) = serve_postmortem_responses(vec![
+            ("200 OK".to_string(), resolution),
+            ("200 OK".to_string(), guard_status),
+        ]);
+
+        let (decision, correlation) = super::resolve_footer_decision(
+            &url,
+            &serde_json::json!({
+                "session_id": "claude-jsonl-1",
+                "cwd": "/repo"
+            }),
+        )
+        .await;
+        let footer = render_footer(&decision, 180);
+
+        assert_eq!(decision.session_id.as_deref(), Some("session_current"));
+        assert_eq!(correlation.mode, "jsonl_session_id");
+        assert_eq!(
+            correlation.matched_session_id.as_deref(),
+            Some("session_current")
+        );
+        assert!(footer.contains("This Claude session is matched"));
+        assert!(footer.contains("cc-blackbox postmortem session_current"));
+
+        let requests = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured footer requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0]
+            .starts_with("GET /api/sessions/resolve-jsonl?jsonl_session_id=claude-jsonl-1 "));
+        assert!(requests[1].starts_with("GET /api/guard/status?session=session_current "));
+    }
+
+    #[tokio::test]
+    async fn footer_with_unmatched_claude_jsonl_session_does_not_reuse_cwd_session() {
+        let resolution = serde_json::json!({
+            "status": "no_match",
+            "matched": false,
+            "jsonl_session_id": "claude-jsonl-new"
+        })
+        .to_string();
+        let (url, request_rx) =
+            serve_postmortem_responses(vec![("200 OK".to_string(), resolution)]);
+
+        let (decision, correlation) = super::resolve_footer_decision(
+            &url,
+            &serde_json::json!({
+                "session_id": "claude-jsonl-new",
+                "cwd": "/repo"
+            }),
+        )
+        .await;
+
+        assert_eq!(decision.state, DecisionState::Watching);
+        assert_eq!(decision.session_id, None);
+        assert_eq!(correlation.mode, "jsonl_session_id");
+        assert_eq!(correlation.matched_session_id, None);
+        assert!(!correlation.ambiguous);
+
+        let requests = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured footer requests");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]
+            .starts_with("GET /api/sessions/resolve-jsonl?jsonl_session_id=claude-jsonl-new "));
     }
 
     #[test]
@@ -8256,6 +8775,10 @@ mod tests {
                     assert!(envs
                         .iter()
                         .any(|(key, value)| *key == "ANTHROPIC_BASE_URL" && !value.is_empty()));
+                    assert!(envs
+                        .iter()
+                        .any(|(key, value)| *key == super::CC_BLACKBOX_RUN_STARTED_AT_ENV
+                            && value.parse::<i64>().is_ok()));
                     events.lock().expect("events lock").push("run".to_string());
                     Ok(0)
                 }
@@ -10200,6 +10723,15 @@ What to do     Continue from the compacted segment.\n\
             "redacted": true,
             "summary": {
                 "initial_prompt_summary": "Initial prompt captured (redacted, 8 words)."
+            },
+            "handoff_context": {
+                "action": "Restart with a compact handoff.",
+                "continue_from": ["Outcome: Compaction Boundary"],
+                "avoid_repeating": ["Do not treat the compaction boundary as task abandonment."],
+                "provenance": {
+                    "cc_blackbox_session_id": "session_target",
+                    "claude_jsonl_session_id": "jsonl_target"
+                }
             }
         });
         let prompt = build_claude_analysis_prompt(&report);
@@ -10211,6 +10743,11 @@ What to do     Continue from the compacted segment.\n\
         assert!(prompt.contains("Use aligned key/value rows"));
         assert!(prompt.contains("No code fences"));
         assert!(prompt.contains("Use `summary.outcome` as the resolved report outcome"));
+        assert!(prompt.contains("Use `handoff_context` as the source for restart guidance"));
+        assert!(prompt.contains("session IDs as provenance only"));
+        assert!(prompt.contains("paste-ready handoff prompt"));
+        assert!(prompt.contains("handoff_context.continue_from"));
+        assert!(prompt.contains("handoff_context.avoid_repeating"));
         assert!(prompt.contains("jsonl_compaction_boundary"));
         assert!(prompt.contains("What happened  one plain sentence"));
         assert!(prompt.contains("What it means  one plain sentence"));
@@ -10220,6 +10757,7 @@ What to do     Continue from the compacted segment.\n\
         assert!(prompt.contains("## Restart Prompt"));
         assert!(prompt.contains("\"redacted\": true"));
         assert!(prompt.contains("Initial prompt captured"));
+        assert!(prompt.contains("\"handoff_context\""));
     }
 
     #[tokio::test]

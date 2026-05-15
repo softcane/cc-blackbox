@@ -128,6 +128,42 @@ impl SessionDecision {
             drilldown_command: None,
         }
     }
+
+    pub(crate) fn known_session_waiting_for_live_status(
+        session_id: impl Into<String>,
+        display_name: Option<String>,
+        model: Option<String>,
+    ) -> Self {
+        let session_id = session_id.into();
+        let reason = DecisionReason {
+            code: "live_status_pending".to_string(),
+            label: "session match".to_string(),
+            short: "live status will refresh after the next request".to_string(),
+            detail: "Claude's session is matched to a cc-blackbox session, but the live guard state is not available yet.".to_string(),
+            evidence_level: "derived".to_string(),
+            source: "statusline".to_string(),
+            evidence: "matched Claude JSONL session to cc-blackbox session".to_string(),
+            caveat: Some(
+                "This usually happens after cc-blackbox-core restarts while Claude windows remain open."
+                    .to_string(),
+            ),
+            suggested_action: Some("Send a message in this Claude window to refresh live status.".to_string()),
+            state: DecisionState::Watching,
+            priority: 20,
+        };
+        Self {
+            state: DecisionState::Watching,
+            session_id: Some(session_id.clone()),
+            display_name,
+            model,
+            main_reason: Some(reason.clone()),
+            reasons: vec![reason],
+            best_action: "send a message to refresh live status".to_string(),
+            footer_action: "send a message to refresh live status".to_string(),
+            alternatives: vec![format!("Run cc-blackbox postmortem {session_id}.")],
+            drilldown_command: Some(format!("cc-blackbox postmortem {session_id}")),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -400,14 +436,7 @@ impl SessionDecisionTracker {
             .map(footer_action_for_reason)
             .unwrap_or_else(|| "continue".to_string());
         let alternatives = alternatives_for_state(state);
-        let drilldown_command = matches!(
-            state,
-            DecisionState::Risky
-                | DecisionState::StopRecommended
-                | DecisionState::Blocked
-                | DecisionState::Cooldown
-        )
-        .then(|| "cc-blackbox postmortem latest".to_string());
+        let drilldown_command = drilldown_command_for_state(state, self.session_id.as_deref());
 
         SessionDecision {
             state,
@@ -532,78 +561,370 @@ pub(crate) fn decision_from_guard_status_session(
 
 pub(crate) fn render_footer(decision: &SessionDecision, width: usize) -> String {
     let width = width.max(12);
-    let reason = decision
-        .main_reason
-        .as_ref()
-        .map(|reason| reason.short.as_str())
-        .unwrap_or("guard clear");
-    let secondary = decision
-        .reasons
-        .iter()
-        .find(|candidate| {
-            decision
-                .main_reason
-                .as_ref()
-                .map(|main| main.code.as_str() != candidate.code.as_str())
-                .unwrap_or(true)
-                && matches!(
-                    candidate.code.as_str(),
-                    "context_status" | "cache_event" | "cache_ratio" | "quota_burn"
-                )
-        })
-        .map(|reason| reason.short.as_str());
-    let state = decision.state.label();
-    let drilldown = decision.drilldown_command.as_deref();
-    let prefix = "cc-blackbox:";
-
-    let mut candidates = Vec::new();
-    if let Some(drilldown) = drilldown {
-        if let Some(secondary) = secondary {
-            candidates.push(format!(
-                "{prefix} {state} | {reason} | {secondary} | {} | {drilldown}",
-                decision.footer_action
-            ));
-            candidates.push(format!(
-                "bb: {state} | {reason} | {secondary} | {} | {drilldown}",
-                decision.footer_action
-            ));
-        }
-        candidates.push(format!(
-            "{prefix} {state} | {reason} | {} | {drilldown}",
-            decision.footer_action
-        ));
-        candidates.push(format!(
-            "bb: {state} | {reason} | {} | {drilldown}",
-            decision.footer_action
-        ));
-        candidates.push(format!(
-            "{state} | {reason} | {} | {drilldown}",
-            decision.footer_action
-        ));
-        candidates.push(format!("{prefix} {state} | {reason} | {drilldown}"));
-        candidates.push(format!("bb: {state} | {reason} | {drilldown}"));
-        candidates.push(format!("{state} | {reason} | {drilldown}"));
-    }
-    candidates.push(format!(
-        "{prefix} {state} | {reason} | {}",
-        decision.footer_action
-    ));
-    candidates.push(format!("{prefix} {state} | {reason}"));
-    candidates.push(format!("bb: {state} | {reason}"));
-    candidates.push(format!("{state} | {reason}"));
-    candidates.push(format!("{state}: {reason}"));
-    candidates.push(format!("bb: {state}"));
+    let candidates = footer_sentence_candidates(decision);
 
     let mut chosen = candidates
         .into_iter()
         .find(|line| line.chars().count() <= width)
-        .unwrap_or_else(|| format!("{state}: {reason}"));
+        .unwrap_or_else(|| footer_minimal_sentence(decision));
     chosen = one_line_ascii(&chosen);
     if chosen.chars().count() > width {
         truncate_ascii(&chosen, width)
     } else {
         chosen
     }
+}
+
+fn footer_sentence_candidates(decision: &SessionDecision) -> Vec<String> {
+    match decision.state {
+        DecisionState::Healthy => healthy_footer_candidates(decision),
+        DecisionState::Watching => watching_footer_candidates(decision),
+        DecisionState::Risky
+        | DecisionState::StopRecommended
+        | DecisionState::Blocked
+        | DecisionState::Cooldown
+        | DecisionState::Ended => action_footer_candidates(decision),
+    }
+}
+
+fn healthy_footer_candidates(decision: &SessionDecision) -> Vec<String> {
+    let primary = decision
+        .main_reason
+        .as_ref()
+        .map(healthy_signal_sentence)
+        .unwrap_or_else(|| "No guard findings right now".to_string());
+    let secondary = secondary_footer_reason(decision).map(healthy_signal_fragment);
+    let mut candidates = Vec::new();
+    if let Some(secondary) = secondary {
+        candidates.push(format!(
+            "cc-blackbox: Looks healthy. {primary}; {secondary}."
+        ));
+        candidates.push(format!("bb: Healthy. {primary}; {secondary}."));
+    }
+    candidates.push(format!("cc-blackbox: Looks healthy. {primary}."));
+    candidates.push(format!("bb: Healthy. {primary}."));
+    candidates.push("cc-blackbox: Looks healthy.".to_string());
+    candidates.push("bb: Healthy.".to_string());
+    candidates
+}
+
+fn watching_footer_candidates(decision: &SessionDecision) -> Vec<String> {
+    let reason = decision.main_reason.as_ref();
+    let (sentence, action) = match reason.map(|value| value.short.as_str()) {
+        Some(short) if short.contains("multiple sessions") => (
+            "I see multiple cc-blackbox sessions in this directory.".to_string(),
+            Some("Run: cc-blackbox guard status".to_string()),
+        ),
+        Some(short) if short.contains("no matching") || short.contains("no unambiguous") => (
+            "Waiting for one active Claude session to match.".to_string(),
+            None,
+        ),
+        Some(short) if short.contains("first request") => (
+            "Waiting for Claude's first proxied request.".to_string(),
+            None,
+        ),
+        Some(short) if short.contains("live status will refresh") => (
+            "This Claude session is matched; live status will refresh after its next request."
+                .to_string(),
+            decision
+                .drilldown_command
+                .as_ref()
+                .map(|command| format!("Run: {command}")),
+        ),
+        Some(short) => (humanize_short(short), Some(decision.best_action.clone())),
+        None => (
+            "Waiting for Claude's first proxied request.".to_string(),
+            None,
+        ),
+    };
+    let mut candidates = Vec::new();
+    if let Some(action) = action.filter(|value| !value.trim().is_empty()) {
+        candidates.push(format!("cc-blackbox: {sentence} {action}."));
+        candidates.push(format!("bb: {sentence} {action}."));
+    }
+    candidates.push(format!("cc-blackbox: {sentence}"));
+    candidates.push(format!("bb: {sentence}"));
+    candidates
+}
+
+fn action_footer_candidates(decision: &SessionDecision) -> Vec<String> {
+    let reason = decision.main_reason.as_ref();
+    let verdict = footer_verdict(decision.state);
+    let why = reason
+        .map(action_reason_sentence)
+        .unwrap_or_else(|| "Something needs attention.".to_string());
+    let action = reason
+        .map(action_sentence_for_reason)
+        .unwrap_or_else(|| fallback_action_sentence(decision.state));
+    let compact_reason = reason
+        .map(compact_reason_sentence)
+        .unwrap_or_else(|| humanize_short(decision.state.label()));
+    let compact_action = humanize_short(&decision.footer_action);
+    let secondary = secondary_footer_reason(decision).map(secondary_action_sentence);
+    let command = decision
+        .drilldown_command
+        .as_ref()
+        .map(|command| format!("Run: {command}"));
+
+    let mut candidates = Vec::new();
+    if let (Some(secondary), Some(command)) = (&secondary, &command) {
+        candidates.push(format!(
+            "cc-blackbox: {verdict}: {why} {secondary} {action} {command}."
+        ));
+    }
+    if let Some(command) = &command {
+        candidates.push(format!("cc-blackbox: {verdict}: {why} {action} {command}."));
+        candidates.push(format!("cc-blackbox: {verdict}: {why} {command}."));
+        candidates.push(format!("bb: {verdict}: {why} {command}."));
+    }
+    if let Some(secondary) = &secondary {
+        candidates.push(format!(
+            "cc-blackbox: {verdict}: {why} {secondary} {action}"
+        ));
+    }
+    candidates.push(format!("cc-blackbox: {verdict}: {why} {action}"));
+    if let Some(command) = &command {
+        candidates.push(format!(
+            "cc-blackbox: {verdict}: {compact_reason} {command}."
+        ));
+        candidates.push(format!(
+            "{}: {compact_reason} {command}.",
+            decision.state.label()
+        ));
+    }
+    candidates.push(format!(
+        "cc-blackbox: {verdict}: {compact_reason} {compact_action}"
+    ));
+    candidates.push(format!(
+        "{}: {compact_reason} {compact_action}",
+        decision.state.label()
+    ));
+    candidates.push(format!("cc-blackbox: {verdict}: {why}"));
+    candidates.push(format!("bb: {verdict}: {why}"));
+    candidates.push(format!(
+        "{}: {}",
+        decision.state.label(),
+        compact_reason.trim_end_matches('.')
+    ));
+    candidates
+}
+
+fn footer_minimal_sentence(decision: &SessionDecision) -> String {
+    let state = decision.state.label();
+    let reason = decision
+        .main_reason
+        .as_ref()
+        .map(|reason| reason.short.as_str())
+        .unwrap_or("watching");
+    format!("{state}: {reason}")
+}
+
+fn secondary_footer_reason(decision: &SessionDecision) -> Option<&DecisionReason> {
+    decision.reasons.iter().find(|candidate| {
+        decision
+            .main_reason
+            .as_ref()
+            .map(|main| main.code.as_str() != candidate.code.as_str())
+            .unwrap_or(true)
+            && matches!(
+                candidate.code.as_str(),
+                "context_status" | "cache_event" | "cache_warning" | "quota_burn"
+            )
+    })
+}
+
+fn footer_verdict(state: DecisionState) -> &'static str {
+    match state {
+        DecisionState::Risky => "Careful",
+        DecisionState::StopRecommended => "Stop here",
+        DecisionState::Blocked => "Blocked",
+        DecisionState::Cooldown => "Cooldown",
+        DecisionState::Ended => "Session ended",
+        DecisionState::Healthy => "Looks healthy",
+        DecisionState::Watching => "Watching",
+    }
+}
+
+fn humanize_short(value: &str) -> String {
+    let value = value.trim_end_matches('.');
+    if value.is_empty() {
+        return "Keep watching.".to_string();
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return "Keep watching.".to_string();
+    };
+    format!(
+        "{}{}.",
+        first.to_ascii_uppercase(),
+        chars.collect::<String>()
+    )
+}
+
+fn healthy_signal_sentence(reason: &DecisionReason) -> String {
+    match reason.code.as_str() {
+        "cache_event" if reason.short == "cache good" => "Cache is warm".to_string(),
+        "cache_event" if reason.short == "cache cold" => "Cache just started cold".to_string(),
+        "context_status" => format!("Context is {}", percent_from_short(&reason.short)),
+        "quota_burn" => humanize_short(&reason.short),
+        _ => humanize_short(&reason.short)
+            .trim_end_matches('.')
+            .to_string(),
+    }
+}
+
+fn healthy_signal_fragment(reason: &DecisionReason) -> String {
+    match reason.code.as_str() {
+        "cache_event" if reason.short == "cache good" => "cache is warm".to_string(),
+        "cache_event" if reason.short == "cache cold" => "cache is cold".to_string(),
+        "context_status" => format!("context is {}", percent_from_short(&reason.short)),
+        "quota_burn" => reason.short.clone(),
+        _ => reason.short.clone(),
+    }
+}
+
+fn percent_from_short(short: &str) -> String {
+    short
+        .split_whitespace()
+        .find(|part| part.ends_with('%'))
+        .map(|percent| format!("{percent} full"))
+        .unwrap_or_else(|| short.to_string())
+}
+
+fn action_reason_sentence(reason: &DecisionReason) -> String {
+    match reason.code.as_str() {
+        "tool_failure_streak" | "jsonl_only_tool_failure_streak" | "tool_failures" => {
+            format!("{} in a row.", reason.short)
+        }
+        "per_session_token_budget_exceeded" => "The session token budget was exceeded.".to_string(),
+        "per_session_trusted_dollar_budget_exceeded" => {
+            "The trusted dollar budget was exceeded.".to_string()
+        }
+        "api_error_circuit_breaker_cooldown" => {
+            "Repeated API errors triggered cooldown.".to_string()
+        }
+        "context_status" | "context_near_warning_threshold" | "near_compaction" => {
+            format!("Context is {}.", percent_from_short(&reason.short))
+        }
+        "compaction_loop" | "suspected_compaction_loop" | "compaction_suspected" => {
+            "The run may be stuck in a compaction loop.".to_string()
+        }
+        "cache_warning" => "Prompt cache is close to expiring.".to_string(),
+        "cache_event" | "repeated_cache_rebuilds" | "cache_miss_ttl" => {
+            "Prompt cache is being rebuilt or thrashed.".to_string()
+        }
+        "quota_burn" | "high_weekly_project_quota_burn" => {
+            format!("{}.", humanize_short(&reason.short).trim_end_matches('.'))
+        }
+        "model_mismatch" => "The response model does not match the requested model.".to_string(),
+        "request_error" | "api_error" => "The proxy is seeing API errors.".to_string(),
+        "postmortem_ready" => "This run has been idle long enough to review.".to_string(),
+        "session_ended" => "Claude has stopped.".to_string(),
+        _ => humanize_short(&reason.short),
+    }
+}
+
+fn compact_reason_sentence(reason: &DecisionReason) -> String {
+    match reason.code.as_str() {
+        "context_status" | "context_near_warning_threshold" | "near_compaction" => {
+            format!("Context is {}.", percent_from_short(&reason.short))
+        }
+        "cache_warning" => "Cache may expire soon.".to_string(),
+        "postmortem_ready" => humanize_short(&reason.short),
+        "tool_failure_streak" | "jsonl_only_tool_failure_streak" | "tool_failures" => {
+            humanize_short(&reason.short)
+        }
+        _ => action_reason_sentence(reason),
+    }
+}
+
+fn secondary_action_sentence(reason: &DecisionReason) -> String {
+    match reason.code.as_str() {
+        "context_status" => format!("Also, context is {}.", percent_from_short(&reason.short)),
+        "cache_event" if reason.short == "cache good" => "Cache is warm.".to_string(),
+        "cache_warning" => "Cache may expire soon.".to_string(),
+        "quota_burn" => format!("Also, {}.", reason.short),
+        _ => format!("Also, {}.", reason.short),
+    }
+}
+
+fn action_sentence_for_reason(reason: &DecisionReason) -> String {
+    if let Some(action) = reason
+        .suggested_action
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return ensure_sentence(action);
+    }
+    match reason.code.as_str() {
+        "tool_failure_streak" | "jsonl_only_tool_failure_streak" | "tool_failures" => {
+            "Fix that before retrying.".to_string()
+        }
+        "per_session_token_budget_exceeded" | "per_session_trusted_dollar_budget_exceeded" => {
+            "Start narrower or adjust the policy.".to_string()
+        }
+        "api_error_circuit_breaker_cooldown" => "Wait for cooldown, then retry.".to_string(),
+        "context_status" | "context_near_warning_threshold" | "near_compaction" => {
+            if reason.state == DecisionState::StopRecommended {
+                "Summarize and restart before continuing.".to_string()
+            } else {
+                "Keep the next prompt narrow.".to_string()
+            }
+        }
+        "compaction_loop" | "suspected_compaction_loop" | "compaction_suspected" => {
+            "Restart from a compact summary.".to_string()
+        }
+        "cache_event" | "cache_warning" | "repeated_cache_rebuilds" | "cache_miss_ttl" => {
+            "Use the cache now or restart intentionally.".to_string()
+        }
+        "quota_burn" | "high_weekly_project_quota_burn" => {
+            "Keep the next request narrow.".to_string()
+        }
+        "model_mismatch" => "Verify the route before trusting the signal.".to_string(),
+        "request_error" | "api_error" => "Check API status or credentials.".to_string(),
+        "postmortem_ready" => "Review it before continuing broadly.".to_string(),
+        "session_ended" => "Review the postmortem if needed.".to_string(),
+        _ => fallback_action_sentence(reason.state),
+    }
+}
+
+fn fallback_action_sentence(state: DecisionState) -> String {
+    match state {
+        DecisionState::Healthy => "Continue normally.".to_string(),
+        DecisionState::Watching => "Keep watching.".to_string(),
+        DecisionState::Risky => "Keep the next prompt narrow.".to_string(),
+        DecisionState::StopRecommended => "Fix the main issue before retrying.".to_string(),
+        DecisionState::Blocked => "Resolve the guard block before restarting.".to_string(),
+        DecisionState::Cooldown => "Wait for cooldown before retrying.".to_string(),
+        DecisionState::Ended => "Review the postmortem if needed.".to_string(),
+    }
+}
+
+fn ensure_sentence(value: &str) -> String {
+    let value = value.trim();
+    if value.ends_with('.') || value.ends_with('!') || value.ends_with('?') {
+        value.to_string()
+    } else {
+        format!("{value}.")
+    }
+}
+
+fn should_prioritize_drilldown(state: DecisionState) -> bool {
+    matches!(
+        state,
+        DecisionState::Risky
+            | DecisionState::StopRecommended
+            | DecisionState::Blocked
+            | DecisionState::Cooldown
+            | DecisionState::Ended
+    )
+}
+
+fn drilldown_command_for_state(state: DecisionState, session_id: Option<&str>) -> Option<String> {
+    should_prioritize_drilldown(state).then(|| match session_id {
+        Some(id) if id.starts_with("session_") => format!("cc-blackbox postmortem {id}"),
+        _ => "cc-blackbox postmortem latest".to_string(),
+    })
 }
 
 fn one_line_ascii(value: &str) -> String {
@@ -988,6 +1309,9 @@ fn quota_reason(
     projected_exhaustion_secs: Option<u64>,
 ) -> Option<DecisionReason> {
     let used = used?;
+    if limit.is_none() && projected_exhaustion_secs.is_none() {
+        return None;
+    }
     let state = match (projected_exhaustion_secs, seconds_to_reset) {
         (Some(exhaust), Some(reset)) if exhaust < reset => DecisionState::Risky,
         _ if limit.is_none() => DecisionState::Watching,
@@ -1005,10 +1329,20 @@ fn quota_reason(
     let source = budget_source
         .map(|value| format!("; cap source {value}"))
         .unwrap_or_default();
+    let short = match (limit, remaining) {
+        (Some(limit), _) if limit > 0 => {
+            let pct = ((used as f64 / limit as f64) * 100.0)
+                .round()
+                .clamp(0.0, 999.0);
+            format!("weekly quota {:.0}%", pct)
+        }
+        (_, Some(remaining)) => format!("quota {} left", format_tokens(remaining)),
+        _ => "quota burn".to_string(),
+    };
     Some(DecisionReason {
         code: "quota_burn".to_string(),
         label: "quota burn".to_string(),
-        short: "quota burn".to_string(),
+        short,
         detail: format!(
             "Used {} tokens this week against {cap}{remaining_text}{projected}{source}.",
             format_tokens(used)
@@ -1270,26 +1604,30 @@ mod tests {
         tracker.add_reason(context_reason(87.0, Some(1)));
         let decision = tracker.decision();
 
-        let wide = render_footer(&decision, 110);
-        assert!(wide.contains("cc-blackbox: Stop"));
-        assert!(wide.contains("4 Bash failures"));
-        assert!(wide.contains("context 87%"));
-        assert!(wide.contains("cc-blackbox postmortem latest"));
+        let wide = render_footer(&decision, 160);
+        assert!(wide.contains("cc-blackbox: Stop here"));
+        assert!(wide.contains("4 Bash failures in a row"));
+        assert!(wide.contains("context is 87% full"));
+        assert!(wide.contains("Fix that before retrying"));
+        assert!(wide.contains("cc-blackbox postmortem session_test"));
         assert!(!wide.contains('\n'));
 
-        let common_terminal = render_footer(&decision, 80);
-        assert!(common_terminal.contains("4 Bash failures"));
-        assert!(common_terminal.contains("cc-blackbox postmortem latest"));
+        let common_terminal = render_footer(&decision, 100);
+        assert!(common_terminal.contains("4 Bash failures in a row"));
+        assert!(common_terminal.contains("cc-blackbox postmortem session_test"));
         assert!(!common_terminal.contains('\n'));
 
         let medium = render_footer(&decision, 60);
         assert!(medium.contains("4 Bash failures"));
-        assert!(medium.contains("cc-blackbox postmortem latest"));
-        assert!(!medium.contains("fix before retry"));
+        assert!(
+            medium.contains("cc-blackbox postmortem session_test")
+                || medium.contains("Fix before retry")
+                || medium.contains("Fix that before retrying")
+        );
 
         let short = render_footer(&decision, 44);
         assert!(short.contains("4 Bash failures"));
-        assert!(!short.contains("fix before retry"));
+        assert!(!short.contains("Fix that before retrying"));
 
         let narrow = render_footer(&decision, 24);
         assert!(narrow.contains("4 Bash failures"), "{narrow}");
@@ -1298,5 +1636,36 @@ mod tests {
         let minimal = render_footer(&decision, 12);
         assert!(minimal.chars().count() <= 12);
         assert!(!minimal.contains('\n'));
+    }
+
+    #[test]
+    fn footer_uses_session_postmortem_command_for_risky_states() {
+        let mut tracker =
+            SessionDecisionTracker::for_session("session_1234_abcd", Some("repo".into()), None);
+        tracker.add_reason(cache_warning_reason(540, 25));
+
+        let decision = tracker.decision();
+        let footer = render_footer(&decision, 180);
+
+        assert!(footer.contains("cc-blackbox: Careful"));
+        assert!(footer.contains("Prompt cache is close to expiring"));
+        assert!(footer.contains("Use the cache now or restart intentionally"));
+        assert!(footer.contains("cc-blackbox postmortem session_1234_abcd"));
+    }
+
+    #[test]
+    fn footer_prefers_local_health_over_uncapped_quota_burn() {
+        let mut tracker = SessionDecisionTracker::for_session("session_test", None, None);
+        tracker.add_reason(context_reason(35.0, None));
+        if let Some(reason) = quota_reason(Some(3600), Some(107_000_000), None, None, None, None) {
+            tracker.add_reason(reason);
+        }
+
+        let decision = tracker.decision();
+        let footer = render_footer(&decision, 100);
+
+        assert_eq!(decision.state, DecisionState::Healthy);
+        assert!(footer.contains("Context is 35% full"), "{footer}");
+        assert!(!footer.contains("quota burn"), "{footer}");
     }
 }

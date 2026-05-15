@@ -280,7 +280,7 @@ fn logical_assistant_turn(
     session.assistant_turn_count
 }
 
-fn parse_epoch_secs(raw: &str) -> Option<u64> {
+pub(crate) fn parse_epoch_secs(raw: &str) -> Option<u64> {
     let raw = raw.trim();
     let without_z = raw.strip_suffix('Z').unwrap_or(raw);
     let main = without_z.split(['.', '+']).next().unwrap_or(without_z);

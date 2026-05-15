@@ -407,7 +407,7 @@ impl SessionDecisionTracker {
                 | DecisionState::Blocked
                 | DecisionState::Cooldown
         )
-        .then(|| "run stop-plan".to_string());
+        .then(|| "cc-blackbox postmortem latest".to_string());
 
         SessionDecision {
             state,
@@ -530,61 +530,6 @@ pub(crate) fn decision_from_guard_status_session(
     tracker.decision()
 }
 
-pub(crate) fn decision_from_postmortem(report: &serde_json::Value) -> SessionDecision {
-    let session_id = json_str(report, "/session_id").unwrap_or("unknown");
-    let model = json_str(report, "/summary/model").map(ToString::to_string);
-    let mut tracker = SessionDecisionTracker::for_session(session_id, None, model);
-
-    if let Some(findings) = report.get("findings").and_then(|value| value.as_array()) {
-        for finding in findings {
-            tracker.add_reason(guard_finding_reason(
-                json_str(finding, "/rule_id").unwrap_or("guard_finding"),
-                json_str(finding, "/severity").unwrap_or("warning"),
-                json_str(finding, "/action").unwrap_or("warn"),
-                json_str(finding, "/evidence_level").unwrap_or("derived"),
-                json_str(finding, "/source").unwrap_or("proxy"),
-                json_str(finding, "/detail").unwrap_or("Guard finding recorded."),
-                json_str(finding, "/suggested_action"),
-            ));
-        }
-    }
-
-    if let Some(reason) = tool_failure_reason_from_postmortem(report) {
-        tracker.add_reason(reason);
-    }
-    if let Some(reason) = diagnosis_reason_from_postmortem(report) {
-        tracker.add_reason(reason);
-    }
-    if let Some(fill) = json_f64(report, "/signals/context/max_fill_percent") {
-        tracker.add_reason(context_reason(
-            fill,
-            json_u64(report, "/signals/context/turns_to_compact").map(|value| value as u32),
-        ));
-    }
-    let rebuild_turns = json_u64(report, "/signals/cache/rebuild_turns").unwrap_or(0);
-    if should_treat_postmortem_cache_rebuild_as_risky(report, rebuild_turns) {
-        tracker.add_reason(cache_event_reason(
-            "miss_rebuild",
-            json_f64(report, "/impact/estimated_likely_wasted_cost_dollars"),
-        ));
-    } else if rebuild_turns > 0 {
-        tracker.add_reason(cache_event_reason("cold_start", None));
-    } else if let Some(ratio) = json_f64(report, "/signals/cache/cache_hit_ratio")
-        .or_else(|| json_f64(report, "/signals/cache/cache_reusable_prefix_ratio"))
-    {
-        tracker.add_reason(cache_ratio_reason(ratio));
-    }
-    if report
-        .pointer("/signals/model/fallbacks")
-        .and_then(|value| value.as_array())
-        .is_some_and(|items| !items.is_empty())
-    {
-        tracker.add_reason(model_mismatch_reason("requested model", "reported model"));
-    }
-
-    tracker.decision()
-}
-
 pub(crate) fn render_footer(decision: &SessionDecision, width: usize) -> String {
     let width = width.max(12);
     let reason = decision
@@ -618,11 +563,26 @@ pub(crate) fn render_footer(decision: &SessionDecision, width: usize) -> String 
                 "{prefix} {state} | {reason} | {secondary} | {} | {drilldown}",
                 decision.footer_action
             ));
+            candidates.push(format!(
+                "bb: {state} | {reason} | {secondary} | {} | {drilldown}",
+                decision.footer_action
+            ));
         }
         candidates.push(format!(
             "{prefix} {state} | {reason} | {} | {drilldown}",
             decision.footer_action
         ));
+        candidates.push(format!(
+            "bb: {state} | {reason} | {} | {drilldown}",
+            decision.footer_action
+        ));
+        candidates.push(format!(
+            "{state} | {reason} | {} | {drilldown}",
+            decision.footer_action
+        ));
+        candidates.push(format!("{prefix} {state} | {reason} | {drilldown}"));
+        candidates.push(format!("bb: {state} | {reason} | {drilldown}"));
+        candidates.push(format!("{state} | {reason} | {drilldown}"));
     }
     candidates.push(format!(
         "{prefix} {state} | {reason} | {}",
@@ -676,36 +636,6 @@ fn evidence_rank(evidence: &str) -> u8 {
         "heuristic" | "inferred" => 1,
         _ => 0,
     }
-}
-
-fn should_treat_postmortem_cache_rebuild_as_risky(
-    report: &serde_json::Value,
-    rebuild_turns: u64,
-) -> bool {
-    if rebuild_turns == 0 {
-        return false;
-    }
-    if rebuild_turns > 1 {
-        return true;
-    }
-    if matches!(
-        json_str(report, "/diagnosis/likely_cause"),
-        Some("cache_miss_ttl" | "cache_miss_thrash" | "repeated_cache_rebuilds")
-    ) {
-        return true;
-    }
-    report
-        .get("findings")
-        .and_then(|value| value.as_array())
-        .map(|findings| {
-            findings.iter().any(|finding| {
-                matches!(
-                    json_str(finding, "/rule_id"),
-                    Some("repeated_cache_rebuilds" | "cache_miss_ttl" | "cache_miss_thrash")
-                )
-            })
-        })
-        .unwrap_or(false)
 }
 
 fn guard_state(action: &str, severity: &str) -> DecisionState {
@@ -957,37 +887,6 @@ fn cache_event_reason(event_type: &str, cost: Option<f64>) -> DecisionReason {
     }
 }
 
-fn cache_ratio_reason(ratio: f64) -> DecisionReason {
-    if ratio >= 0.60 {
-        return DecisionReason {
-            code: "cache_ratio".to_string(),
-            label: "cache".to_string(),
-            short: "cache good".to_string(),
-            detail: format!("{:.0}% reusable prompt cache.", ratio * 100.0),
-            evidence_level: "derived".to_string(),
-            source: "proxy".to_string(),
-            evidence: "derived proxy estimate".to_string(),
-            caveat: None,
-            suggested_action: None,
-            state: DecisionState::Healthy,
-            priority: 80,
-        };
-    }
-    DecisionReason {
-        code: "cache_ratio".to_string(),
-        label: "cache".to_string(),
-        short: "cache low".to_string(),
-        detail: format!("{:.0}% reusable prompt cache.", ratio * 100.0),
-        evidence_level: "derived".to_string(),
-        source: "proxy".to_string(),
-        evidence: "derived proxy estimate".to_string(),
-        caveat: Some("Cache reuse is computed locally from proxy token buckets.".to_string()),
-        suggested_action: None,
-        state: DecisionState::Risky,
-        priority: 600,
-    }
-}
-
 fn cache_warning_reason(idle_secs: u64, ttl_secs: u64) -> DecisionReason {
     DecisionReason {
         code: "cache_warning".to_string(),
@@ -1124,95 +1023,6 @@ fn quota_reason(
     })
 }
 
-fn tool_failure_reason_from_postmortem(report: &serde_json::Value) -> Option<DecisionReason> {
-    let tools = report.pointer("/signals/tools")?.as_array()?;
-    let mut total_failures = 0u64;
-    let mut top_tool = None::<(&str, u64)>;
-    for tool in tools {
-        let failures = tool
-            .get("failures")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
-        if failures == 0 {
-            continue;
-        }
-        total_failures += failures;
-        let name = tool
-            .get("tool_name")
-            .and_then(|value| value.as_str())
-            .unwrap_or("tool");
-        if top_tool.map(|(_, count)| failures > count).unwrap_or(true) {
-            top_tool = Some((name, failures));
-        }
-    }
-    if total_failures == 0 {
-        return None;
-    }
-    let (tool, count) = top_tool.unwrap_or(("tool", total_failures));
-    let state = if total_failures >= 3 {
-        DecisionState::StopRecommended
-    } else {
-        DecisionState::Risky
-    };
-    Some(DecisionReason {
-        code: "tool_failure_streak".to_string(),
-        label: "tool failures".to_string(),
-        short: format!(
-            "{count} {tool} {}",
-            if count == 1 { "failure" } else { "failures" }
-        ),
-        detail: format!(
-            "{} total tool failures; most visible failing tool: {tool} ({count}).",
-            total_failures
-        ),
-        evidence_level: "direct".to_string(),
-        source: "proxy".to_string(),
-        evidence: "direct proxy".to_string(),
-        caveat: None,
-        suggested_action: None,
-        state,
-        priority: 930,
-    })
-}
-
-fn diagnosis_reason_from_postmortem(report: &serde_json::Value) -> Option<DecisionReason> {
-    let cause = json_str(report, "/diagnosis/likely_cause")?;
-    if cause == "none" || cause.trim().is_empty() {
-        return None;
-    }
-    let is_heuristic = json_bool(report, "/diagnosis/likely_cause_is_heuristic").unwrap_or(false);
-    let detail = json_str(report, "/diagnosis/detail").unwrap_or(cause);
-    let state = match cause {
-        "tool_failure_streak" => DecisionState::StopRecommended,
-        "compaction_suspected" | "near_compaction" | "context_bloat" => {
-            if json_f64(report, "/signals/context/max_fill_percent").unwrap_or(0.0) >= 80.0 {
-                DecisionState::StopRecommended
-            } else {
-                DecisionState::Risky
-            }
-        }
-        "cache_miss_ttl" | "cache_miss_thrash" | "api_error" | "model_fallback" => {
-            DecisionState::Risky
-        }
-        _ => DecisionState::Risky,
-    };
-    let evidence_level = if is_heuristic { "heuristic" } else { "derived" };
-    Some(DecisionReason {
-        code: cause.to_string(),
-        label: rule_label(cause),
-        short: guard_short_reason(cause, detail),
-        detail: detail.to_string(),
-        evidence_level: evidence_level.to_string(),
-        source: "postmortem".to_string(),
-        evidence: evidence_display(evidence_level, "postmortem"),
-        caveat: is_heuristic
-            .then(|| "Likely cause is heuristic in the postmortem JSON.".to_string()),
-        suggested_action: None,
-        state,
-        priority: 500,
-    })
-}
-
 fn best_action_for_reason(reason: &DecisionReason) -> String {
     if let Some(action) = reason
         .suggested_action
@@ -1254,7 +1064,9 @@ fn best_action_for_reason(reason: &DecisionReason) -> String {
         "request_error" | "api_error" => {
             "Check API status or credentials before retrying repeatedly.".to_string()
         }
-        "postmortem_ready" => "Run stop-plan or postmortem before continuing broadly.".to_string(),
+        "postmortem_ready" => {
+            "Run cc-blackbox postmortem latest before continuing broadly.".to_string()
+        }
         _ => match reason.state {
             DecisionState::Healthy => "Continue normally.".to_string(),
             DecisionState::Watching => "Keep watching.".to_string(),
@@ -1313,7 +1125,7 @@ fn alternatives_for_state(state: DecisionState) -> Vec<String> {
         DecisionState::Watching => vec!["Wait for the first proxied Claude request.".to_string()],
         DecisionState::Risky => vec![
             "Continue with a narrow prompt.".to_string(),
-            "Run cc-blackbox stop-plan latest before a broad prompt.".to_string(),
+            "Run cc-blackbox postmortem latest before a broad prompt.".to_string(),
         ],
         DecisionState::StopRecommended => vec![
             "Restart from a short summary after fixing the precondition.".to_string(),
@@ -1462,13 +1274,18 @@ mod tests {
         assert!(wide.contains("cc-blackbox: Stop"));
         assert!(wide.contains("4 Bash failures"));
         assert!(wide.contains("context 87%"));
-        assert!(wide.contains("run stop-plan"));
+        assert!(wide.contains("cc-blackbox postmortem latest"));
         assert!(!wide.contains('\n'));
+
+        let common_terminal = render_footer(&decision, 80);
+        assert!(common_terminal.contains("4 Bash failures"));
+        assert!(common_terminal.contains("cc-blackbox postmortem latest"));
+        assert!(!common_terminal.contains('\n'));
 
         let medium = render_footer(&decision, 60);
         assert!(medium.contains("4 Bash failures"));
-        assert!(medium.contains("fix before retry"));
-        assert!(!medium.contains("run stop-plan"));
+        assert!(medium.contains("cc-blackbox postmortem latest"));
+        assert!(!medium.contains("fix before retry"));
 
         let short = render_footer(&decision, 44);
         assert!(short.contains("4 Bash failures"));
@@ -1481,95 +1298,5 @@ mod tests {
         let minimal = render_footer(&decision, 12);
         assert!(minimal.chars().count() <= 12);
         assert!(!minimal.contains('\n'));
-    }
-
-    #[test]
-    fn harmless_first_turn_cache_rebuild_does_not_make_postmortem_risky() {
-        let report = serde_json::json!({
-            "session_id": "session_cache_cold",
-            "summary": {
-                "model": "claude-sonnet",
-                "total_turns": 1,
-                "total_tokens": 12000,
-                "outcome": "Completed"
-            },
-            "diagnosis": {
-                "likely_cause": "none",
-                "likely_cause_is_heuristic": false
-            },
-            "impact": {
-                "estimated_likely_wasted_cost_dollars": 0.0
-            },
-            "signals": {
-                "cache": { "cache_hit_ratio": 0.0, "rebuild_turns": 1 },
-                "context": { "max_fill_percent": 20.0, "turns_to_compact": 10 },
-                "tools": [],
-                "model": { "fallbacks": [] }
-            },
-            "findings": []
-        });
-
-        let decision = decision_from_postmortem(&report);
-
-        assert_eq!(decision.state, DecisionState::Healthy);
-        assert_eq!(
-            decision
-                .main_reason
-                .as_ref()
-                .map(|reason| reason.code.as_str()),
-            Some("cache_event")
-        );
-        assert_eq!(
-            decision
-                .main_reason
-                .as_ref()
-                .map(|reason| reason.short.as_str()),
-            Some("cache cold")
-        );
-    }
-
-    #[test]
-    fn cache_rebuild_with_cache_diagnosis_remains_risky_and_labeled_heuristic() {
-        let report = serde_json::json!({
-            "session_id": "session_cache_risky",
-            "summary": {
-                "model": "claude-sonnet",
-                "total_turns": 3,
-                "total_tokens": 12000,
-                "outcome": "Likely Partially Completed"
-            },
-            "diagnosis": {
-                "likely_cause": "cache_miss_ttl",
-                "likely_cause_is_heuristic": true,
-                "detail": "Cache TTL miss was inferred locally."
-            },
-            "impact": {
-                "estimated_likely_wasted_cost_dollars": 0.24
-            },
-            "signals": {
-                "cache": { "cache_hit_ratio": 0.10, "rebuild_turns": 1 },
-                "context": { "max_fill_percent": 20.0, "turns_to_compact": 10 },
-                "tools": [],
-                "model": { "fallbacks": [] }
-            },
-            "findings": []
-        });
-
-        let decision = decision_from_postmortem(&report);
-
-        assert_eq!(decision.state, DecisionState::Risky);
-        let cache_reason = decision
-            .reasons
-            .iter()
-            .find(|reason| reason.code == "cache_event")
-            .expect("cache reason");
-        assert_eq!(cache_reason.short, "cache rebuild");
-        assert_eq!(cache_reason.label, "cache rebuild");
-        assert!(cache_reason.detail.contains("rebuild $0.24"));
-        assert!(decision.reasons.iter().any(|reason| reason
-            .caveat
-            .as_deref()
-            .unwrap_or("")
-            .contains("heuristic")));
     }
 }

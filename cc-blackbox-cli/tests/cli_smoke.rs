@@ -1,5 +1,7 @@
+use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::mpsc;
 use std::thread;
@@ -91,6 +93,38 @@ fn captured_request(rx: mpsc::Receiver<String>) -> String {
         .expect("captured HTTP request")
 }
 
+fn unique_test_dir(name: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "cc-blackbox-cli-smoke-{name}-{}-{nanos}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+fn fake_claude_on_path(script_body: &str) -> (PathBuf, String) {
+    let dir = unique_test_dir("fake-claude");
+    let executable = dir.join("claude");
+    fs::write(&executable, format!("#!/bin/sh\n{script_body}")).expect("write fake claude");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&executable).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).expect("chmod fake claude");
+    }
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    (dir, path)
+}
+
 #[test]
 fn top_level_help_exposes_user_workflows() {
     let output = cc_blackbox(&["--help"]);
@@ -103,7 +137,8 @@ fn top_level_help_exposes_user_workflows() {
     assert!(out.contains("run"));
     assert!(out.contains("watch"));
     assert!(out.contains("sessions"));
-    assert!(out.contains("stop-plan"));
+    assert!(out.contains("postmortem"));
+    assert!(!out.contains("stop-plan"));
     assert!(out.contains("recall"));
     assert!(!out.contains("reconcile"));
 }
@@ -114,11 +149,11 @@ fn run_help_documents_watch_and_trailing_child_command() {
 
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
     let out = stdout(&output);
-    assert!(out.contains("Run a command through the local cc-blackbox proxy"));
+    assert!(out.contains("Run Claude Code through the local cc-blackbox proxy"));
     assert!(out.contains("--watch"));
     assert!(out.contains("--live"));
     assert!(out.contains("--no-live"));
-    assert!(out.contains("Command and arguments to run"));
+    assert!(out.contains("Claude command and arguments to run"));
 }
 
 #[test]
@@ -130,19 +165,36 @@ fn run_command_requires_child_command() {
 }
 
 #[test]
+fn run_command_rejects_non_claude_before_core_health_check() {
+    let output = cc_blackbox_with_env(
+        &["run", "/bin/sh", "-c", "exit 0"],
+        &[("CC_BLACKBOX_CORE_HEALTH_URL", "http://127.0.0.1:9/health")],
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    let err = stderr(&output);
+    assert!(err.contains("cc-blackbox run only supports Claude Code"));
+    assert!(!err.contains("Connection refused"), "{err}");
+}
+
+#[test]
 fn run_command_uses_proxy_env_after_core_health_check() {
     let (url, request_rx) = serve_json_once(r#"{"ok":true}"#);
     let health_url = format!("{url}/health");
+    let (fake_dir, path) = fake_claude_on_path("printf '%s' \"$ANTHROPIC_BASE_URL\"\nexit 7\n");
+    let home = unique_test_dir("home");
+    let home_path = home.to_string_lossy().to_string();
 
     let output = cc_blackbox_with_env(
+        &["run", "claude"],
         &[
-            "run",
-            "/bin/sh",
-            "-c",
-            "printf '%s' \"$ANTHROPIC_BASE_URL\"; exit 7",
+            ("CC_BLACKBOX_CORE_HEALTH_URL", &health_url),
+            ("PATH", &path),
+            ("HOME", &home_path),
         ],
-        &[("CC_BLACKBOX_CORE_HEALTH_URL", &health_url)],
     );
+    let _ = fs::remove_dir_all(fake_dir);
+    let _ = fs::remove_dir_all(home);
 
     assert_eq!(
         output.status.code(),
@@ -332,67 +384,4 @@ fn reconcile_command_reports_api_errors() {
         "unexpected request:\n{request}"
     );
     assert!(stderr(&output).contains("Error: HTTP 404"));
-}
-
-#[test]
-fn stop_plan_command_renders_operational_sections() {
-    let (url, request_rx) = serve_json_once(
-        r#"{
-          "session_id": "session_stop",
-          "redacted": true,
-          "partial": false,
-          "summary": {
-            "duration_secs": 300,
-            "model": "claude-sonnet",
-            "outcome": "Likely Partially Completed",
-            "total_turns": 4,
-            "total_tokens": 123456
-          },
-          "diagnosis": {
-            "likely_cause": "tool_failure_streak",
-            "likely_cause_is_heuristic": false,
-            "detail": "Bash failed repeatedly.",
-            "next_action": "Fix the failing command, then restart."
-          },
-          "impact": {
-            "estimated_likely_wasted_cost_dollars": 0.12
-          },
-          "signals": {
-            "cache": { "cache_hit_ratio": 0.75, "rebuild_turns": 0 },
-            "context": { "max_fill_percent": 82.0, "turns_to_compact": 1 },
-            "tools": [
-              { "tool_name": "Bash", "calls": 5, "failures": 3 }
-            ],
-            "model": { "fallbacks": [] }
-          },
-          "findings": [],
-          "evidence": [
-            { "type": "direct", "label": "tools", "detail": "3 tool failures", "turn": 2 }
-          ],
-          "recommendations": ["Fix the failing command, then restart."]
-        }"#,
-    );
-
-    let output = cc_blackbox(&["stop-plan", "--url", &url, "latest"]);
-
-    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
-    let request = captured_request(request_rx);
-    assert!(
-        request.starts_with("GET /api/postmortem/last?"),
-        "unexpected request:\n{request}"
-    );
-    assert!(request.contains("redact=true"));
-    let out = stdout(&output);
-    for heading in [
-        "Decision",
-        "Why",
-        "What failed",
-        "Fix before restart",
-        "Restart prompt",
-        "Commands/tests first",
-        "Alternatives",
-    ] {
-        assert!(out.contains(heading), "missing {heading} in:\n{out}");
-    }
-    assert!(out.contains("Stop: 3 Bash failures"));
 }

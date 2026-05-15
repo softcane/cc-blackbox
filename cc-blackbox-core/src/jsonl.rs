@@ -14,6 +14,20 @@ pub struct JsonlUsageTotals {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JsonlRequestSummary {
+    pub turn_number: u64,
+    pub timestamp_epoch_secs: u64,
+    pub request_id: Option<String>,
+    pub usage: JsonlUsageTotals,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JsonlSystemEventSummary {
+    pub timestamp_epoch_secs: u64,
+    pub category: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JsonlDerivedSession {
     pub jsonl_session_id: String,
     pub cwd: String,
@@ -33,6 +47,8 @@ pub struct JsonlDerivedSession {
     pub file_operation_categories: BTreeMap<String, u64>,
     pub usage: JsonlUsageTotals,
     pub system_event_categories: BTreeMap<String, u64>,
+    pub requests: Vec<JsonlRequestSummary>,
+    pub system_events: Vec<JsonlSystemEventSummary>,
 }
 
 impl JsonlDerivedSession {
@@ -90,6 +106,8 @@ pub fn parse_jsonl_str(raw: &str, source_id: &str) -> Option<JsonlDerivedSession
     };
     let mut tool_ids = BTreeMap::<String, String>::new();
     let mut assistant_request_turns = BTreeMap::<String, u64>::new();
+    let mut usage_recorded_request_ids = BTreeSet::<String>::new();
+    let mut usage_recorded_turns = BTreeSet::<u64>::new();
     let mut current_assistant_turn = 0u64;
 
     for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -98,16 +116,20 @@ pub fn parse_jsonl_str(raw: &str, source_id: &str) -> Option<JsonlDerivedSession
             Err(_) => return None,
         };
 
-        if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
-            if let Some(epoch) = parse_epoch_secs(timestamp) {
-                if session.started_at_epoch_secs == 0 || epoch < session.started_at_epoch_secs {
-                    session.started_at_epoch_secs = epoch;
-                }
-                if epoch > session.last_activity_at_epoch_secs {
-                    session.last_activity_at_epoch_secs = epoch;
-                }
-            }
-        }
+        let timestamp_epoch_secs =
+            value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(|timestamp| {
+                    let epoch = parse_epoch_secs(timestamp)?;
+                    if session.started_at_epoch_secs == 0 || epoch < session.started_at_epoch_secs {
+                        session.started_at_epoch_secs = epoch;
+                    }
+                    if epoch > session.last_activity_at_epoch_secs {
+                        session.last_activity_at_epoch_secs = epoch;
+                    }
+                    Some(epoch)
+                });
         if session.cwd.is_empty() {
             if let Some(cwd) = value.get("cwd").and_then(Value::as_str) {
                 session.cwd = normalize_cwd(cwd);
@@ -127,6 +149,13 @@ pub fn parse_jsonl_str(raw: &str, source_id: &str) -> Option<JsonlDerivedSession
         if top_type == Some("system") {
             let category = system_event_category(&value);
             *session.system_event_categories.entry(category).or_insert(0) += 1;
+            if let Some(epoch) = timestamp_epoch_secs {
+                let category = system_event_category(&value);
+                session.system_events.push(JsonlSystemEventSummary {
+                    timestamp_epoch_secs: epoch,
+                    category,
+                });
+            }
             continue;
         }
 
@@ -157,7 +186,15 @@ pub fn parse_jsonl_str(raw: &str, source_id: &str) -> Option<JsonlDerivedSession
             "assistant" => {
                 current_assistant_turn =
                     logical_assistant_turn(&value, &mut assistant_request_turns, &mut session);
-                collect_usage(message.get("usage"), &mut session.usage);
+                record_usage_once(
+                    &value,
+                    message.get("usage"),
+                    current_assistant_turn,
+                    timestamp_epoch_secs,
+                    &mut usage_recorded_request_ids,
+                    &mut usage_recorded_turns,
+                    &mut session,
+                );
                 collect_tool_uses(
                     message.get("content"),
                     current_assistant_turn,
@@ -169,7 +206,15 @@ pub fn parse_jsonl_str(raw: &str, source_id: &str) -> Option<JsonlDerivedSession
                 if top_type == Some("assistant") {
                     current_assistant_turn =
                         logical_assistant_turn(&value, &mut assistant_request_turns, &mut session);
-                    collect_usage(message.get("usage"), &mut session.usage);
+                    record_usage_once(
+                        &value,
+                        message.get("usage"),
+                        current_assistant_turn,
+                        timestamp_epoch_secs,
+                        &mut usage_recorded_request_ids,
+                        &mut usage_recorded_turns,
+                        &mut session,
+                    );
                     collect_tool_uses(
                         message.get("content"),
                         current_assistant_turn,
@@ -192,6 +237,13 @@ pub fn parse_jsonl_str(raw: &str, source_id: &str) -> Option<JsonlDerivedSession
     } else {
         Some(session)
     }
+}
+
+fn add_usage_totals(totals: &mut JsonlUsageTotals, usage: &JsonlUsageTotals) {
+    totals.input_tokens += usage.input_tokens;
+    totals.output_tokens += usage.output_tokens;
+    totals.cache_read_tokens += usage.cache_read_tokens;
+    totals.cache_creation_tokens += usage.cache_creation_tokens;
 }
 
 fn normalize_cwd(raw: &str) -> String {
@@ -296,26 +348,65 @@ fn add_count(map: &mut BTreeMap<String, u64>, key: impl Into<String>) {
     *map.entry(key.into()).or_insert(0) += 1;
 }
 
-fn collect_usage(usage: Option<&Value>, totals: &mut JsonlUsageTotals) {
-    let Some(usage) = usage else {
+fn usage_totals_from_json(usage: Option<&Value>) -> Option<JsonlUsageTotals> {
+    let usage = usage?;
+    let totals = JsonlUsageTotals {
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_read_tokens: usage
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_creation_tokens: usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    };
+    (totals.input_tokens
+        + totals.output_tokens
+        + totals.cache_read_tokens
+        + totals.cache_creation_tokens
+        > 0)
+    .then_some(totals)
+}
+
+fn record_usage_once(
+    value: &Value,
+    usage: Option<&Value>,
+    turn: u64,
+    timestamp_epoch_secs: Option<u64>,
+    usage_recorded_request_ids: &mut BTreeSet<String>,
+    usage_recorded_turns: &mut BTreeSet<u64>,
+    session: &mut JsonlDerivedSession,
+) {
+    let Some(usage) = usage_totals_from_json(usage) else {
         return;
     };
-    totals.input_tokens += usage
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    totals.output_tokens += usage
-        .get("output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    totals.cache_read_tokens += usage
-        .get("cache_read_input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    totals.cache_creation_tokens += usage
-        .get("cache_creation_input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let request_id = value
+        .get("requestId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let should_record = match request_id.as_ref() {
+        Some(id) => usage_recorded_request_ids.insert(id.clone()),
+        None => usage_recorded_turns.insert(turn),
+    };
+    if !should_record {
+        return;
+    }
+
+    add_usage_totals(&mut session.usage, &usage);
+    session.requests.push(JsonlRequestSummary {
+        turn_number: turn,
+        timestamp_epoch_secs: timestamp_epoch_secs.unwrap_or(0),
+        request_id,
+        usage,
+    });
 }
 
 fn collect_tool_uses(
@@ -331,10 +422,13 @@ fn collect_tool_uses(
         let Some(name) = block.get("name").and_then(Value::as_str) else {
             continue;
         };
-        add_count(&mut session.tool_calls, name);
         if let Some(id) = block.get("id").and_then(Value::as_str) {
+            if tool_ids.contains_key(id) {
+                continue;
+            }
             tool_ids.insert(id.to_string(), name.to_string());
         }
+        add_count(&mut session.tool_calls, name);
         if let Some(mcp) = mcp_tool_name(name) {
             session.mcp_tool_names.insert(mcp);
         }
@@ -552,5 +646,30 @@ this is not json
             parsed.prompt_correlation_hash,
             crate::correlation::prompt_correlation_hash("Read-only architecture audit")
         );
+    }
+
+    #[test]
+    fn parser_counts_repeated_request_usage_once_and_tracks_compaction() {
+        let raw = r#"
+{"type":"user","sessionId":"jsonl-streaming","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"Continue the work"}}
+{"type":"assistant","sessionId":"jsonl-streaming","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:01Z","requestId":"req_1","message":{"role":"assistant","content":[{"type":"thinking","thinking":"plan"}],"usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":30,"output_tokens":40}}}
+{"type":"assistant","sessionId":"jsonl-streaming","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:02Z","requestId":"req_1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test"}}],"usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":30,"output_tokens":40}}}
+{"type":"assistant","sessionId":"jsonl-streaming","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:03Z","requestId":"req_1","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test"}}],"usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":30,"output_tokens":40}}}
+{"type":"system","sessionId":"jsonl-streaming","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:04Z","subtype":"compact_boundary"}
+"#;
+
+        let parsed = parse_jsonl_str(raw, "streaming.jsonl").expect("parsed jsonl");
+
+        assert_eq!(parsed.assistant_turn_count, 1);
+        assert_eq!(parsed.request_count, 1);
+        assert_eq!(parsed.requests.len(), 1);
+        assert_eq!(parsed.usage.input_tokens, 10);
+        assert_eq!(parsed.usage.cache_read_tokens, 20);
+        assert_eq!(parsed.usage.cache_creation_tokens, 30);
+        assert_eq!(parsed.usage.output_tokens, 40);
+        assert_eq!(parsed.tool_calls.get("Bash"), Some(&1));
+        assert_eq!(parsed.system_event_categories.get("compaction"), Some(&1));
+        assert_eq!(parsed.system_events.len(), 1);
+        assert_eq!(parsed.system_events[0].category, "compaction");
     }
 }

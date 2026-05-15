@@ -193,6 +193,43 @@ fn http_get_stream_until(addr: &str, path: &str, expected: &str) -> Result<Strin
     ))
 }
 
+fn http_get_stream_for(addr: &str, path: &str, duration: Duration) -> Result<String, String> {
+    let mut stream = TcpStream::connect(addr).map_err(|err| err.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .map_err(|err| err.to_string())?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| err.to_string())?;
+
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n"
+    )
+    .map_err(|err| err.to_string())?;
+
+    let deadline = Instant::now() + duration;
+    let mut response = Vec::new();
+    let mut buffer = [0u8; 1024];
+    while Instant::now() < deadline {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buffer[..n]),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+
+    Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
 fn parse_http_response(response: &str) -> Result<(u16, String), String> {
     let status = response
         .lines()
@@ -564,6 +601,65 @@ fn core_billing_reconciliation_api_validates_and_persists_payloads() {
 }
 
 #[test]
+fn core_finalize_sessions_api_is_process_visible_and_idempotent() {
+    let _guard = CORE_PROCESS_TEST_LOCK
+        .lock()
+        .expect("lock core process test");
+    let http_addr = unused_loopback_addr();
+    let grpc_addr = unused_loopback_addr();
+    let db_path = unique_db_path();
+    let mut core = start_core(&http_addr, &grpc_addr, &db_path);
+    wait_for_health(&mut core, &http_addr);
+
+    let conn = open_db_after_schema_ready(&db_path);
+    conn.execute(
+        "INSERT INTO sessions (session_id, started_at, ended_at, model, initial_prompt)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            "session_http_finalized",
+            "2999-01-01T00:00:00Z",
+            "2999-01-01T00:05:00Z",
+            "claude-sonnet",
+            "already done"
+        ],
+    )
+    .expect("insert finalized session");
+
+    let (status, body) = http_post_json(
+        &http_addr,
+        "/api/sessions/finalize",
+        r#"{
+          "session_ids": ["session_http_finalized", "session_http_missing"],
+          "reason": "child_exit",
+          "child_exit_code": 0
+        }"#,
+    )
+    .expect("POST finalize sessions");
+    assert_eq!(status, 200, "body: {body}");
+    let body: Value = serde_json::from_str(&body).expect("finalize JSON");
+    assert_eq!(body["reason"], "child_exit");
+    assert_eq!(body["results"][0]["session_id"], "session_http_finalized");
+    assert_eq!(body["results"][0]["outcome"], "already_finalized");
+    assert_eq!(body["results"][1]["session_id"], "session_http_missing");
+    assert_eq!(body["results"][1]["outcome"], "not_found");
+
+    let (status, body) = http_post_json(
+        &http_addr,
+        "/api/sessions/finalize",
+        r#"{"session_ids":[],"reason":"child_exit"}"#,
+    )
+    .expect("POST invalid finalize sessions");
+    assert_eq!(status, 400);
+    assert!(body.contains("session_ids must not be empty"));
+
+    drop(conn);
+    drop(core);
+    let _ = fs::remove_file(&db_path);
+    let _ = fs::remove_file(format!("{}-wal", db_path.display()));
+    let _ = fs::remove_file(format!("{}-shm", db_path.display()));
+}
+
+#[test]
 fn core_watch_replays_hook_events_for_late_subscribers() {
     let _guard = CORE_PROCESS_TEST_LOCK
         .lock()
@@ -599,6 +695,54 @@ fn core_watch_replays_hook_events_for_late_subscribers() {
     assert!(stream.contains(r#""type":"skill_event""#));
     assert!(stream.contains(r#""event_type":"fired""#));
     assert!(stream.contains(r#""source":"hook""#));
+
+    drop(core);
+    let _ = fs::remove_file(&db_path);
+    let _ = fs::remove_file(format!("{}-wal", db_path.display()));
+    let _ = fs::remove_file(format!("{}-shm", db_path.display()));
+}
+
+#[test]
+fn core_watch_replay_false_suppresses_history_for_run_owned_watchers() {
+    let _guard = CORE_PROCESS_TEST_LOCK
+        .lock()
+        .expect("lock core process test");
+    let http_addr = unused_loopback_addr();
+    let grpc_addr = unused_loopback_addr();
+    let db_path = unique_db_path();
+    let mut core = start_core(&http_addr, &grpc_addr, &db_path);
+    wait_for_health(&mut core, &http_addr);
+
+    let (status, body) = http_post_json(
+        &http_addr,
+        "/api/hooks/claude-code",
+        r#"{
+          "session_id": "session_watch_no_replay",
+          "hook_event_name": "PreToolUse",
+          "tool_name": "Skill",
+          "tool_input": {
+            "skill_name": "tdd",
+            "prompt": "write one failing test"
+          }
+        }"#,
+    )
+    .expect("POST hook event");
+    assert_eq!(status, 204, "body: {body}");
+
+    let stream = http_get_stream_for(
+        &http_addr,
+        "/watch?session=session_watch_no_replay&replay=false",
+        Duration::from_millis(250),
+    )
+    .expect("watch stream with replay disabled");
+    assert!(
+        stream.starts_with("HTTP/1.1 200 OK"),
+        "unexpected stream response:\n{stream}"
+    );
+    assert!(
+        !stream.contains(r#""type":"skill_event""#),
+        "replay=false should suppress prior history:\n{stream}"
+    );
 
     drop(core);
     let _ = fs::remove_file(&db_path);

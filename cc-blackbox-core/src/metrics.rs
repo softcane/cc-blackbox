@@ -34,6 +34,33 @@ pub const HISTORY_CAUSE_TYPES: [&str; 8] = [
     "tool_failure_streak",
     "compaction_suspected",
 ];
+const GUARD_RULE_IDS: [&str; 13] = [
+    "per_session_token_budget_exceeded",
+    "per_session_trusted_dollar_budget_exceeded",
+    "api_error_circuit_breaker_cooldown",
+    "repeated_cache_rebuilds",
+    "context_near_warning_threshold",
+    "model_mismatch",
+    "suspected_compaction_loop",
+    "tool_failure_streak",
+    "high_weekly_project_quota_burn",
+    "no_progress_turns",
+    "jsonl_only_tool_failure_streak",
+    "ambiguous_cache_ttl_miss",
+    "task_abandonment_inference",
+];
+const GUARD_SEVERITIES: [&str; 3] = ["info", "warning", "critical"];
+const GUARD_ACTIONS: [&str; 6] = [
+    "allow",
+    "diagnose_only",
+    "warn",
+    "critical",
+    "block",
+    "cooldown",
+];
+const GUARD_SOURCES: [&str; 4] = ["proxy", "jsonl", "heuristic", "policy"];
+const FINALIZATION_REASONS: [&str; 4] = ["child_exit", "budget_block", "timeout", "explicit_api"];
+const FINALIZATION_OUTCOMES: [&str; 4] = ["finalized", "already_finalized", "not_found", "failed"];
 
 #[derive(Clone, Debug, Default)]
 pub struct HistoricalWindowMetrics {
@@ -71,6 +98,9 @@ pub struct CcBlackboxMetrics {
     mcp_server_failures_total: IntCounterVec,
     mcp_events_total: IntCounterVec,
     skill_events_total: IntCounterVec,
+    guard_findings_total: IntCounterVec,
+    guard_blocks_total: IntCounterVec,
+    session_finalizations_total: IntCounterVec,
     active_sessions: IntGauge,
     weekly_tokens_used: IntGauge,
     weekly_tokens_remaining: IntGauge,
@@ -237,6 +267,30 @@ impl CcBlackboxMetrics {
                 &["skill", "event_type", "source"]
             )
             .expect("register cc_blackbox_skill_events_total"),
+            guard_findings_total: register_int_counter_vec!(
+                opts!(
+                    "cc_blackbox_guard_findings_total",
+                    "Guard findings emitted by rule, severity, action, and source."
+                ),
+                &["rule_id", "severity", "action", "source"]
+            )
+            .expect("register cc_blackbox_guard_findings_total"),
+            guard_blocks_total: register_int_counter_vec!(
+                opts!(
+                    "cc_blackbox_guard_blocks_total",
+                    "Guard request blocks emitted by rule."
+                ),
+                &["rule_id"]
+            )
+            .expect("register cc_blackbox_guard_blocks_total"),
+            session_finalizations_total: register_int_counter_vec!(
+                opts!(
+                    "cc_blackbox_session_finalizations_total",
+                    "Session finalization attempts by reason and outcome."
+                ),
+                &["reason", "outcome"]
+            )
+            .expect("register cc_blackbox_session_finalizations_total"),
             active_sessions: register_int_gauge!(
                 "cc_blackbox_active_sessions",
                 "Tracked active sessions currently in memory."
@@ -426,6 +480,25 @@ pub fn init() {
     for event_type in LIVE_SKILL_EVENT_TYPES {
         for source in LIVE_SKILL_EVENT_SOURCES {
             ensure_skill_metric_labels("unknown", event_type, source);
+        }
+    }
+    for rule_id in GUARD_RULE_IDS {
+        METRICS.guard_blocks_total.with_label_values(&[rule_id]);
+        for severity in GUARD_SEVERITIES {
+            for action in GUARD_ACTIONS {
+                for source in GUARD_SOURCES {
+                    METRICS
+                        .guard_findings_total
+                        .with_label_values(&[rule_id, severity, action, source]);
+                }
+            }
+        }
+    }
+    for reason in FINALIZATION_REASONS {
+        for outcome in FINALIZATION_OUTCOMES {
+            METRICS
+                .session_finalizations_total
+                .with_label_values(&[reason, outcome]);
         }
     }
 }
@@ -646,6 +719,35 @@ pub fn ensure_mcp_event_metric_labels(server: &str, tool: &str, event_type: &str
         event_type,
         source,
     ]);
+}
+
+pub fn record_guard_finding(rule_id: &str, severity: &str, action: &str, source: &str) {
+    METRICS
+        .guard_findings_total
+        .with_label_values(&[
+            normalize_guard_rule_id(rule_id),
+            normalize_guard_severity(severity),
+            normalize_guard_action(action),
+            normalize_guard_source(source),
+        ])
+        .inc();
+}
+
+pub fn record_guard_block(rule_id: &str) {
+    METRICS
+        .guard_blocks_total
+        .with_label_values(&[normalize_guard_rule_id(rule_id)])
+        .inc();
+}
+
+pub fn record_session_finalization(reason: &str, outcome: &str) {
+    METRICS
+        .session_finalizations_total
+        .with_label_values(&[
+            normalize_finalization_reason(reason),
+            normalize_finalization_outcome(outcome),
+        ])
+        .inc();
 }
 
 pub fn set_active_sessions(count: usize) {
@@ -924,6 +1026,65 @@ fn normalize_mcp_event_source(source: &str) -> &'static str {
     match source {
         "hook" => "hook",
         "proxy" => "proxy",
+        _ => "other",
+    }
+}
+
+fn normalize_guard_rule_id(rule_id: &str) -> &'static str {
+    GUARD_RULE_IDS
+        .iter()
+        .copied()
+        .find(|known| *known == rule_id)
+        .unwrap_or("other")
+}
+
+fn normalize_guard_severity(severity: &str) -> &'static str {
+    match severity {
+        "info" => "info",
+        "warning" => "warning",
+        "critical" => "critical",
+        _ => "other",
+    }
+}
+
+fn normalize_guard_action(action: &str) -> &'static str {
+    match action {
+        "allow" => "allow",
+        "diagnose_only" => "diagnose_only",
+        "warn" => "warn",
+        "critical" => "critical",
+        "block" => "block",
+        "cooldown" => "cooldown",
+        _ => "other",
+    }
+}
+
+fn normalize_guard_source(source: &str) -> &'static str {
+    match source {
+        "proxy" => "proxy",
+        "jsonl" => "jsonl",
+        "heuristic" => "heuristic",
+        "policy" => "policy",
+        _ => "other",
+    }
+}
+
+fn normalize_finalization_reason(reason: &str) -> &'static str {
+    match reason {
+        "child_exit" => "child_exit",
+        "budget_block" => "budget_block",
+        "timeout" => "timeout",
+        "explicit_api" => "explicit_api",
+        _ => "other",
+    }
+}
+
+fn normalize_finalization_outcome(outcome: &str) -> &'static str {
+    match outcome {
+        "finalized" => "finalized",
+        "already_finalized" => "already_finalized",
+        "not_found" => "not_found",
+        "failed" => "failed",
         _ => "other",
     }
 }

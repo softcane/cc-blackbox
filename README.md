@@ -1,8 +1,10 @@
 # cc-blackbox
 
-Claude Code can look busy after the useful work has already stopped.
+Claude Code can look busy even when the useful work has already stopped.
 
-cc-blackbox helps you stop bad Claude Code runs before they eat the afternoon. It watches a run locally, warns when continuing looks expensive or pointless, and gives you a postmortem plus restart prompt when you stop.
+cc-blackbox adds a one-line footer to Claude Code. It tells you whether the current session looks healthy, needs care, should stop, is blocked, is cooling down, or has ended.
+
+When the footer says the run needs a closer look, use `cc-blackbox postmortem latest`. The footer gives you the short answer. The postmortem gives you the evidence and a restart prompt.
 
 ## Start Here
 
@@ -18,26 +20,31 @@ Run Claude Code through cc-blackbox:
 cc-blackbox run claude
 ```
 
-While Claude is running, watch live warnings in another terminal when you want them:
+While Claude is running, read the footer at the bottom of Claude Code. It updates as cc-blackbox sees traffic, failed tools, cache behavior, context pressure, API errors, and policy blocks.
 
-```bash
-cc-blackbox guard watch
-```
-
-After Claude finishes, or after you interrupt a run that feels stuck, read the latest postmortem:
+When the footer says to review the run, or after you stop a session that felt stuck, read the latest postmortem:
 
 ```bash
 cc-blackbox postmortem latest
 ```
 
-`cc-blackbox run claude` starts the local guard stack if needed, then launches Claude Code with cc-blackbox enabled. `guard watch` is live. `postmortem latest` is after the run.
+`cc-blackbox run claude` starts the local stack if needed, then launches Claude Code through the local proxy. It also installs the cc-blackbox footer when Claude does not already have a custom status line.
+
+If you want a separate terminal view, run:
+
+```bash
+cc-blackbox guard watch
+```
+
+That is optional. The footer is the normal live view.
 
 ## What It Does
 
-- **Tells you when to stop:** live warnings when a session is becoming a bad bet.
-- **Shows what failed:** failed tools, bad infrastructure assumptions, cache churn, context pressure, API errors, and model route mismatch.
-- **Explains the waste:** token totals, cache behavior, estimated spend, and likely wasted work.
-- **Helps you restart cleanly:** a compact restart prompt for the next Claude Code session.
+- **Shows the live state:** healthy, careful, stop, blocked, cooldown, or ended.
+- **Tells you the main reason:** cache rebuilds, context pressure, failed tools, API errors, budget limits, or model route mismatch.
+- **Gives the next move:** continue, narrow the next prompt, stop and fix something, wait, or open the postmortem.
+- **Explains bad runs:** token totals, cache behavior, estimated spend, failed tools, and likely wasted work.
+- **Helps you restart:** a compact restart prompt for the next Claude Code session.
 - **Stays local:** derived metadata stays on your machine.
 
 cc-blackbox runs locally. Claude Code traffic still goes to Anthropic. cc-blackbox stores derived metadata, not raw full transcripts or file contents. Optional postmortem analysis sends only redacted evidence to Claude, and you can turn that off.
@@ -46,7 +53,7 @@ cc-blackbox runs locally. Claude Code traffic still goes to Anthropic. cc-blackb
 
 - Claude keeps retrying broken commands.
 - Claude burns tokens near compaction.
-- Claude looks busy but never reaches a decision.
+- Claude looks busy but never reaches a clear answer.
 - Claude validates against missing local state, fake infrastructure, or the wrong environment.
 - You want a restart prompt instead of continuing a bloated session.
 
@@ -67,11 +74,52 @@ In one read-only validation run, Claude moved through a checklist, read docs, ra
 
 The useful move was not "let it keep trying." The useful move was: **stop this session, fix the module boundary and `go.sum`, attach a real cluster, then rerun validation.**
 
-For live runs, cc-blackbox can also warn before the next request when a configured guard condition is hit.
+For live runs, the footer is where that warning should show up before you spend another prompt.
+
+## Live Footer
+
+The footer is what you normally read while Claude is running. It is short on purpose.
+
+Healthy:
+
+```text
+cc-blackbox: Looks healthy. Context is 31% full; cache is warm.
+```
+
+Careful:
+
+```text
+cc-blackbox: Careful: Prompt cache is close to expiring. Run: cc-blackbox postmortem latest.
+```
+
+Stop:
+
+```text
+cc-blackbox: Stop here: 4 Bash failures in a row. Run: cc-blackbox postmortem latest.
+```
+
+Blocked:
+
+```text
+cc-blackbox: Blocked: The session token budget was exceeded. Start narrower or adjust the policy.
+```
+
+Use the footer this way:
+
+- `Looks healthy`: keep going.
+- `Careful`: keep the next prompt narrow.
+- `Stop here`: fix the main issue before retrying.
+- `Blocked`: cc-blackbox stopped a request because policy said to.
+- `Cooldown`: wait before retrying.
+- `Session ended`: read the postmortem if you need the details.
+
+The footer answers: **can I keep going, and why?**
+
+The postmortem answers: **what happened, what proves it, and how should I restart?**
 
 ## Live Guard
 
-Live Guard is what you keep open next to Claude Code. It tells you whether a session is still healthy, whether it is burning budget, and whether the next prompt should be blocked or restarted.
+Live Guard is the lower-level view behind the footer. Use it when you want to inspect all sessions, policy state, or the event stream in a separate terminal.
 
 ```bash
 cc-blackbox guard start     # start or validate the local guard stack
@@ -81,13 +129,13 @@ cc-blackbox guard watch     # stream live findings in plain language
 ```
 
 The states are: `Healthy`, `Watching`, `Warning`, `Critical`, `Blocked`, `Cooldown`, and `Ended`.
-A warning means "pay attention." Critical means the next request may be blocked if policy says so. Blocked and Cooldown mean cc-blackbox already returned a policy response instead of forwarding that request.
+A warning means "pay attention." Critical means "stop and inspect." Blocked and Cooldown mean cc-blackbox returned a policy response instead of forwarding that request.
 
 Guard findings are evidence-labeled. A model mismatch is reported as a route mismatch. Context runway and compaction risk are marked as heuristics. Tool and JSONL findings say where the evidence came from.
 
 ## Postmortem
 
-The guard tells you what is happening now. The postmortem tells you what happened after the session has enough evidence to be useful.
+The footer tells you what to do now. The postmortem tells you what happened.
 
 Postmortems are redacted by default. They combine cc-blackbox data with local Claude Code JSONL when a confident match exists. Without a confident JSONL match, cc-blackbox produces a local-only report instead of mixing sessions.
 
@@ -224,7 +272,7 @@ cc-blackbox is designed to be safe to try because it stays local and is easy to 
 
 #### Supporting Workflows
 
-Live Guard is the normal live workflow. Watch mode, APIs, and Grafana are still useful when you want lower-level events or history across many sessions.
+The footer is the normal live view. Live Guard, watch mode, APIs, and Grafana are useful when you want lower-level events or history across many sessions.
 
 - **Start or validate the guard stack:** `cc-blackbox guard start`
 - **Show effective guard policy:** `cc-blackbox guard policy`

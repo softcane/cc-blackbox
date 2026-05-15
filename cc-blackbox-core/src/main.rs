@@ -3678,6 +3678,133 @@ fn load_jsonl_candidate_sessions() -> Vec<jsonl::JsonlDerivedSession> {
         .collect()
 }
 
+fn load_jsonl_candidate_session_by_id(
+    jsonl_session_id: &str,
+) -> Option<jsonl::JsonlDerivedSession> {
+    load_jsonl_candidate_sessions()
+        .into_iter()
+        .find(|session| session.jsonl_session_id == jsonl_session_id)
+}
+
+fn stored_proxy_session_for_jsonl(
+    conn: &Connection,
+    jsonl_session_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    if !table_exists(conn, "session_jsonl_correlations")? {
+        return Ok(None);
+    }
+
+    conn.query_row(
+        "SELECT proxy_session_id \
+         FROM session_jsonl_correlations \
+         WHERE jsonl_session_id = ?1 AND status = 'matched' \
+         ORDER BY matched_at DESC \
+         LIMIT 1",
+        rusqlite::params![jsonl_session_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+fn active_proxy_session_correlations(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<correlation::ProxySessionCorrelation>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.session_id, s.working_dir, s.started_at, \
+                COALESCE(s.last_activity_at, s.started_at), \
+                COALESCE(s.first_message_hash, ''), \
+                COALESCE(s.prompt_correlation_hash, ''), \
+                COALESCE(s.request_count, 0) \
+         FROM sessions s \
+         LEFT JOIN session_diagnoses d ON d.session_id = s.session_id \
+         WHERE s.ended_at IS NULL AND d.completed_at IS NULL",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        let started_at: String = row.get(2)?;
+        let last_activity_at: String = row.get(3)?;
+        let request_count = row.get::<_, Option<i64>>(6)?.unwrap_or(0).max(0) as u64;
+        Ok(correlation::ProxySessionCorrelation {
+            session_id: row.get(0)?,
+            cwd: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            started_at_epoch_secs: jsonl::parse_epoch_secs(&started_at).unwrap_or(0),
+            last_activity_at_epoch_secs: jsonl::parse_epoch_secs(&last_activity_at).unwrap_or(0),
+            first_message_hash: row.get(4)?,
+            prompt_correlation_hash: row.get(5)?,
+            request_count,
+            turn_count: request_count,
+        })
+    })?;
+
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+fn build_jsonl_session_resolution_response_from_db(
+    conn: &Connection,
+    jsonl_session_id: &str,
+) -> Result<Value, String> {
+    let jsonl_session_id = jsonl_session_id.trim();
+    if jsonl_session_id.is_empty() {
+        return Ok(serde_json::json!({
+            "status": "missing_jsonl_session_id",
+            "matched": false,
+        }));
+    }
+
+    if let Some(proxy_session_id) = stored_proxy_session_for_jsonl(conn, jsonl_session_id)
+        .map_err(|err| format!("load stored jsonl correlation: {err}"))?
+    {
+        return Ok(serde_json::json!({
+            "status": "matched",
+            "matched": true,
+            "source": "stored_jsonl_correlation",
+            "jsonl_session_id": jsonl_session_id,
+            "proxy_session_id": proxy_session_id,
+        }));
+    }
+
+    let Some(summary) = load_jsonl_candidate_session_by_id(jsonl_session_id) else {
+        return Ok(serde_json::json!({
+            "status": "missing_jsonl",
+            "matched": false,
+            "jsonl_session_id": jsonl_session_id,
+        }));
+    };
+
+    let candidate = summary.correlation();
+    let proxies = active_proxy_session_correlations(conn)
+        .map_err(|err| format!("load active proxy sessions: {err}"))?;
+    let matches = proxies
+        .iter()
+        .filter(|proxy| correlation::candidate_matches_proxy(proxy, &candidate))
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [proxy] => {
+            persist_jsonl_correlation(conn, &proxy.session_id, &summary)
+                .map_err(|err| format!("persist jsonl correlation: {err}"))?;
+            Ok(serde_json::json!({
+                "status": "matched",
+                "matched": true,
+                "source": "live_jsonl_correlation",
+                "jsonl_session_id": jsonl_session_id,
+                "proxy_session_id": proxy.session_id,
+            }))
+        }
+        [] => Ok(serde_json::json!({
+            "status": "no_match",
+            "matched": false,
+            "jsonl_session_id": jsonl_session_id,
+        })),
+        many => Ok(serde_json::json!({
+            "status": "ambiguous",
+            "matched": false,
+            "jsonl_session_id": jsonl_session_id,
+            "candidate_count": many.len(),
+        })),
+    }
+}
+
 fn proxy_correlation_for_postmortem_session(
     session: &PostmortemSessionRow,
     turn_count: u64,
@@ -4118,6 +4245,119 @@ fn string_set_json(values: &std::collections::BTreeSet<String>) -> Value {
     )
 }
 
+fn top_count_labels(map: &BTreeMap<String, u64>, max_items: usize) -> Vec<String> {
+    let mut items = map
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .collect::<Vec<_>>();
+    items.sort_by(|(left_name, left_count), (right_name, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_name.cmp(right_name))
+    });
+    items
+        .into_iter()
+        .take(max_items)
+        .map(|(name, count)| format!("{name} ({count})"))
+        .collect()
+}
+
+fn push_unique_limited(values: &mut Vec<String>, value: String, limit: usize) {
+    let value = value.trim();
+    if value.is_empty() || values.iter().any(|existing| existing == value) || values.len() >= limit
+    {
+        return;
+    }
+    values.push(value.to_string());
+}
+
+fn handoff_summary_line(label: &str, value: &str, redact: bool) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if is_derived_content_metadata(trimmed) {
+        return Some(format!("{label}: {trimmed}"));
+    }
+    if redact {
+        return redacted_human_summary(label, trimmed, true)
+            .map(|summary| format!("{label}: {summary}"));
+    }
+    Some(format!(
+        "{label}: {}",
+        redact_operational_text(trimmed, false)
+    ))
+}
+
+fn handoff_tool_activity(
+    tools: &[ToolAggregate],
+    jsonl_summary: Option<&jsonl::JsonlDerivedSession>,
+) -> Vec<String> {
+    let mut activity = Vec::new();
+    for tool in tools.iter().take(4) {
+        let detail = if tool.failures > 0 {
+            format!(
+                "{}: {} calls, {} failures",
+                tool.tool_name, tool.calls, tool.failures
+            )
+        } else {
+            format!("{}: {} calls, 0 failures", tool.tool_name, tool.calls)
+        };
+        push_unique_limited(&mut activity, detail, 6);
+    }
+
+    if let Some(summary) = jsonl_summary {
+        if activity.is_empty() {
+            let mut jsonl_tools = summary
+                .tool_calls
+                .iter()
+                .map(|(tool_name, calls)| {
+                    (
+                        tool_name.clone(),
+                        *calls,
+                        summary.tool_failures.get(tool_name).copied().unwrap_or(0),
+                    )
+                })
+                .collect::<Vec<_>>();
+            jsonl_tools.sort_by(
+                |(left_name, left_calls, left_failures),
+                 (right_name, right_calls, right_failures)| {
+                    right_failures
+                        .cmp(left_failures)
+                        .then_with(|| right_calls.cmp(left_calls))
+                        .then_with(|| left_name.cmp(right_name))
+                },
+            );
+            for (tool_name, calls, failures) in jsonl_tools.into_iter().take(4) {
+                push_unique_limited(
+                    &mut activity,
+                    format!("{tool_name}: {calls} JSONL calls, {failures} failures"),
+                    6,
+                );
+            }
+        }
+
+        let bash_categories = top_count_labels(&summary.bash_command_categories, 3);
+        if !bash_categories.is_empty() {
+            push_unique_limited(
+                &mut activity,
+                format!("Bash categories: {}", bash_categories.join(", ")),
+                6,
+            );
+        }
+        let file_categories = top_count_labels(&summary.file_operation_categories, 3);
+        if !file_categories.is_empty() {
+            push_unique_limited(
+                &mut activity,
+                format!("File operations: {}", file_categories.join(", ")),
+                6,
+            );
+        }
+    }
+
+    activity
+}
+
 fn jsonl_signal_json(summary: Option<&jsonl::JsonlDerivedSession>) -> Value {
     let Some(summary) = summary else {
         return Value::Null;
@@ -4142,6 +4382,120 @@ fn jsonl_signal_json(summary: Option<&jsonl::JsonlDerivedSession>) -> Value {
             "cache_creation_tokens": summary.usage.cache_creation_tokens,
         },
         "system_event_categories": count_map_json(&summary.system_event_categories, "category"),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handoff_context_json(
+    session: &PostmortemSessionRow,
+    partial: bool,
+    display_outcome: &str,
+    primary_cause: &str,
+    primary_detail: &str,
+    next_action: &str,
+    prompt_source: &str,
+    final_summary_source: &str,
+    tools: &[ToolAggregate],
+    jsonl_summary: Option<&jsonl::JsonlDerivedSession>,
+    max_context_fill_percent: f64,
+    turns_to_compact: Option<u64>,
+    jsonl_compaction_boundary_epoch: Option<u64>,
+    jsonl_continued_after_proxy_secs: Option<u64>,
+    redact: bool,
+) -> Value {
+    let mut continue_from = Vec::new();
+    push_unique_limited(&mut continue_from, format!("Outcome: {display_outcome}"), 6);
+    push_unique_limited(
+        &mut continue_from,
+        if partial {
+            "Session is still running; treat this as a progress snapshot.".to_string()
+        } else {
+            "Session has ended; use this as the final local report.".to_string()
+        },
+        6,
+    );
+    if primary_cause != "none" {
+        push_unique_limited(
+            &mut continue_from,
+            format!("Main issue: {primary_detail}"),
+            6,
+        );
+    }
+    if let Some(line) = handoff_summary_line("Initial prompt", prompt_source, redact) {
+        push_unique_limited(&mut continue_from, line, 6);
+    }
+    if let Some(line) = handoff_summary_line("Last response", final_summary_source, redact) {
+        push_unique_limited(&mut continue_from, line, 6);
+    }
+
+    let mut recent_activity = handoff_tool_activity(tools, jsonl_summary);
+    if max_context_fill_percent > 0.0 {
+        let context = match turns_to_compact {
+            Some(turns) => format!(
+                "Context reached {:.0}% full; about {turns} turns before auto-compaction.",
+                max_context_fill_percent
+            ),
+            None => format!("Context reached {:.0}% full.", max_context_fill_percent),
+        };
+        push_unique_limited(&mut recent_activity, context, 6);
+    }
+
+    let total_tool_failures = tools.iter().map(|tool| tool.failures).sum::<u64>()
+        + jsonl_summary
+            .map(jsonl::JsonlDerivedSession::total_tool_failures)
+            .unwrap_or(0);
+    let mut avoid_repeating = Vec::new();
+    if total_tool_failures > 0 || primary_cause == "tool_failure_streak" {
+        push_unique_limited(
+            &mut avoid_repeating,
+            "Fix failing tool preconditions before rerunning the same tool loop.".to_string(),
+            4,
+        );
+    }
+    match primary_cause {
+        "cache_miss_ttl" | "cache_miss_thrash" => push_unique_limited(
+            &mut avoid_repeating,
+            "Avoid resubmitting a large unchanged prompt until cache behavior is fixed."
+                .to_string(),
+            4,
+        ),
+        "context_bloat" | "near_compaction" | "compaction_suspected" => push_unique_limited(
+            &mut avoid_repeating,
+            "Start with a compact state summary and avoid broad scans.".to_string(),
+            4,
+        ),
+        "model_fallback" => push_unique_limited(
+            &mut avoid_repeating,
+            "Do not assume the requested model was used; verify the model route.".to_string(),
+            4,
+        ),
+        _ => {}
+    }
+    if jsonl_compaction_boundary_epoch.is_some() {
+        push_unique_limited(
+            &mut avoid_repeating,
+            "Do not treat the compaction boundary as task abandonment.".to_string(),
+            4,
+        );
+    }
+
+    serde_json::json!({
+        "status": if partial { "running" } else { "ended" },
+        "outcome": display_outcome,
+        "action": next_action,
+        "provenance": {
+            "cc_blackbox_session_id": session.session_id,
+            "claude_jsonl_session_id": jsonl_summary.map(|summary| summary.jsonl_session_id.clone()),
+        },
+        "continue_from": continue_from,
+        "recent_activity": recent_activity,
+        "avoid_repeating": avoid_repeating,
+        "jsonl_continued_after_proxy_secs": jsonl_continued_after_proxy_secs,
+        "privacy": if redact {
+            "redacted: raw prompts, assistant text, tool inputs, tool outputs, and file contents are omitted"
+        } else {
+            "local: raw transcripts and file contents are still not included unless already stored as derived metadata"
+        },
     })
 }
 
@@ -4685,6 +5039,23 @@ fn build_postmortem_response_from_db(
     }
     let enrichment_status = jsonl_enrichment.status.clone();
     let evidence_labels = evidence_labels_json(&findings);
+    let handoff_context = handoff_context_json(
+        &session,
+        partial,
+        &display_outcome,
+        &primary_cause,
+        &primary_detail,
+        &next_action,
+        prompt_source,
+        final_summary_source,
+        &tools,
+        jsonl_enrichment.summary.as_ref(),
+        max_context_fill_percent,
+        turns_to_compact.map(u64::from),
+        jsonl_compaction_boundary_epoch,
+        jsonl_continued_after_proxy_secs,
+        redact,
+    );
 
     Ok(serde_json::json!({
         "session_id": session.session_id,
@@ -4789,6 +5160,7 @@ fn build_postmortem_response_from_db(
         "evidence": evidence,
         "timeline": timeline,
         "enrichment_status": enrichment_status,
+        "handoff_context": handoff_context,
         "recommendations": recommendations,
         "caveats": [
             "This report is deterministic and generated from local cc-blackbox SQLite data.",
@@ -7429,14 +7801,6 @@ fn turn_snapshot_context_window_needs_repair(
         .any(model_matches_legacy_native_1m_rule)
 }
 
-fn beta_values_use_1m_context(values: &[String]) -> bool {
-    values
-        .iter()
-        .flat_map(|value| value.split(','))
-        .map(|beta| beta.trim().to_ascii_lowercase())
-        .any(|beta| beta.starts_with(CONTEXT_1M_BETA_PREFIX))
-}
-
 fn request_uses_1m_context(headers: &HttpHeaders) -> bool {
     let _ = headers;
     false
@@ -7464,17 +7828,24 @@ fn anthropic_beta_without_1m_context(beta_values: &[String]) -> String {
         .join(", ")
 }
 
+fn upstream_anthropic_beta_adjustment(beta_values: &[String]) -> (Option<String>, bool) {
+    let cleaned_beta = anthropic_beta_without_1m_context(beta_values);
+    let should_sanitize_beta = !beta_values.is_empty();
+    (
+        (should_sanitize_beta && !cleaned_beta.is_empty()).then_some(cleaned_beta),
+        should_sanitize_beta,
+    )
+}
+
 fn upstream_request_adjustment_for_body(
     beta_values: &[String],
     body: &[u8],
 ) -> UpstreamRequestAdjustment {
-    let cleaned_beta = anthropic_beta_without_1m_context(beta_values);
-    let had_retired_context_beta = beta_values_use_1m_context(beta_values);
+    let (anthropic_beta, remove_anthropic_beta) = upstream_anthropic_beta_adjustment(beta_values);
     let mut adjustment = UpstreamRequestAdjustment {
         body: None,
-        anthropic_beta: (had_retired_context_beta && !cleaned_beta.is_empty())
-            .then_some(cleaned_beta),
-        remove_anthropic_beta: had_retired_context_beta,
+        anthropic_beta,
+        remove_anthropic_beta,
     };
 
     let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
@@ -8756,6 +9127,24 @@ fn body_continue() -> BodyResponse {
         }),
     }
 }
+
+fn request_header_continue_with_sanitized_headers(_beta_values: &[String]) -> HeadersResponse {
+    HeadersResponse {
+        response: Some(CommonResponse {
+            status: ResponseStatus::Continue.into(),
+            header_mutation: Some(HeaderMutation {
+                set_headers: Vec::new(),
+                remove_headers: vec![
+                    "accept-encoding".into(),
+                    "anthropic-beta".into(),
+                    "content-length".into(),
+                ],
+            }),
+            ..Default::default()
+        }),
+    }
+}
+
 fn body_continue_with_upstream_adjustment(adjustment: UpstreamRequestAdjustment) -> BodyResponse {
     let mut set_headers = Vec::new();
     let mut remove_headers = Vec::new();
@@ -8769,22 +9158,9 @@ fn body_continue_with_upstream_adjustment(adjustment: UpstreamRequestAdjustment)
             append_action: HeaderAppendAction::OverwriteIfExistsOrAdd.into(),
             ..Default::default()
         });
-    }
-    if adjustment.remove_anthropic_beta {
+    } else if adjustment.remove_anthropic_beta {
         remove_headers.push("anthropic-beta".to_string());
     }
-    if let Some(body) = adjustment.body.as_ref() {
-        set_headers.push(ProtoHeaderValueOption {
-            header: Some(ProtoHeaderValue {
-                key: "content-length".to_string(),
-                value: body.len().to_string(),
-                raw_value: Vec::new(),
-            }),
-            append_action: HeaderAppendAction::OverwriteIfExistsOrAdd.into(),
-            ..Default::default()
-        });
-    }
-
     BodyResponse {
         response: Some(CommonResponse {
             status: ResponseStatus::Continue.into(),
@@ -8901,16 +9277,11 @@ impl ExternalProcessor for CcBlackboxProcessor {
                             .unwrap_or(STANDARD_CONTEXT_WINDOW_TOKENS);
 
                         let response = ProcessingResponse {
-                            response: Some(ExtProcResponse::RequestHeaders(HeadersResponse {
-                                response: Some(CommonResponse {
-                                    status: ResponseStatus::Continue.into(),
-                                    header_mutation: Some(HeaderMutation {
-                                        remove_headers: vec!["accept-encoding".into()],
-                                        ..Default::default()
-                                    }),
-                                    ..Default::default()
-                                }),
-                            })),
+                            response: Some(ExtProcResponse::RequestHeaders(
+                                request_header_continue_with_sanitized_headers(
+                                    &request_anthropic_beta_values,
+                                ),
+                            )),
                             ..Default::default()
                         };
                         if tx.send(Ok(response)).await.is_err() {
@@ -9532,6 +9903,49 @@ async fn handle_sessions(
         StatusCode::OK,
         [("content-type", "application/json")],
         serde_json::to_string_pretty(&result).unwrap_or_default(),
+    )
+}
+
+async fn handle_resolve_jsonl_session(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let jsonl_session_id = params
+        .get("jsonl_session_id")
+        .or_else(|| params.get("session_id"))
+        .cloned()
+        .unwrap_or_default();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = Connection::open(db_path()).map_err(|err| err.to_string())?;
+        let _ = repair_persisted_session_artifacts(&conn);
+        build_jsonl_session_resolution_response_from_db(&conn, &jsonl_session_id)
+    })
+    .await;
+
+    let (status, body) = match result {
+        Ok(Ok(body)) => (StatusCode::OK, body),
+        Ok(Err(err)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "status": "error",
+                "matched": false,
+                "error": err,
+            }),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            serde_json::json!({
+                "status": "error",
+                "matched": false,
+                "error": err.to_string(),
+            }),
+        ),
+    };
+
+    (
+        status,
+        [("content-type", "application/json")],
+        serde_json::to_string_pretty(&body).unwrap_or_default(),
     )
 }
 
@@ -10234,6 +10648,10 @@ async fn http_server() {
         .route("/api/degradation/:session_id", get(handle_degradation))
         .route("/api/cache-rebuilds", get(handle_cache_rebuilds))
         .route("/api/sessions", get(handle_sessions))
+        .route(
+            "/api/sessions/resolve-jsonl",
+            get(handle_resolve_jsonl_session),
+        )
         .route("/api/sessions/finalize", post(handle_finalize_sessions))
         .route("/watch", get(handle_watch));
 
@@ -11223,14 +11641,41 @@ mod tests {
     }
 
     #[test]
+    fn upstream_body_rewrite_leaves_content_length_to_envoy() {
+        let body = br#"{"model":"claude-opus-4-7[1m]","messages":[]}"#;
+        let adjustment = upstream_request_adjustment_for_body(&[], body);
+        assert!(adjustment.body.is_some());
+
+        let response = super::body_continue_with_upstream_adjustment(adjustment);
+        let common = response.response.expect("common response");
+        assert!(common.body_mutation.is_some());
+
+        let rewrites_content_length = common
+            .header_mutation
+            .map(|mutation| {
+                mutation.set_headers.iter().any(|header| {
+                    header
+                        .header
+                        .as_ref()
+                        .is_some_and(|header| header.key.eq_ignore_ascii_case("content-length"))
+                })
+            })
+            .unwrap_or(false);
+        assert!(!rewrites_content_length);
+    }
+
+    #[test]
     fn upstream_adjustment_removes_retired_context_beta_when_normalizing_alias() {
         let body = br#"{"model":"claude-sonnet-4-6[1m]","messages":[]}"#;
         let existing = vec!["prompt-tools-2025-04-02".to_string()];
 
         let adjustment = upstream_request_adjustment_for_body(&existing, body);
 
-        assert!(adjustment.anthropic_beta.is_none());
-        assert!(!adjustment.remove_anthropic_beta);
+        assert_eq!(
+            adjustment.anthropic_beta.as_deref(),
+            Some("prompt-tools-2025-04-02")
+        );
+        assert!(adjustment.remove_anthropic_beta);
 
         let already_has_context =
             vec!["prompt-tools-2025-04-02, context-1m-2025-08-07".to_string()];
@@ -11266,6 +11711,97 @@ mod tests {
         );
         assert!(adjustment.remove_anthropic_beta);
         assert!(adjustment.body.is_none());
+    }
+
+    #[test]
+    fn upstream_adjustment_removes_empty_anthropic_beta_header() {
+        let body = br#"{"model":"claude-opus-4-7","messages":[]}"#;
+
+        let adjustment = upstream_request_adjustment_for_body(&[String::new()], body);
+
+        assert_eq!(adjustment.anthropic_beta, None);
+        assert!(adjustment.remove_anthropic_beta);
+        assert!(adjustment.body.is_none());
+
+        let response = super::body_continue_with_upstream_adjustment(adjustment);
+        let mutation = response
+            .response
+            .expect("common response")
+            .header_mutation
+            .expect("header mutation");
+        assert_eq!(mutation.remove_headers, vec!["anthropic-beta"]);
+        assert!(mutation.set_headers.is_empty());
+    }
+
+    #[test]
+    fn upstream_adjustment_preserves_valid_beta_when_removing_empty_entries() {
+        let body = br#"{"model":"claude-opus-4-7","messages":[]}"#;
+        let existing = vec!["prompt-tools-2025-04-02, ".to_string()];
+
+        let adjustment = upstream_request_adjustment_for_body(&existing, body);
+
+        assert_eq!(
+            adjustment.anthropic_beta.as_deref(),
+            Some("prompt-tools-2025-04-02")
+        );
+        assert!(adjustment.remove_anthropic_beta);
+        assert!(adjustment.body.is_none());
+
+        let response = super::body_continue_with_upstream_adjustment(adjustment);
+        let mutation = response
+            .response
+            .expect("common response")
+            .header_mutation
+            .expect("header mutation");
+        assert!(mutation.remove_headers.is_empty());
+        let header = mutation.set_headers[0]
+            .header
+            .as_ref()
+            .expect("anthropic beta header");
+        assert_eq!(header.key, "anthropic-beta");
+        assert_eq!(header.value, "prompt-tools-2025-04-02");
+    }
+
+    #[test]
+    fn request_header_mutation_removes_empty_anthropic_beta_before_upstream() {
+        let headers = super::request_header_continue_with_sanitized_headers(&[String::new()]);
+        let mutation = headers
+            .response
+            .expect("common response")
+            .header_mutation
+            .expect("header mutation");
+
+        assert!(mutation.set_headers.is_empty());
+        assert_eq!(
+            mutation.remove_headers,
+            vec![
+                "accept-encoding".to_string(),
+                "anthropic-beta".to_string(),
+                "content-length".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn request_header_mutation_removes_anthropic_beta_for_body_phase_rewrite() {
+        let headers = super::request_header_continue_with_sanitized_headers(&[
+            "prompt-tools-2025-04-02, ".into(),
+        ]);
+        let mutation = headers
+            .response
+            .expect("common response")
+            .header_mutation
+            .expect("header mutation");
+
+        assert!(mutation.set_headers.is_empty());
+        assert_eq!(
+            mutation.remove_headers,
+            vec![
+                "accept-encoding".to_string(),
+                "anthropic-beta".to_string(),
+                "content-length".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -13929,6 +14465,28 @@ mod tests {
             .get("confidence")
             .and_then(serde_json::Value::as_f64)
             .is_some_and(|confidence| confidence >= 0.9));
+        assert_eq!(
+            json.pointer("/handoff_context/provenance/cc_blackbox_session_id")
+                .and_then(|value| value.as_str()),
+            Some("session-jsonl-match")
+        );
+        assert_eq!(
+            json.pointer("/handoff_context/provenance/claude_jsonl_session_id")
+                .and_then(|value| value.as_str()),
+            Some("jsonl-match")
+        );
+        assert!(json
+            .pointer("/handoff_context/recent_activity")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item
+                .as_str()
+                .is_some_and(|line| line.contains("Bash: 5 JSONL calls, 5 failures")))));
+        assert!(json
+            .pointer("/handoff_context/avoid_repeating")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| items.iter().any(|item| item
+                .as_str()
+                .is_some_and(|line| line.contains("Fix failing tool preconditions")))));
 
         let rendered = serde_json::to_string(&json).expect("serialize postmortem");
         for forbidden in [
@@ -14052,6 +14610,77 @@ mod tests {
                 "raw JSONL leaked: {rendered}"
             );
         }
+
+        fs::remove_dir_all(jsonl_dir).expect("remove jsonl dir");
+    }
+
+    #[test]
+    fn jsonl_session_resolution_maps_claude_session_to_live_proxy_session() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let jsonl_dir = std::env::temp_dir().join(format!(
+            "cc-blackbox-live-jsonl-resolution-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&jsonl_dir).expect("create jsonl dir");
+        let _jsonl_dir = EnvVarGuard::set(
+            "CC_BLACKBOX_JSONL_DIR",
+            jsonl_dir.to_str().expect("jsonl dir is utf-8"),
+        );
+        let conn = create_full_test_db();
+        let visible_prompt = "Investigate this live footer mapping";
+        conn.execute(
+            "INSERT INTO sessions (
+                session_id, started_at, last_activity_at, model, working_dir,
+                first_message_hash, prompt_correlation_hash, request_count
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                "session-live-proxy",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:02Z",
+                "claude-sonnet-4-6",
+                "/tmp/cc-blackbox-jsonl",
+                super::hash_text_hex("full proxy prompt differs"),
+                correlation::prompt_correlation_hash(visible_prompt),
+                1,
+            ],
+        )
+        .expect("insert live proxy session");
+        let jsonl = format!(
+            r#"{{"type":"user","sessionId":"jsonl-live-session","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:00Z","message":{{"role":"user","content":"{visible_prompt}"}}}}
+{{"type":"assistant","sessionId":"jsonl-live-session","cwd":"/tmp/cc-blackbox-jsonl","timestamp":"2026-01-01T00:00:02Z","requestId":"req_live_1","message":{{"role":"assistant","content":[{{"type":"text","text":"working"}}],"usage":{{"input_tokens":10,"output_tokens":2}}}}}}
+"#
+        );
+        fs::write(jsonl_dir.join("live.jsonl"), jsonl).expect("write live jsonl fixture");
+
+        let response =
+            super::build_jsonl_session_resolution_response_from_db(&conn, "jsonl-live-session")
+                .expect("resolve jsonl session");
+
+        assert_eq!(
+            response.get("status").and_then(Value::as_str),
+            Some("matched")
+        );
+        assert_eq!(
+            response.get("proxy_session_id").and_then(Value::as_str),
+            Some("session-live-proxy")
+        );
+        assert_eq!(
+            response.get("source").and_then(Value::as_str),
+            Some("live_jsonl_correlation")
+        );
+        let persisted_proxy_id: String = conn
+            .query_row(
+                "SELECT proxy_session_id FROM session_jsonl_correlations \
+                 WHERE jsonl_session_id = ?1",
+                rusqlite::params!["jsonl-live-session"],
+                |row| row.get(0),
+            )
+            .expect("persisted live JSONL correlation");
+        assert_eq!(persisted_proxy_id, "session-live-proxy");
 
         fs::remove_dir_all(jsonl_dir).expect("remove jsonl dir");
     }

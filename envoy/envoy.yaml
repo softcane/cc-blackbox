@@ -94,6 +94,45 @@ static_resources:
                           response_flags: "%RESPONSE_FLAGS%"
 
                 http_filters:
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      inline_code: |
+                        local function strip_beta_query(path)
+                          local base, query = string.match(path, "^([^?]+)%?(.*)$")
+                          if base == nil then
+                            return path
+                          end
+                          if base ~= "/v1/messages" and base ~= "/v1/messages/count_tokens" then
+                            return path
+                          end
+
+                          local kept = {}
+                          for param in string.gmatch(query, "([^&]+)") do
+                            local name = string.match(param, "^([^=]*)") or param
+                            if string.lower(name) ~= "beta" then
+                              table.insert(kept, param)
+                            end
+                          end
+
+                          if #kept == 0 then
+                            return base
+                          end
+                          return base .. "?" .. table.concat(kept, "&")
+                        end
+
+                        function envoy_on_request(handle)
+                          local headers = handle:headers()
+                          local path = headers:get(":path")
+                          if path == nil then
+                            return
+                          end
+                          local rewritten = strip_beta_query(path)
+                          if rewritten ~= path then
+                            headers:replace(":path", rewritten)
+                          end
+                        end
+
                   # ext_proc: send all phases to cc-blackbox-core for observation.
                   - name: envoy.filters.http.ext_proc
                     typed_config:

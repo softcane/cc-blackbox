@@ -22,6 +22,14 @@ cc-blackbox run claude
 
 While Claude is running, read the footer at the bottom of Claude Code. It updates as cc-blackbox sees traffic, failed tools, cache behavior, context pressure, API errors, and policy blocks.
 
+The footer looks like this in normal, careful, and stop cases:
+
+![Healthy cc-blackbox Claude Code footer](docs/footer-healthy.png)
+
+![Careful cc-blackbox Claude Code footer](docs/footer-careful.png)
+
+![Stop cc-blackbox Claude Code footer](docs/footer-stop.png)
+
 When the footer says to review the run, or after you stop a session that felt stuck, read the latest postmortem:
 
 ```bash

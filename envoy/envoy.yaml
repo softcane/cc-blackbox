@@ -98,6 +98,33 @@ static_resources:
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
                       inline_code: |
+                        local function trim(value)
+                          return string.match(value, "^%s*(.-)%s*$")
+                        end
+
+                        local function sanitize_anthropic_beta(headers)
+                          local value = headers:get("anthropic-beta")
+                          if value == nil then
+                            return
+                          end
+
+                          local kept = {}
+                          for beta in string.gmatch(value .. ",", "([^,]*),") do
+                            local cleaned = trim(beta)
+                            local lower = string.lower(cleaned)
+                            if cleaned ~= "" and string.sub(lower, 1, 11) ~= "context-1m-" then
+                              table.insert(kept, cleaned)
+                            end
+                          end
+
+                          if #kept == 0 then
+                            headers:remove("anthropic-beta")
+                          else
+                            headers:remove("anthropic-beta")
+                            headers:add("anthropic-beta", table.concat(kept, ", "))
+                          end
+                        end
+
                         local function strip_beta_query(path)
                           local base, query = string.match(path, "^([^?]+)%?(.*)$")
                           if base == nil then
@@ -123,6 +150,7 @@ static_resources:
 
                         function envoy_on_request(handle)
                           local headers = handle:headers()
+                          sanitize_anthropic_beta(headers)
                           local path = headers:get(":path")
                           if path == nil then
                             return

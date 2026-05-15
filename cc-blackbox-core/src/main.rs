@@ -7813,24 +7813,32 @@ struct UpstreamRequestAdjustment {
     remove_anthropic_beta: bool,
 }
 
-fn anthropic_beta_without_1m_context(beta_values: &[String]) -> String {
-    beta_values
+fn clean_anthropic_beta(beta_values: &[String]) -> (String, bool) {
+    let mut removed_any = false;
+    let kept = beta_values
         .iter()
         .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .filter(|value| {
-            !value
+        .filter_map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                removed_any = true;
+                return None;
+            }
+            if value
                 .to_ascii_lowercase()
                 .starts_with(CONTEXT_1M_BETA_PREFIX)
+            {
+                removed_any = true;
+                return None;
+            }
+            Some(value)
         })
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect::<Vec<_>>();
+    (kept.join(", "), removed_any)
 }
 
 fn upstream_anthropic_beta_adjustment(beta_values: &[String]) -> (Option<String>, bool) {
-    let cleaned_beta = anthropic_beta_without_1m_context(beta_values);
-    let should_sanitize_beta = !beta_values.is_empty();
+    let (cleaned_beta, should_sanitize_beta) = clean_anthropic_beta(beta_values);
     (
         (should_sanitize_beta && !cleaned_beta.is_empty()).then_some(cleaned_beta),
         should_sanitize_beta,
@@ -9134,11 +9142,7 @@ fn request_header_continue_with_sanitized_headers(_beta_values: &[String]) -> He
             status: ResponseStatus::Continue.into(),
             header_mutation: Some(HeaderMutation {
                 set_headers: Vec::new(),
-                remove_headers: vec![
-                    "accept-encoding".into(),
-                    "anthropic-beta".into(),
-                    "content-length".into(),
-                ],
+                remove_headers: vec!["accept-encoding".into()],
             }),
             ..Default::default()
         }),
@@ -9148,7 +9152,11 @@ fn request_header_continue_with_sanitized_headers(_beta_values: &[String]) -> He
 fn body_continue_with_upstream_adjustment(adjustment: UpstreamRequestAdjustment) -> BodyResponse {
     let mut set_headers = Vec::new();
     let mut remove_headers = Vec::new();
+    let body_len = adjustment.body.as_ref().map(Vec::len);
     if let Some(value) = adjustment.anthropic_beta {
+        if adjustment.remove_anthropic_beta {
+            remove_headers.push("anthropic-beta".to_string());
+        }
         set_headers.push(ProtoHeaderValueOption {
             header: Some(ProtoHeaderValue {
                 key: "anthropic-beta".to_string(),
@@ -9160,6 +9168,17 @@ fn body_continue_with_upstream_adjustment(adjustment: UpstreamRequestAdjustment)
         });
     } else if adjustment.remove_anthropic_beta {
         remove_headers.push("anthropic-beta".to_string());
+    }
+    if let Some(len) = body_len {
+        set_headers.push(ProtoHeaderValueOption {
+            header: Some(ProtoHeaderValue {
+                key: "content-length".to_string(),
+                value: len.to_string(),
+                raw_value: Vec::new(),
+            }),
+            append_action: HeaderAppendAction::OverwriteIfExistsOrAdd.into(),
+            ..Default::default()
+        });
     }
     BodyResponse {
         response: Some(CommonResponse {
@@ -11641,27 +11660,27 @@ mod tests {
     }
 
     #[test]
-    fn upstream_body_rewrite_leaves_content_length_to_envoy() {
+    fn upstream_body_rewrite_sets_matching_content_length() {
         let body = br#"{"model":"claude-opus-4-7[1m]","messages":[]}"#;
         let adjustment = upstream_request_adjustment_for_body(&[], body);
-        assert!(adjustment.body.is_some());
+        let rewritten_len = adjustment.body.as_ref().expect("rewritten body").len();
 
         let response = super::body_continue_with_upstream_adjustment(adjustment);
         let common = response.response.expect("common response");
         assert!(common.body_mutation.is_some());
 
-        let rewrites_content_length = common
+        let content_length = common
             .header_mutation
-            .map(|mutation| {
-                mutation.set_headers.iter().any(|header| {
+            .and_then(|mutation| {
+                mutation.set_headers.into_iter().find_map(|header| {
                     header
                         .header
-                        .as_ref()
-                        .is_some_and(|header| header.key.eq_ignore_ascii_case("content-length"))
+                        .filter(|header| header.key.eq_ignore_ascii_case("content-length"))
+                        .map(|header| header.value)
                 })
             })
-            .unwrap_or(false);
-        assert!(!rewrites_content_length);
+            .expect("content-length header");
+        assert_eq!(content_length, rewritten_len.to_string());
     }
 
     #[test]
@@ -11671,11 +11690,9 @@ mod tests {
 
         let adjustment = upstream_request_adjustment_for_body(&existing, body);
 
-        assert_eq!(
-            adjustment.anthropic_beta.as_deref(),
-            Some("prompt-tools-2025-04-02")
-        );
-        assert!(adjustment.remove_anthropic_beta);
+        assert_eq!(adjustment.anthropic_beta, None);
+        assert!(!adjustment.remove_anthropic_beta);
+        assert!(adjustment.body.is_some());
 
         let already_has_context =
             vec!["prompt-tools-2025-04-02, context-1m-2025-08-07".to_string()];
@@ -11693,6 +11710,17 @@ mod tests {
     fn upstream_adjustment_leaves_normal_models_untouched() {
         let body = br#"{"model":"claude-sonnet-4-6","messages":[]}"#;
         let adjustment = upstream_request_adjustment_for_body(&[], body);
+
+        assert_eq!(adjustment, super::UpstreamRequestAdjustment::default());
+    }
+
+    #[test]
+    fn upstream_adjustment_leaves_clean_beta_header_untouched() {
+        let body = br#"{"model":"claude-sonnet-4-6","messages":[]}"#;
+        let adjustment = upstream_request_adjustment_for_body(
+            &["fine-grained-tool-streaming-2025-05-14".into()],
+            body,
+        );
 
         assert_eq!(adjustment, super::UpstreamRequestAdjustment::default());
     }
@@ -11753,7 +11781,7 @@ mod tests {
             .expect("common response")
             .header_mutation
             .expect("header mutation");
-        assert!(mutation.remove_headers.is_empty());
+        assert_eq!(mutation.remove_headers, vec!["anthropic-beta"]);
         let header = mutation.set_headers[0]
             .header
             .as_ref()
@@ -11763,7 +11791,7 @@ mod tests {
     }
 
     #[test]
-    fn request_header_mutation_removes_empty_anthropic_beta_before_upstream() {
+    fn request_header_mutation_strips_accept_encoding_without_touching_beta() {
         let headers = super::request_header_continue_with_sanitized_headers(&[String::new()]);
         let mutation = headers
             .response
@@ -11772,18 +11800,11 @@ mod tests {
             .expect("header mutation");
 
         assert!(mutation.set_headers.is_empty());
-        assert_eq!(
-            mutation.remove_headers,
-            vec![
-                "accept-encoding".to_string(),
-                "anthropic-beta".to_string(),
-                "content-length".to_string()
-            ]
-        );
+        assert_eq!(mutation.remove_headers, vec!["accept-encoding".to_string()]);
     }
 
     #[test]
-    fn request_header_mutation_removes_anthropic_beta_for_body_phase_rewrite() {
+    fn request_header_mutation_keeps_beta_for_lua_and_body_phase_rewrite() {
         let headers = super::request_header_continue_with_sanitized_headers(&[
             "prompt-tools-2025-04-02, ".into(),
         ]);
@@ -11794,14 +11815,7 @@ mod tests {
             .expect("header mutation");
 
         assert!(mutation.set_headers.is_empty());
-        assert_eq!(
-            mutation.remove_headers,
-            vec![
-                "accept-encoding".to_string(),
-                "anthropic-beta".to_string(),
-                "content-length".to_string()
-            ]
-        );
+        assert_eq!(mutation.remove_headers, vec!["accept-encoding".to_string()]);
     }
 
     #[test]

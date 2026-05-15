@@ -22,6 +22,26 @@ def _has_context_1m_beta(headers) -> bool:
     return False
 
 
+def _has_empty_beta(headers) -> bool:
+    beta_values = headers.get_all("anthropic-beta", [])
+    for value in beta_values:
+        if value.strip() == "":
+            return True
+        for beta in value.split(","):
+            if beta.strip() == "":
+                return True
+    return False
+
+
+def _has_beta(headers, expected: str) -> bool:
+    beta_values = headers.get_all("anthropic-beta", [])
+    for value in beta_values:
+        for beta in value.split(","):
+            if beta.strip().lower() == expected.lower():
+                return True
+    return False
+
+
 def _scenario(body: dict) -> tuple[str, list[tuple[str, dict]], str]:
     text = _request_text(body)
     if "pipeline-review" in text:
@@ -79,6 +99,32 @@ class Handler(BaseHTTPRequestHandler):
                     "error": {
                         "type": "invalid_request_error",
                         "message": "accept-encoding leaked to upstream",
+                    },
+                },
+            )
+            return
+        if _has_empty_beta(self.headers):
+            self._send_json(
+                400,
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "empty anthropic-beta leaked to upstream",
+                    },
+                },
+            )
+            return
+        if "proxy-empty-beta" in request_text and not _has_beta(
+            self.headers, "fine-grained-tool-streaming-2025-05-14"
+        ):
+            self._send_json(
+                400,
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "valid anthropic-beta was not preserved",
                     },
                 },
             )

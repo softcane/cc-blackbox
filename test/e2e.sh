@@ -215,6 +215,24 @@ PY
         || fail "fake upstream response did not contain $skill: $response"
 }
 
+send_proxy_turn_with_empty_beta() {
+    local payload response
+    payload=$(proxy_payload "$SKILL_A" "proxy-empty-beta" "claude-haiku-4-5-20251001" "true")
+    response=$(curl -fsS --max-time 30 -N \
+        -H "x-api-key: test-e2e-fake" \
+        -H "anthropic-version: 2023-06-01" \
+        -H "anthropic-beta: fine-grained-tool-streaming-2025-05-14" \
+        -H "anthropic-beta;" \
+        -H "content-type: application/json" \
+        -H "accept-encoding: gzip" \
+        -d "$payload" \
+        "$ENVOY_URL/v1/messages")
+    grep -q "message_stop" <<<"$response" \
+        || fail "empty-beta proxy response did not contain message_stop: $response"
+    grep -q "$SKILL_A" <<<"$response" \
+        || fail "empty-beta proxy response did not contain $SKILL_A: $response"
+}
+
 send_delayed_proxy_turn_and_assert_live_watch() {
     local payload watch_file response_file watch_pid proxy_pid response live_seen still_running
     payload=$(proxy_payload "$SKILL_A" "proxy-delayed" "claude-sonnet-4-6-20250514" "true")
@@ -388,9 +406,10 @@ info "Sending fake Anthropic streaming turns through Envoy..."
 send_proxy_turn "proxy-a" "$SKILL_A"
 send_proxy_turn "proxy-b" "$SKILL_B"
 send_proxy_turn "proxy-1m" "$SKILL_A" "claude-opus-4-7[1m]"
+send_proxy_turn_with_empty_beta
 send_delayed_proxy_turn_and_assert_live_watch
 send_proxy_turn "proxy-json" "$SKILL_B" "claude-haiku-4-5-20251001" "false"
-pass "Envoy ext_proc observed fake streaming, delayed streaming, and JSON turns"
+pass "Envoy ext_proc observed fake streaming, empty-beta, delayed streaming, and JSON turns"
 
 sleep 4
 

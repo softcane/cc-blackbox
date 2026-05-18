@@ -15,6 +15,7 @@ use serde::Serialize;
 pub struct SessionState {
     pub session_id: String,
     pub display_name: String,
+    pub working_dir: String,
     /// Model string seen on the first request for this session.
     pub model: String,
     /// Cleaned excerpt of the user's first prompt. Populated when available;

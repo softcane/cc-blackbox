@@ -385,6 +385,110 @@ impl SnapshotStore {
         Some(snapshot)
     }
 
+    pub fn latest_session_id_for_working_dir(&self, working_dir: &str) -> Option<String> {
+        let inner = self.lock();
+        inner
+            .by_working_dir
+            .get(working_dir)
+            .map(|observation| observation.session_id.clone())
+    }
+
+    pub fn record_generated_summary(
+        &self,
+        mut candidate: RequestSnapshotCandidate,
+        session_id: String,
+        request_id: String,
+        timestamp: String,
+        response_text: &str,
+    ) -> Option<CompactionSnapshot> {
+        let summary = compacted_summary_from_response(response_text)?;
+        candidate.compacted_objective_text = summary.clone();
+        candidate.compact_summary_text = Some(summary.clone());
+        candidate.detection_text = summary;
+        candidate.explicit_compaction_marker = true;
+
+        let now = Instant::now();
+        let mut inner = self.lock();
+        let previous = inner
+            .sessions
+            .get(&session_id)
+            .and_then(|session| session.last_observation.clone())
+            .or_else(|| inner.by_working_dir.get(&candidate.working_dir).cloned());
+        let session = inner
+            .sessions
+            .entry(session_id.clone())
+            .or_insert_with(|| SnapshotSession {
+                snapshots: VecDeque::new(),
+                last_observation: None,
+                next_sequence: 1,
+                last_activity: now,
+            });
+        session.last_activity = now;
+
+        let previous_snapshot = session.snapshots.back().cloned();
+        let sequence = session.next_sequence.max(1);
+        session.next_sequence = sequence.saturating_add(1);
+        let initial_text = previous
+            .as_ref()
+            .map(|previous| previous.initial_objective_text.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(candidate.initial_objective_text.as_str());
+        let request = SnapshotRequestShape {
+            message_count: candidate.message_count,
+            previous_message_count: previous.as_ref().map(|previous| previous.message_count),
+            system_prompt_length: candidate.system_prompt_length,
+            previous_system_prompt_length: previous
+                .as_ref()
+                .map(|previous| previous.system_prompt_length),
+            estimated_input_tokens: candidate.estimated_input_tokens,
+            previous_estimated_input_tokens: previous
+                .as_ref()
+                .map(|previous| previous.estimated_input_tokens),
+            first_message_hash: candidate.first_message_hash.clone(),
+            previous_first_message_hash: previous
+                .as_ref()
+                .map(|previous| previous.first_message_hash.clone()),
+            system_prompt_hash: candidate.system_prompt_hash.clone(),
+            compacted_state_hash: candidate.compacted_state_hash.clone(),
+        };
+        let excerpts = build_excerpts(&candidate, initial_text);
+        let detection = CompactionDetection {
+            status: CompactionDetectionStatus::Detected,
+            reason: "Claude Code generated compacted conversation summary".to_string(),
+            confidence: 0.95,
+            signals: vec!["compaction summary response".to_string()],
+        };
+        let mut snapshot = CompactionSnapshot {
+            sequence,
+            timestamp,
+            session_id: session_id.clone(),
+            request_id,
+            model: candidate.model.clone(),
+            capture_mode: candidate.capture_mode,
+            local_only: true,
+            full_capture_warning: (candidate.capture_mode == PromptCaptureMode::Full).then(|| {
+                "FULL LOCAL-ONLY PROMPT CAPTURE ENABLED: excerpts may contain sensitive prompt text."
+                    .to_string()
+            }),
+            detection,
+            request,
+            excerpts,
+            drift: None,
+        };
+        snapshot.drift = Some(score_drift_deterministic(
+            initial_text,
+            previous_snapshot.as_ref(),
+            &snapshot,
+        ));
+
+        if session.snapshots.len() >= self.max_snapshots_per_session {
+            session.snapshots.pop_front();
+        }
+        session.snapshots.push_back(snapshot.clone());
+
+        Some(snapshot)
+    }
+
     pub fn list_session_snapshots(&self, session_id: &str) -> Vec<CompactionSnapshot> {
         let inner = self.lock();
         inner
@@ -463,22 +567,20 @@ pub fn build_candidate(
 ) -> RequestSnapshotCandidate {
     let system_text = collect_system_text(value);
     let message_text = collect_message_text(value, TEXT_CAPTURE_CHARS);
+    let cleaned_message_text = strip_snapshot_noise_blocks(&message_text);
     let compact_summary_text = collect_compact_summary_text(value);
     let detection_text = compact_summary_text
         .as_deref()
-        .unwrap_or(message_text.as_str())
+        .unwrap_or(cleaned_message_text.as_str())
         .to_string();
     let compacted_objective_text = compact_summary_text.clone().unwrap_or_else(|| {
         if input.user_prompt_excerpt.trim().is_empty() {
-            truncate_string(&message_text, TEXT_CAPTURE_CHARS)
+            truncate_string(&cleaned_message_text, TEXT_CAPTURE_CHARS)
         } else {
             input.user_prompt_excerpt.clone()
         }
     });
-    let explicit_compaction_marker = compact_summary_text
-        .as_deref()
-        .or(Some(detection_text.as_str()))
-        .is_some_and(contains_explicit_compaction_marker);
+    let explicit_compaction_marker = contains_explicit_compaction_marker(&detection_text);
 
     RequestSnapshotCandidate {
         capture_mode,
@@ -541,14 +643,77 @@ fn collect_compact_summary_text(value: &Value) -> Option<String> {
         if text.trim().is_empty() {
             continue;
         }
-        if contains_explicit_compaction_marker(&text) {
-            return Some(truncate_string(&text, TEXT_CAPTURE_CHARS));
+        let cleaned = strip_snapshot_noise_blocks(&text);
+        if cleaned.trim().is_empty() {
+            continue;
         }
-        if fallback.is_none() && looks_like_compact_summary(&text) {
-            fallback = Some(truncate_string(&text, TEXT_CAPTURE_CHARS));
+        if contains_explicit_compaction_marker(&cleaned) {
+            return Some(truncate_string(&cleaned, TEXT_CAPTURE_CHARS));
+        }
+        if fallback.is_none() && looks_like_compact_summary(&cleaned) {
+            fallback = Some(truncate_string(&cleaned, TEXT_CAPTURE_CHARS));
         }
     }
     fallback
+}
+
+fn strip_snapshot_noise_blocks(raw: &str) -> String {
+    static NOISE_TAGS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+        [
+            r"(?s)<system-reminder\b[^>]*>.*?</system-reminder>",
+            r"(?s)<command-name\b[^>]*>.*?</command-name>",
+            r"(?s)<command-message\b[^>]*>.*?</command-message>",
+            r"(?s)<command-args\b[^>]*>.*?</command-args>",
+            r"(?s)<local-command-stdout\b[^>]*>.*?</local-command-stdout>",
+            r"(?s)<local-command-stderr\b[^>]*>.*?</local-command-stderr>",
+        ]
+        .iter()
+        .filter_map(|pattern| Regex::new(pattern).ok())
+        .collect()
+    });
+
+    let mut cleaned = raw.to_string();
+    for _ in 0..4 {
+        let mut changed = false;
+        for regex in NOISE_TAGS.iter() {
+            let next = regex.replace_all(&cleaned, "").to_string();
+            if next != cleaned {
+                cleaned = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    cleaned
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn compacted_summary_from_response(raw: &str) -> Option<String> {
+    let cleaned = strip_snapshot_noise_blocks(raw);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if let (Some(start), Some(end)) = (lower.find("<summary>"), lower.rfind("</summary>")) {
+        let content_start = start + "<summary>".len();
+        if end > content_start {
+            let summary = trimmed[content_start..end].trim();
+            if !summary.is_empty() {
+                return Some(summary.to_string());
+            }
+        }
+    }
+
+    Some(trimmed.to_string())
 }
 
 fn collect_text_from_value(value: &Value, out: &mut String, max_chars: usize) {
@@ -599,10 +764,14 @@ fn truncate_string(value: &str, max_chars: usize) -> String {
 
 fn contains_explicit_compaction_marker(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    lower.contains("compaction")
-        || lower.contains("compacted")
-        || lower.contains("compact summary")
-        || lower.contains("conversation compact")
+    lower.contains("compaction summary:")
+        || lower.contains("compact summary:")
+        || lower.contains("conversation summary:")
+        || lower.contains("session summary:")
+        || lower.contains("conversation compacted")
+        || lower.contains("conversation was compacted")
+        || lower.contains("previous conversation has been summarized")
+        || lower.contains("previous conversation was summarized")
 }
 
 fn looks_like_compact_summary(value: &str) -> bool {
@@ -630,9 +799,11 @@ fn detect_compaction(
     previous_context_fill_percent: Option<f64>,
 ) -> Option<CompactionDetection> {
     let mut signals = Vec::new();
+    let mut compaction_shape_signals = 0usize;
 
     if candidate.explicit_compaction_marker {
         signals.push("explicit compact-summary marker".to_string());
+        compaction_shape_signals += 1;
     } else if looks_like_compact_summary(&candidate.detection_text) {
         signals.push("compact-summary-looking text block".to_string());
     }
@@ -645,6 +816,7 @@ fn detect_compaction(
                 "message count dropped {} -> {}",
                 previous.message_count, candidate.message_count
             ));
+            compaction_shape_signals += 1;
         }
         if previous.estimated_input_tokens >= 2_000
             && candidate.estimated_input_tokens.saturating_mul(100)
@@ -654,6 +826,7 @@ fn detect_compaction(
                 "estimated input tokens dropped {} -> {}",
                 previous.estimated_input_tokens, candidate.estimated_input_tokens
             ));
+            compaction_shape_signals += 1;
         }
         if previous.system_prompt_length > 0 {
             let delta = previous
@@ -664,12 +837,14 @@ fn detect_compaction(
                     "system prompt length changed {} -> {}",
                     previous.system_prompt_length, candidate.system_prompt_length
                 ));
+                compaction_shape_signals += 1;
             }
         }
         if previous.working_dir == candidate.working_dir
             && previous.first_message_hash != candidate.first_message_hash
         {
             signals.push("first message hash changed in same working directory".to_string());
+            compaction_shape_signals += 1;
         }
     }
 
@@ -677,7 +852,7 @@ fn detect_compaction(
         signals.push("previous context fill was near compaction threshold".to_string());
     }
 
-    if signals.is_empty() {
+    if compaction_shape_signals == 0 {
         return None;
     }
 
@@ -718,12 +893,14 @@ fn build_excerpts(candidate: &RequestSnapshotCandidate, initial_text: &str) -> S
 
     if candidate.capture_mode == PromptCaptureMode::Full {
         excerpts.raw_initial_objective = raw_excerpt(initial_text, FULL_EXCERPT_CHARS);
-        excerpts.raw_compacted_objective =
-            raw_excerpt(&candidate.compacted_objective_text, FULL_EXCERPT_CHARS);
+        excerpts.raw_compacted_objective = raw_excerpt(
+            &candidate.compacted_objective_text,
+            candidate.compacted_objective_text.chars().count(),
+        );
         excerpts.raw_compact_summary = candidate
             .compact_summary_text
             .as_ref()
-            .and_then(|text| raw_excerpt(text, FULL_EXCERPT_CHARS));
+            .and_then(|text| raw_excerpt(text, text.chars().count()));
     }
 
     excerpts
@@ -1570,6 +1747,197 @@ See /Users/pradeep/code/private/src/main.rs and https://example.com/a?token=secr
             detected.detection.status,
             CompactionDetectionStatus::Detected
         );
+    }
+
+    #[test]
+    fn deferred_tool_system_reminders_do_not_emit_compaction_snapshots() {
+        let store = SnapshotStore::new(5, Duration::from_secs(60));
+        let initial_prompt = "Lets investigate Playwright traces-only reporter";
+        store.record_request(
+            normal_candidate(initial_prompt, 79, 125_383),
+            "session_a".to_string(),
+            "req_1".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+            None,
+        );
+
+        let mut candidate = build_candidate(
+            &json!({
+                "system": "Primary working directory: /tmp/project",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<system-reminder>\nThe following deferred tools are now available via ToolSearch. Their schemas are NOT loaded. Use them for compaction snapshot debugging.\n</system-reminder>"
+                        },
+                        {
+                            "type": "text",
+                            "text": "Continue checking playwright-opentelemetry-reporter traces-only behavior."
+                        }
+                    ]
+                }]
+            }),
+            PromptCaptureMode::Full,
+            input("claude-sonnet", 81, initial_prompt),
+        );
+        candidate.estimated_input_tokens = 126_961;
+
+        assert!(store
+            .record_request(
+                candidate,
+                "session_a".to_string(),
+                "req_2".to_string(),
+                "2026-01-01T00:01:00Z".to_string(),
+                Some(84.0),
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn generated_compaction_summary_uses_response_summary_block() {
+        let store = SnapshotStore::new(5, Duration::from_secs(60));
+        store.record_request(
+            normal_candidate("Fix Playwright traces-only reporter", 79, 125_383),
+            "session_a".to_string(),
+            "req_1".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+            None,
+        );
+
+        let mut candidate = compact_candidate(
+            "CRITICAL: Respond with TEXT ONLY. Your task is to create a detailed summary of the conversation so far. Optional Next Step.",
+            1,
+            126_000,
+        );
+        candidate.capture_mode = PromptCaptureMode::Full;
+        let snapshot = store
+            .record_generated_summary(
+                candidate,
+                "session_a".to_string(),
+                "req_summary".to_string(),
+                "2026-01-01T00:01:00Z".to_string(),
+                "<analysis>private scratch</analysis>\n<summary>Continue fixing playwright-opentelemetry-reporter traces-only test.</summary>",
+            )
+            .expect("generated summary snapshot");
+
+        let raw = snapshot
+            .excerpts
+            .raw_compacted_objective
+            .as_ref()
+            .expect("raw compacted objective");
+        assert_eq!(
+            raw.text,
+            "Continue fixing playwright-opentelemetry-reporter traces-only test."
+        );
+        assert!(!raw.text.contains("private scratch"));
+        assert_eq!(
+            snapshot.detection.status,
+            CompactionDetectionStatus::Detected
+        );
+        assert!(snapshot
+            .detection
+            .reason
+            .contains("generated compacted conversation summary"));
+    }
+
+    #[test]
+    fn full_mode_generated_compaction_summary_raw_excerpt_is_not_preview_capped() {
+        let store = SnapshotStore::new(5, Duration::from_secs(60));
+        store.record_request(
+            normal_candidate(
+                "Ship Playwright OpenTelemetry metrics rollout",
+                120,
+                130_965,
+            ),
+            "session_a".to_string(),
+            "req_before".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+            None,
+        );
+
+        let long_context =
+            " producer docs, collector wiring, dashboard checks, and review notes".repeat(100);
+        let tail_marker = "FINAL_OPTIONAL_NEXT_STEP_MARKER";
+        let response = format!(
+            "<analysis>private scratch</analysis>\n<summary>1. Primary Request and Intent: The user is shipping a three-PR OpenTelemetry metrics rollout for Playwright e2e tests.{long_context}\n9. Optional Next Step: {tail_marker}</summary>"
+        );
+
+        let mut candidate = compact_candidate(
+            "CRITICAL: Respond with TEXT ONLY. Your task is to create a detailed summary of the conversation so far. Optional Next Step.",
+            3,
+            73_554,
+        );
+        candidate.capture_mode = PromptCaptureMode::Full;
+        let snapshot = store
+            .record_generated_summary(
+                candidate,
+                "session_a".to_string(),
+                "req_summary".to_string(),
+                "2026-01-01T00:01:00Z".to_string(),
+                &response,
+            )
+            .expect("generated summary snapshot");
+
+        let raw = snapshot
+            .excerpts
+            .raw_compacted_objective
+            .as_ref()
+            .expect("raw compacted objective");
+        assert!(raw.rendered_chars > FULL_EXCERPT_CHARS);
+        assert!(!raw.truncated);
+        assert!(raw.text.contains(tail_marker));
+        assert!(!raw.text.contains("private scratch"));
+
+        let safe = snapshot
+            .excerpts
+            .compacted_objective
+            .as_ref()
+            .expect("safe compacted objective");
+        assert!(safe.truncated);
+        assert!(safe.rendered_chars <= SAFE_EXCERPT_CHARS);
+    }
+
+    #[test]
+    fn carried_forward_compact_summary_is_not_re_emitted_each_turn() {
+        let store = SnapshotStore::new(5, Duration::from_secs(60));
+        store.record_request(
+            normal_candidate(
+                "Create Playwright OpenTelemetry metrics reporter",
+                3,
+                67_495,
+            ),
+            "session_a".to_string(),
+            "req_before".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+            None,
+        );
+
+        let carried_summary = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation. Summary: The user wants to add an OpenTelemetry metrics reporter to Playwright e2e tests.";
+        let mut first_continuation = compact_candidate(carried_summary, 4, 64_957);
+        first_continuation.first_message_hash = hash_text_hex(carried_summary);
+        let first = store
+            .record_request(
+                first_continuation,
+                "session_a".to_string(),
+                "req_first_continuation".to_string(),
+                "2026-01-01T00:01:00Z".to_string(),
+                Some(82.0),
+            )
+            .expect("first carried summary should emit once");
+        assert_eq!(first.sequence, 1);
+
+        let mut later_continuation = compact_candidate(carried_summary, 6, 70_977);
+        later_continuation.first_message_hash = hash_text_hex(carried_summary);
+        assert!(store
+            .record_request(
+                later_continuation,
+                "session_a".to_string(),
+                "req_later_continuation".to_string(),
+                "2026-01-01T00:02:00Z".to_string(),
+                Some(35.0),
+            )
+            .is_none());
     }
 
     #[test]

@@ -91,6 +91,10 @@ enum Commands {
         #[arg(long)]
         session: Option<String>,
 
+        /// Intentionally watch every session in one stream
+        #[arg(long, conflicts_with = "session")]
+        all: bool,
+
         /// Render redacted postmortems automatically in watch output
         #[arg(long, conflicts_with = "no_postmortem")]
         postmortem: bool,
@@ -437,6 +441,7 @@ pub(crate) struct CompactionSnapshotEvent {
     #[allow(dead_code)]
     #[serde(default)]
     timestamp: String,
+    #[allow(dead_code)]
     #[serde(default)]
     request_id: String,
     #[allow(dead_code)]
@@ -444,8 +449,10 @@ pub(crate) struct CompactionSnapshotEvent {
     model: String,
     #[serde(default)]
     capture_mode: String,
+    #[allow(dead_code)]
     #[serde(default)]
     local_only: bool,
+    #[allow(dead_code)]
     #[serde(default)]
     full_capture_warning: Option<String>,
     #[serde(default)]
@@ -462,8 +469,10 @@ pub(crate) struct CompactionSnapshotEvent {
 pub(crate) struct SnapshotDetection {
     #[serde(default)]
     status: String,
+    #[allow(dead_code)]
     #[serde(default)]
     reason: String,
+    #[allow(dead_code)]
     #[serde(default)]
     confidence: f64,
     #[allow(dead_code)]
@@ -477,8 +486,10 @@ pub(crate) struct SnapshotRequestShape {
     message_count: usize,
     #[serde(default)]
     previous_message_count: Option<usize>,
+    #[allow(dead_code)]
     #[serde(default)]
     system_prompt_length: usize,
+    #[allow(dead_code)]
     #[serde(default)]
     previous_system_prompt_length: Option<usize>,
     #[serde(default)]
@@ -536,8 +547,10 @@ pub(crate) struct SnapshotExcerpt {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub(crate) struct SnapshotDriftScore {
+    #[allow(dead_code)]
     #[serde(default)]
     source: String,
+    #[allow(dead_code)]
     #[serde(default)]
     objective_alignment: SnapshotDimensionScore,
     #[serde(default)]
@@ -551,6 +564,7 @@ pub(crate) struct SnapshotDriftScore {
     risk: SnapshotDimensionScore,
     #[serde(default)]
     missing_facts: Vec<String>,
+    #[allow(dead_code)]
     #[serde(default)]
     changed_framing: Option<String>,
     #[allow(dead_code)]
@@ -1758,6 +1772,8 @@ fn watcher_args(core_url: String, tmux: bool, postmortem: bool) -> Vec<String> {
     let mut args = vec!["watch".to_string()];
     if tmux {
         args.push("--tmux".to_string());
+    } else {
+        args.push("--all".to_string());
     }
     args.extend(["--url".to_string(), core_url]);
     if postmortem {
@@ -3096,101 +3112,175 @@ fn snapshot_excerpt_for_display(snapshot: &CompactionSnapshotEvent) -> Option<&S
     }
 }
 
+fn push_wrapped_prefixed_lines(lines: &mut Vec<String>, prefix: &str, text: &str, width: usize) {
+    push_wrapped_continuation_lines(lines, prefix, prefix, text, width);
+}
+
+fn push_wrapped_continuation_lines(
+    lines: &mut Vec<String>,
+    first_prefix: &str,
+    continuation_prefix: &str,
+    text: &str,
+    width: usize,
+) {
+    let mut first_content_line = true;
+    for raw_line in text.lines() {
+        if raw_line.trim().is_empty() {
+            lines.push(continuation_prefix.trim_end().to_string());
+            continue;
+        }
+        for (idx, wrapped) in wrap_text_for_width(raw_line.trim(), width)
+            .into_iter()
+            .enumerate()
+        {
+            let prefix = if first_content_line && idx == 0 {
+                first_prefix
+            } else {
+                continuation_prefix
+            };
+            lines.push(format!("{prefix}{wrapped}"));
+        }
+        first_content_line = false;
+    }
+}
+
+fn strip_compaction_summary_preamble(text: &str) -> String {
+    let trimmed = text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("this session is being continued from a previous conversation") {
+        if let Some(idx) = lower.find("summary:") {
+            return trimmed[idx + "summary:".len()..].trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn numbered_section_starts(text: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut starts = Vec::new();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let at_boundary = idx == 0 || bytes[idx.saturating_sub(1)].is_ascii_whitespace();
+        if !at_boundary || !bytes[idx].is_ascii_digit() {
+            idx += 1;
+            continue;
+        }
+
+        let mut cursor = idx;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        let marker_number = text[idx..cursor].parse::<usize>().ok();
+        let has_numbered_marker = cursor > idx
+            && marker_number.is_some_and(|number| (1..=20).contains(&number))
+            && cursor + 1 < bytes.len()
+            && bytes[cursor] == b'.'
+            && bytes[cursor + 1].is_ascii_whitespace();
+        if has_numbered_marker {
+            starts.push(idx);
+            idx = cursor + 2;
+        } else {
+            idx = cursor.max(idx + 1);
+        }
+    }
+    starts
+}
+
+fn split_compaction_summary_items(text: &str) -> Vec<String> {
+    let numbered_starts = numbered_section_starts(text);
+    if !numbered_starts.is_empty() {
+        return numbered_starts
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, start)| {
+                let end = numbered_starts.get(idx + 1).copied().unwrap_or(text.len());
+                let item = text[*start..end].trim();
+                (!item.is_empty()).then(|| item.to_string())
+            })
+            .collect();
+    }
+
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        current.push(ch);
+        let current_trimmed = current.trim();
+        let numbered_marker = current_trimmed.ends_with('.')
+            && current_trimmed
+                .trim_end_matches('.')
+                .chars()
+                .all(|ch| ch.is_ascii_digit());
+        if matches!(ch, '.' | '!' | '?')
+            && !numbered_marker
+            && chars.peek().is_some_and(|next| next.is_whitespace())
+        {
+            let item = current.trim();
+            if !item.is_empty() {
+                items.push(item.to_string());
+            }
+            current.clear();
+            while chars.peek().is_some_and(|next| next.is_whitespace()) {
+                chars.next();
+            }
+        }
+    }
+
+    let item = current.trim();
+    if !item.is_empty() {
+        items.push(item.to_string());
+    }
+
+    items
+}
+
+fn compacted_context_preview_lines(excerpt: &SnapshotExcerpt) -> Vec<String> {
+    let cleaned = strip_compaction_summary_preamble(&excerpt.text);
+    let mut lines = Vec::new();
+    let items = split_compaction_summary_items(&cleaned);
+    if items.is_empty() {
+        push_wrapped_prefixed_lines(&mut lines, "  ", &cleaned, 108);
+    } else {
+        for item in items {
+            push_wrapped_continuation_lines(&mut lines, "  - ", "    ", &item, 108);
+        }
+    }
+    if excerpt.truncated {
+        lines.push("  ... summary capture capped at local capture limit".to_string());
+    }
+    lines
+}
+
 fn snapshot_watch_lines(snapshot: &CompactionSnapshotEvent) -> Vec<String> {
     let status = if snapshot.detection.status.is_empty() {
         "suspected"
     } else {
         snapshot.detection.status.as_str()
     };
-    let mode = if snapshot.capture_mode.is_empty() {
-        "unknown"
-    } else {
-        snapshot.capture_mode.as_str()
-    };
     let mut lines = Vec::new();
-    let mut head = format!(
-        "COMPACTION SNAPSHOT #{} {} [{}] messages {} system {} chars tokens {}",
-        snapshot.sequence,
-        status,
-        mode,
+    let action = if status == "detected" {
+        "COMPACTED"
+    } else {
+        "COMPACTED?"
+    };
+    lines.push(format!(
+        "{action} Claude is continuing from a summary · messages {} · tokens {}",
         snapshot_shape_change(
             snapshot.request.message_count,
             snapshot.request.previous_message_count
         ),
         snapshot_shape_change(
-            snapshot.request.system_prompt_length,
-            snapshot.request.previous_system_prompt_length
-        ),
-        snapshot_shape_change(
             snapshot.request.estimated_input_tokens,
             snapshot.request.previous_estimated_input_tokens
         )
-    );
-    if snapshot.local_only {
-        head.push_str(" local-only");
-    }
-    if !snapshot.request_id.is_empty() {
-        head.push_str(&format!(" req {}", snapshot.request_id));
-    }
-    lines.push(head);
+    ));
 
-    if let Some(warning) = snapshot.full_capture_warning.as_deref() {
-        lines.push(format!(
-            "FULL LOCAL PROMPT CAPTURE: {}",
-            truncate_for_box(warning, 120)
-        ));
-    }
-
-    if let Some(drift) = snapshot.drift.as_ref() {
-        let source = if drift.source.is_empty() {
-            "deterministic"
-        } else {
-            drift.source.as_str()
-        };
-        lines.push(format!(
-            "drift {source}: objective {} ({}/100) preservation {} ({}/100) scope {} risk {}",
-            drift.objective_alignment.label,
-            drift.objective_alignment.score,
-            drift.state_preservation.label,
-            drift.state_preservation.score,
-            drift.scope_drift.label,
-            drift.risk.label
-        ));
-        if !drift.missing_facts.is_empty() {
-            lines.push(format!(
-                "missing from latest compact: {}",
-                drift
-                    .missing_facts
-                    .iter()
-                    .take(5)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
-        if let Some(changed) = drift.changed_framing.as_deref() {
-            lines.push(format!(
-                "changed framing: {}",
-                truncate_for_box(changed, 140)
-            ));
-        }
-    }
-
+    lines.push("Summary Claude will carry forward:".to_string());
     if let Some(excerpt) = snapshot_excerpt_for_display(snapshot) {
-        let mut text = truncate_for_box(&excerpt.text, 110);
-        if excerpt.truncated {
-            text.push_str(" [capped]");
-        }
-        lines.push(format!("compact objective: {text}"));
+        lines.extend(compacted_context_preview_lines(excerpt));
+    } else {
+        lines.push("  No summary text was captured.".to_string());
     }
-    if !snapshot.detection.reason.is_empty() {
-        lines.push(format!(
-            "evidence: {} ({:.0}% confidence)",
-            truncate_for_box(&snapshot.detection.reason, 140),
-            snapshot.detection.confidence * 100.0
-        ));
-    }
-
     lines
 }
 
@@ -3651,8 +3741,8 @@ fn render_event(
             snapshot,
         } => {
             let lines = snapshot_watch_lines(snapshot);
-            for (idx, line) in lines.iter().enumerate() {
-                let rendered = if snapshot.capture_mode == "full_local" && idx == 1 {
+            for line in lines.iter() {
+                let rendered = if line.starts_with("FULL LOCAL PROMPT CAPTURE:") {
                     line.red().bold().to_string()
                 } else if snapshot.detection.status == "detected" {
                     line.yellow().bold().to_string()
@@ -6189,6 +6279,7 @@ async fn main() {
             no_cache,
             no_signals,
             session,
+            all,
             postmortem,
             no_postmortem,
             analyze_with_claude,
@@ -6234,13 +6325,46 @@ async fn main() {
                     std::process::exit(1);
                 }
             } else {
-                // Existing inline watch mode. When --session is set, pass it
-                // as ?session=X so the server can inject a synthetic
-                // SessionStart for mid-session joiners. Session ids are
-                // server-generated and URL-safe by construction
-                // (`session_<ts>_<hex>`), no escaping needed.
+                let selection = match resolve_watch_selection(
+                    &url,
+                    session,
+                    all,
+                    io::stdin().is_terminal() && io::stdout().is_terminal(),
+                )
+                .await
+                {
+                    Ok(selection) => selection,
+                    Err(err) => {
+                        eprintln!("{}", err.red());
+                        std::process::exit(1);
+                    }
+                };
+                let session = match selection {
+                    WatchSelection::All => None,
+                    WatchSelection::Session {
+                        session_id,
+                        label,
+                        auto_selected,
+                    } => {
+                        if auto_selected {
+                            let label = label.unwrap_or_else(|| session_id.clone());
+                            println!(
+                                "{}",
+                                format!(
+                                    "Auto-following only active session: {label} ({session_id})."
+                                )
+                                .dimmed()
+                            );
+                        }
+                        Some(session_id)
+                    }
+                };
                 let watch_url = match &session {
-                    Some(sid) => format!("{}/watch?session={}", url.trim_end_matches('/'), sid),
+                    Some(sid) => format!(
+                        "{}/watch?session={}",
+                        url.trim_end_matches('/'),
+                        query_escape(sid)
+                    ),
                     None => format!("{}/watch", url.trim_end_matches('/')),
                 };
                 println!("Connecting to {}...", watch_url);
@@ -6557,6 +6681,10 @@ struct FooterResponse {
     footer: String,
     decision: SessionDecision,
     correlation: FooterCorrelation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    watch_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    watch_command: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -6692,6 +6820,228 @@ async fn footer_recent_sessions(base_url: &str) -> Result<serde_json::Value, Str
         Duration::from_millis(650),
     )
     .await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchSessionChoice {
+    session_id: String,
+    display_name: Option<String>,
+    model: Option<String>,
+    working_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WatchSelection {
+    All,
+    Session {
+        session_id: String,
+        label: Option<String>,
+        auto_selected: bool,
+    },
+}
+
+fn active_watch_session_choices(sessions_report: &serde_json::Value) -> Vec<WatchSessionChoice> {
+    let Some(sessions) = sessions_report
+        .get("sessions")
+        .and_then(|value| value.as_array())
+    else {
+        return Vec::new();
+    };
+
+    sessions
+        .iter()
+        .filter(|session| json_bool(session, "/active").unwrap_or(false))
+        .filter_map(|session| {
+            let session_id = json_str(session, "/session_id")?.trim();
+            if session_id.is_empty() {
+                return None;
+            }
+            Some(WatchSessionChoice {
+                session_id: session_id.to_string(),
+                display_name: json_str(session, "/display_name")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string),
+                model: json_str(session, "/model")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string),
+                working_dir: json_str(session, "/working_dir")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string),
+            })
+        })
+        .collect()
+}
+
+fn watch_session_label(choice: &WatchSessionChoice) -> String {
+    choice
+        .display_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(choice.session_id.as_str())
+        .to_string()
+}
+
+fn watch_session_command(session_id: &str) -> String {
+    shell_join(&[
+        "cc-blackbox".to_string(),
+        "watch".to_string(),
+        "--session".to_string(),
+        session_id.to_string(),
+    ])
+}
+
+fn render_watch_session_choices(choices: &[WatchSessionChoice]) -> String {
+    let mut lines = vec![
+        "cc-blackbox watch needs a session id because multiple sessions are active.".to_string(),
+        "Pick one:".to_string(),
+    ];
+
+    for (idx, choice) in choices.iter().enumerate() {
+        let mut details = Vec::new();
+        if let Some(model) = choice.model.as_deref() {
+            details.push(model.to_string());
+        }
+        if let Some(working_dir) = choice.working_dir.as_deref() {
+            details.push(working_dir.to_string());
+        }
+        let detail = if details.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", details.join(" · "))
+        };
+        lines.push(format!(
+            "  {}. {}{}",
+            idx + 1,
+            watch_session_label(choice),
+            detail
+        ));
+        lines.push(format!(
+            "     {}",
+            watch_session_command(&choice.session_id)
+        ));
+    }
+
+    lines.push("".to_string());
+    lines.push(format!(
+        "To intentionally combine all sessions, run {}.",
+        shell_join(&[
+            "cc-blackbox".to_string(),
+            "watch".to_string(),
+            "--all".to_string(),
+        ])
+    ));
+    lines
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_watch_no_active_sessions() -> String {
+    format!(
+        "cc-blackbox watch needs a session id, but no active sessions were found.\nRun `cc-blackbox sessions` to find a recent session id, or run {} to intentionally watch every session.",
+        shell_join(&[
+            "cc-blackbox".to_string(),
+            "watch".to_string(),
+            "--all".to_string(),
+        ])
+    )
+}
+
+fn parse_watch_session_selection(
+    choices: &[WatchSessionChoice],
+    input: &str,
+) -> Option<WatchSelection> {
+    let trimmed = input.trim();
+    if trimmed.eq_ignore_ascii_case("all") || trimmed.eq_ignore_ascii_case("a") {
+        return Some(WatchSelection::All);
+    }
+    let idx = trimmed.parse::<usize>().ok()?;
+    if idx == 0 || idx > choices.len() {
+        return None;
+    }
+    let choice = &choices[idx - 1];
+    Some(WatchSelection::Session {
+        session_id: choice.session_id.clone(),
+        label: Some(watch_session_label(choice)),
+        auto_selected: false,
+    })
+}
+
+fn prompt_watch_session_selection(
+    choices: &[WatchSessionChoice],
+) -> Result<WatchSelection, String> {
+    println!("{}", render_watch_session_choices(choices));
+    for _ in 0..3 {
+        print!("Select session [1-{}] or all: ", choices.len());
+        io::stdout()
+            .flush()
+            .map_err(|err| format!("failed to flush prompt: {err}"))?;
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .map_err(|err| format!("failed to read selection: {err}"))?;
+        if let Some(selection) = parse_watch_session_selection(choices, &input) {
+            return Ok(selection);
+        }
+        eprintln!("{}", "Invalid selection.".yellow());
+    }
+    Err("No valid session selected.".to_string())
+}
+
+async fn fetch_active_watch_sessions(base_url: &str) -> Result<Vec<WatchSessionChoice>, String> {
+    let report = fetch_json_endpoint_with_timeout(
+        base_url,
+        "/api/sessions?limit=20&days=1",
+        Duration::from_millis(1200),
+    )
+    .await
+    .map_err(|err| {
+        format!(
+            "cc-blackbox watch needs --session <id>, but active sessions could not be listed: {err}"
+        )
+    })?;
+    Ok(active_watch_session_choices(&report))
+}
+
+async fn resolve_watch_selection(
+    base_url: &str,
+    explicit_session: Option<String>,
+    all: bool,
+    interactive: bool,
+) -> Result<WatchSelection, String> {
+    if all {
+        return Ok(WatchSelection::All);
+    }
+    if let Some(session_id) = explicit_session {
+        let session_id = session_id.trim().to_string();
+        if session_id.is_empty() {
+            return Err("cc-blackbox watch --session needs a non-empty session id.".to_string());
+        }
+        return Ok(WatchSelection::Session {
+            session_id,
+            label: None,
+            auto_selected: false,
+        });
+    }
+
+    let choices = fetch_active_watch_sessions(base_url).await?;
+    match choices.len() {
+        0 => Err(render_watch_no_active_sessions()),
+        1 => {
+            let choice = &choices[0];
+            Ok(WatchSelection::Session {
+                session_id: choice.session_id.clone(),
+                label: Some(watch_session_label(choice)),
+                auto_selected: true,
+            })
+        }
+        _ if interactive => prompt_watch_session_selection(&choices),
+        _ => Err(render_watch_session_choices(&choices)),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7148,6 +7498,61 @@ fn footer_render_width(explicit_width: Option<usize>, statusline: &serde_json::V
         .unwrap_or(160)
 }
 
+fn footer_watch_url(base_url: &str, session_id: &str) -> String {
+    format!(
+        "{}/watch?session={}",
+        base_url.trim_end_matches('/'),
+        query_escape(session_id)
+    )
+}
+
+fn footer_watch_command(session_id: &str) -> String {
+    format!("cc-blackbox watch --session {session_id}")
+}
+
+fn terminal_hyperlink(label: &str, url: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\")
+}
+
+struct RenderedFooter {
+    footer: String,
+    watch_url: Option<String>,
+    watch_command: Option<String>,
+}
+
+fn render_footer_with_watch_link(
+    decision: &SessionDecision,
+    width: usize,
+    base_url: &str,
+    clickable: bool,
+) -> RenderedFooter {
+    let watch_url = decision
+        .session_id
+        .as_deref()
+        .map(|session_id| footer_watch_url(base_url, session_id));
+    let watch_command = decision.session_id.as_deref().map(footer_watch_command);
+    let suffix_visible_chars = watch_url
+        .as_ref()
+        .map(|_| " · watch".chars().count())
+        .unwrap_or(0);
+    let body_width = width.saturating_sub(suffix_visible_chars).max(12);
+    let mut footer = render_footer(decision, body_width);
+    if let Some(url) = watch_url.as_deref() {
+        let label = if clickable {
+            terminal_hyperlink("watch", url)
+        } else {
+            "watch".to_string()
+        };
+        footer.push_str(" · ");
+        footer.push_str(&label);
+    }
+    RenderedFooter {
+        footer,
+        watch_url,
+        watch_command,
+    }
+}
+
 async fn run_footer(
     base_url: &str,
     width: Option<usize>,
@@ -7163,12 +7568,14 @@ async fn run_footer(
     };
     let (decision, correlation) = resolve_footer_decision(base_url, &statusline).await;
     let width = footer_render_width(width, &statusline);
-    let footer = render_footer(&decision, width);
+    let rendered_footer = render_footer_with_watch_link(&decision, width, base_url, !json_output);
     if json_output {
         let response = FooterResponse {
-            footer,
+            footer: rendered_footer.footer,
             decision,
             correlation,
+            watch_url: rendered_footer.watch_url,
+            watch_command: rendered_footer.watch_command,
         };
         println!(
             "{}",
@@ -7177,7 +7584,7 @@ async fn run_footer(
     } else {
         println!(
             "{}",
-            colorize_footer_line(&footer, decision.state, color_mode)
+            colorize_footer_line(&rendered_footer.footer, decision.state, color_mode)
         );
     }
     0
@@ -7685,10 +8092,10 @@ mod tests {
         event_session_id, extract_run_flags, fetch_guard_policy_report, fetch_guard_status_report,
         fetch_postmortem_json, fetch_run_final_postmortem_markdown,
         fetch_run_final_postmortem_markdown_with_retry, finalize_run_owned_sessions,
-        format_duration_coarse, format_tokens, local_time_from_iso, parse_mcp_tool_name,
-        postmortem_progress_message, postmortem_separator_line_for_width, push_unique,
-        render_footer, render_guard_policy_report, render_guard_status_report,
-        render_guard_watch_line, render_postmortem_markdown,
+        footer_watch_url, format_duration_coarse, format_tokens, local_time_from_iso,
+        parse_mcp_tool_name, postmortem_progress_message, postmortem_separator_line_for_width,
+        push_unique, render_footer, render_footer_with_watch_link, render_guard_policy_report,
+        render_guard_status_report, render_guard_watch_line, render_postmortem_markdown,
         render_postmortem_markdown_with_optional_analysis, render_postmortem_terminal_for_width,
         render_run_guard_panel, render_tmux_unavailable_fallback, run_child_command_with_deps,
         run_child_command_with_lifecycle_deps, run_claude_postmortem_analysis_with_command,
@@ -7696,7 +8103,7 @@ mod tests {
         select_run_live_mode, shell_join, shell_quote, snapshot_watch_lines, truncate_for_box,
         watcher_args, yaml_quote, ActiveSessions, Cli, Commands, DecisionState, FooterColorMode,
         GuardCommands, GuardStackReadiness, RunGuardEventOrigin, RunGuardPanel, RunLiveMode,
-        RunOwnedSessionMonitor, RunOwnedSessions, RunTerminalState, WatchEvent,
+        RunOwnedSessionMonitor, RunOwnedSessions, RunTerminalState, SessionDecision, WatchEvent,
         WatchPostmortemState,
     };
     use chrono::{DateTime, Local};
@@ -8145,6 +8552,40 @@ mod tests {
     }
 
     #[test]
+    fn footer_watch_url_uses_session_filter() {
+        assert_eq!(
+            footer_watch_url("http://localhost:9091", "session_1234_abcd"),
+            "http://localhost:9091/watch?session=session_1234_abcd"
+        );
+        assert_eq!(
+            footer_watch_url("http://localhost:9091/", "session_1234_abcd"),
+            "http://localhost:9091/watch?session=session_1234_abcd"
+        );
+    }
+
+    #[test]
+    fn footer_appends_clickable_scoped_watch_link() {
+        let decision = SessionDecision::known_session_waiting_for_live_status(
+            "session_1234_abcd",
+            Some("omni".to_string()),
+            Some("opus".to_string()),
+        );
+        let rendered = render_footer_with_watch_link(&decision, 120, "http://localhost:9091", true);
+
+        assert_eq!(
+            rendered.watch_url.as_deref(),
+            Some("http://localhost:9091/watch?session=session_1234_abcd")
+        );
+        assert_eq!(
+            rendered.watch_command.as_deref(),
+            Some("cc-blackbox watch --session session_1234_abcd")
+        );
+        assert!(rendered
+            .footer
+            .contains("\x1b]8;;http://localhost:9091/watch?session=session_1234_abcd\x1b\\watch\x1b]8;;\x1b\\"));
+    }
+
+    #[test]
     fn claude_footer_statusline_installs_updates_and_preserves_custom_settings() {
         let dir = unique_test_dir("footer-statusline");
         let settings_path = dir.join(".claude/settings.json");
@@ -8470,11 +8911,11 @@ mod tests {
     fn side_watcher_args_can_enable_auto_postmortem() {
         assert_eq!(
             watcher_args("http://core".to_string(), false, false),
-            vec!["watch", "--url", "http://core"]
+            vec!["watch", "--all", "--url", "http://core"]
         );
         assert_eq!(
             watcher_args("http://core".to_string(), false, true),
-            vec!["watch", "--url", "http://core", "--postmortem"]
+            vec!["watch", "--all", "--url", "http://core", "--postmortem"]
         );
         assert_eq!(
             watcher_args("http://core".to_string(), true, true),
@@ -9462,6 +9903,7 @@ mod tests {
             no_cache,
             no_signals,
             session,
+            all,
             postmortem,
             no_postmortem,
             analyze_with_claude,
@@ -9476,6 +9918,7 @@ mod tests {
         assert!(!no_cache);
         assert!(!no_signals);
         assert_eq!(session, None);
+        assert!(!all);
         assert!(!postmortem);
         assert!(!no_postmortem);
         assert!(claude_analysis_enabled(
@@ -9484,6 +9927,18 @@ mod tests {
         ));
         assert!(!tmux);
         assert_eq!(tmux_max_panes, 4);
+
+        let cli = Cli::try_parse_from(["cc-blackbox", "watch", "--all"]).expect("watch all parses");
+        let Commands::Watch { all, session, .. } = cli.command else {
+            panic!("expected watch command");
+        };
+        assert!(all);
+        assert_eq!(session, None);
+
+        assert!(
+            Cli::try_parse_from(["cc-blackbox", "watch", "--all", "--session", "session_a"])
+                .is_err()
+        );
 
         let cli = Cli::try_parse_from(["cc-blackbox", "watch", "--postmortem"])
             .expect("watch postmortem parses");
@@ -9608,6 +10063,203 @@ mod tests {
         assert!(!redact);
         assert!(!no_redact);
         assert_eq!(output, Some(std::path::PathBuf::from("postmortem.md")));
+    }
+
+    #[test]
+    fn active_watch_session_choices_filters_active_sessions() {
+        let report = serde_json::json!({
+            "sessions": [
+                {
+                    "active": false,
+                    "session_id": "session_done",
+                    "display_name": "done"
+                },
+                {
+                    "active": true,
+                    "session_id": "session_alpha",
+                    "display_name": "omni",
+                    "model": "claude-opus-4-7",
+                    "working_dir": "/Users/pradeep/code/omni"
+                },
+                {
+                    "active": true,
+                    "session_id": ""
+                }
+            ]
+        });
+
+        let choices = super::active_watch_session_choices(&report);
+
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].session_id, "session_alpha");
+        assert_eq!(choices[0].display_name.as_deref(), Some("omni"));
+        assert_eq!(choices[0].model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(
+            choices[0].working_dir.as_deref(),
+            Some("/Users/pradeep/code/omni")
+        );
+    }
+
+    #[test]
+    fn render_watch_session_choices_prints_scoped_commands() {
+        let choices = vec![
+            super::WatchSessionChoice {
+                session_id: "session_alpha".to_string(),
+                display_name: Some("omni".to_string()),
+                model: Some("opus".to_string()),
+                working_dir: Some("/repo/omni".to_string()),
+            },
+            super::WatchSessionChoice {
+                session_id: "session_beta".to_string(),
+                display_name: Some("cc-blackbox".to_string()),
+                model: Some("sonnet".to_string()),
+                working_dir: Some("/repo/cc-blackbox".to_string()),
+            },
+        ];
+
+        let rendered = super::render_watch_session_choices(&choices);
+
+        assert!(rendered.contains("multiple sessions are active"));
+        assert!(rendered.contains("omni · opus · /repo/omni"));
+        assert!(rendered.contains("cc-blackbox watch --session session_alpha"));
+        assert!(rendered.contains("cc-blackbox watch --session session_beta"));
+        assert!(rendered.contains("cc-blackbox watch --all"));
+    }
+
+    #[test]
+    fn parse_watch_session_selection_accepts_number_or_all() {
+        let choices = vec![super::WatchSessionChoice {
+            session_id: "session_alpha".to_string(),
+            display_name: Some("omni".to_string()),
+            model: None,
+            working_dir: None,
+        }];
+
+        assert_eq!(
+            super::parse_watch_session_selection(&choices, "1"),
+            Some(super::WatchSelection::Session {
+                session_id: "session_alpha".to_string(),
+                label: Some("omni".to_string()),
+                auto_selected: false,
+            })
+        );
+        assert_eq!(
+            super::parse_watch_session_selection(&choices, "all"),
+            Some(super::WatchSelection::All)
+        );
+        assert_eq!(super::parse_watch_session_selection(&choices, "2"), None);
+    }
+
+    #[tokio::test]
+    async fn watch_selection_uses_explicit_session_or_all_without_session_lookup() {
+        assert_eq!(
+            super::resolve_watch_selection(
+                "http://127.0.0.1:1",
+                Some(" session_alpha ".to_string()),
+                false,
+                false,
+            )
+            .await
+            .expect("explicit session resolves"),
+            super::WatchSelection::Session {
+                session_id: "session_alpha".to_string(),
+                label: None,
+                auto_selected: false,
+            }
+        );
+        assert_eq!(
+            super::resolve_watch_selection("http://127.0.0.1:1", None, true, false)
+                .await
+                .expect("all resolves"),
+            super::WatchSelection::All
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_selection_auto_selects_single_active_session() {
+        let sessions = serde_json::json!({
+            "sessions": [
+                {
+                    "active": true,
+                    "session_id": "session_alpha",
+                    "display_name": "omni",
+                    "working_dir": "/repo/omni"
+                }
+            ]
+        })
+        .to_string();
+        let (url, request_rx) = serve_postmortem_responses(vec![("200 OK".to_string(), sessions)]);
+
+        let selection = super::resolve_watch_selection(&url, None, false, false)
+            .await
+            .expect("single active session resolves");
+
+        assert_eq!(
+            selection,
+            super::WatchSelection::Session {
+                session_id: "session_alpha".to_string(),
+                label: Some("omni".to_string()),
+                auto_selected: true,
+            }
+        );
+        let requests = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured sessions request");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with("GET /api/sessions?limit=20&days=1 "));
+    }
+
+    #[tokio::test]
+    async fn watch_selection_fails_without_session_when_no_active_sessions() {
+        let sessions = serde_json::json!({ "sessions": [] }).to_string();
+        let (url, request_rx) = serve_postmortem_responses(vec![("200 OK".to_string(), sessions)]);
+
+        let err = super::resolve_watch_selection(&url, None, false, false)
+            .await
+            .expect_err("no active sessions should fail");
+
+        assert!(err.contains("needs a session id"));
+        assert!(err.contains("no active sessions"));
+        assert!(err.contains("cc-blackbox watch --all"));
+        let requests = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured sessions request");
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn watch_selection_fails_with_choice_list_when_multiple_active_sessions_noninteractive() {
+        let sessions = serde_json::json!({
+            "sessions": [
+                {
+                    "active": true,
+                    "session_id": "session_alpha",
+                    "display_name": "omni",
+                    "working_dir": "/repo/omni"
+                },
+                {
+                    "active": true,
+                    "session_id": "session_beta",
+                    "display_name": "cc-blackbox",
+                    "working_dir": "/repo/cc-blackbox"
+                }
+            ]
+        })
+        .to_string();
+        let (url, request_rx) = serve_postmortem_responses(vec![("200 OK".to_string(), sessions)]);
+
+        let err = super::resolve_watch_selection(&url, None, false, false)
+            .await
+            .expect_err("multiple active sessions should need selection");
+
+        assert!(err.contains("multiple sessions are active"));
+        assert!(err.contains("cc-blackbox watch --session session_alpha"));
+        assert!(err.contains("cc-blackbox watch --session session_beta"));
+        assert!(err.contains("cc-blackbox watch --all"));
+        let requests = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured sessions request");
+        assert_eq!(requests.len(), 1);
     }
 
     #[test]
@@ -11783,11 +12435,12 @@ What to do     Continue from the compacted segment.\n\
         };
         let lines = snapshot_watch_lines(&snapshot);
         let rendered = lines.join("\n");
-        assert!(rendered.contains("COMPACTION SNAPSHOT #3 detected [safe_redacted]"));
-        assert!(rendered.contains("messages 42 -> 9"));
-        assert!(rendered.contains("preservation medium (68/100)"));
-        assert!(rendered.contains("missing from latest compact: migration constraint"));
-        assert!(rendered.contains("compact objective: Compaction summary"));
+        assert!(rendered.contains(
+            "COMPACTED Claude is continuing from a summary · messages 42 -> 9 · tokens 42000 -> 9000"
+        ));
+        assert!(rendered.contains("Summary Claude will carry forward:"));
+        assert!(rendered.contains("  - Compaction summary: fix login timeout."));
+        assert!(!rendered.contains("Possible missing from compacted context"));
         assert!(!rendered.contains("raw_compacted_objective"));
     }
 
@@ -11813,9 +12466,41 @@ What to do     Continue from the compacted segment.\n\
             panic!("snapshot event");
         };
         let rendered = snapshot_watch_lines(&snapshot).join("\n");
-        assert!(rendered.contains("FULL LOCAL PROMPT CAPTURE"));
-        assert!(rendered.contains("full_local"));
+        assert!(!rendered.contains("FULL LOCAL PROMPT CAPTURE"));
+        assert!(rendered.contains("Summary Claude will carry forward:"));
         assert!(rendered.contains("Raw local compact state"));
+    }
+
+    #[test]
+    fn cli_watch_formats_compacted_continuation_summary_as_preview() {
+        let event: WatchEvent = serde_json::from_str(
+            r#"{
+              "type":"compaction_snapshot",
+              "session_id":"session_snapshot",
+              "snapshot":{
+                "sequence":1,
+                "capture_mode":"full_local",
+                "detection":{"status":"detected","reason":"message count dropped","confidence":0.9},
+                "request":{"message_count":4,"previous_message_count":24,"estimated_input_tokens":71723,"previous_estimated_input_tokens":77530},
+                "excerpts":{"raw_compacted_objective":{"text":"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation. Summary: 1. Primary Request and Intent: The user is shipping a three-PR rollout of OpenTelemetry metrics for Playwright e2e tests: - PR 1 (omni repo, this branch): Playwright producer-side work remains visible after wrapping. 2. Current Work: The branch has been created and a draft PR was opened. 3. Optional Next Step: Review CI and fix feedback.","source_chars":478,"rendered_chars":478,"truncated":false,"redacted":false}}
+              }
+            }"#,
+        )
+        .expect("parse compacted continuation summary");
+        let WatchEvent::CompactionSnapshot { snapshot, .. } = event else {
+            panic!("snapshot event");
+        };
+        let rendered = snapshot_watch_lines(&snapshot).join("\n");
+        assert!(!rendered.contains("This session is being continued"));
+        assert!(rendered.contains("  - 1. Primary Request and Intent:"));
+        assert!(rendered.contains("  - 2. Current Work:"));
+        assert!(rendered.contains("  - 3. Optional Next Step:"));
+        assert!(!rendered.contains("\n  - for Playwright"));
+        assert!(rendered
+            .lines()
+            .any(|line| line.starts_with("    ") && line.contains("Playwright")));
+        assert!(rendered.contains("wrapping."));
+        assert!(!rendered.contains("wrapping…"));
     }
 
     #[test]

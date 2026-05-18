@@ -223,6 +223,66 @@ fn watch_rejects_session_filter_with_tmux_mode() {
 }
 
 #[test]
+fn watch_without_session_fails_when_no_active_sessions() {
+    let (url, request_rx) = serve_json_once(r#"{"sessions":[]}"#);
+
+    let output = cc_blackbox(&["watch", "--url", &url]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let request = captured_request(request_rx);
+    assert!(
+        request.starts_with("GET /api/sessions?limit=20&days=1 "),
+        "unexpected request:\n{request}"
+    );
+    let err = stderr(&output);
+    assert!(err.contains("needs a session id"), "{err}");
+    assert!(err.contains("no active sessions"), "{err}");
+    assert!(err.contains("cc-blackbox watch --all"), "{err}");
+}
+
+#[test]
+fn watch_without_session_lists_choices_when_multiple_sessions_are_active() {
+    let (url, request_rx) = serve_json_once(
+        r#"{
+          "sessions": [
+            {
+              "active": true,
+              "session_id": "session_alpha",
+              "display_name": "omni",
+              "working_dir": "/repo/omni"
+            },
+            {
+              "active": true,
+              "session_id": "session_beta",
+              "display_name": "cc-blackbox",
+              "working_dir": "/repo/cc-blackbox"
+            }
+          ]
+        }"#,
+    );
+
+    let output = cc_blackbox(&["watch", "--url", &url]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let request = captured_request(request_rx);
+    assert!(
+        request.starts_with("GET /api/sessions?limit=20&days=1 "),
+        "unexpected request:\n{request}"
+    );
+    let err = stderr(&output);
+    assert!(err.contains("multiple sessions are active"), "{err}");
+    assert!(
+        err.contains("cc-blackbox watch --session session_alpha"),
+        "{err}"
+    );
+    assert!(
+        err.contains("cc-blackbox watch --session session_beta"),
+        "{err}"
+    );
+    assert!(err.contains("cc-blackbox watch --all"), "{err}");
+}
+
+#[test]
 fn sessions_command_renders_sessions_from_api() {
     let (url, request_rx) = serve_json_once(
         r#"{

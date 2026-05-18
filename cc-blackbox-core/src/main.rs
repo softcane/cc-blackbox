@@ -6178,6 +6178,7 @@ fn ensure_session_state(
         diagnosis::SessionState {
             session_id: sid.clone(),
             display_name: name,
+            working_dir: working_dir_str.to_string(),
             model: model.to_string(),
             initial_prompt: if user_prompt_excerpt.is_empty() {
                 None
@@ -6192,6 +6193,67 @@ fn ensure_session_state(
         },
     );
     sid
+}
+
+fn session_hash_for_id(session_id: &str) -> Option<u64> {
+    diagnosis::SESSIONS
+        .iter()
+        .find_map(|entry| (entry.session_id == session_id).then_some(*entry.key()))
+}
+
+fn latest_live_session_identity_for_working_dir(working_dir: &str) -> Option<(u64, String)> {
+    let working_dir = normalize_working_dir(working_dir);
+    diagnosis::SESSIONS
+        .iter()
+        .filter_map(|entry| {
+            let state = entry.value();
+            (state.working_dir == working_dir).then_some((
+                *entry.key(),
+                state.session_id.clone(),
+                state.last_activity,
+            ))
+        })
+        .max_by_key(|(_, _, last_activity)| *last_activity)
+        .map(|(hash, session_id, _)| (hash, session_id))
+}
+
+fn latest_snapshot_session_identity_for_working_dir(working_dir: &str) -> Option<(u64, String)> {
+    let session_id = snapshots::SNAPSHOT_STORE.latest_session_id_for_working_dir(working_dir)?;
+    let hash = session_hash_for_id(&session_id)?;
+    Some((hash, session_id))
+}
+
+fn resolve_request_session_identity(parsed: &ParsedRequestBody) -> (u64, String) {
+    if parsed.is_compaction_summary_request || parsed.is_compacted_continuation {
+        if let Some((hash, _session_id)) =
+            latest_live_session_identity_for_working_dir(&parsed.working_dir)
+                .or_else(|| latest_snapshot_session_identity_for_working_dir(&parsed.working_dir))
+        {
+            let session_id = ensure_session_state(
+                hash,
+                &parsed.working_dir,
+                &parsed.model,
+                &parsed.user_prompt_excerpt,
+            );
+            return (hash, session_id);
+        }
+
+        if parsed.is_compaction_summary_request {
+            if let Some(session_id) =
+                snapshots::SNAPSHOT_STORE.latest_session_id_for_working_dir(&parsed.working_dir)
+            {
+                return (parsed.sys_prompt_hash, session_id);
+            }
+        }
+    }
+
+    let session_id = ensure_session_state(
+        parsed.sys_prompt_hash,
+        &parsed.working_dir,
+        &parsed.model,
+        &parsed.user_prompt_excerpt,
+    );
+    (parsed.sys_prompt_hash, session_id)
 }
 
 fn ensure_session_inserted(
@@ -6362,6 +6424,29 @@ fn record_prompt_snapshot_after_continue(
         request_id.to_string(),
         now_iso8601(),
         previous_context_fill_percent,
+    ) else {
+        return;
+    };
+
+    watch::BROADCASTER.broadcast(watch::WatchEvent::CompactionSnapshot {
+        session_id: snapshot.session_id.clone(),
+        snapshot: Box::new(snapshot.clone()),
+    });
+    maybe_spawn_claude_drift_analysis(snapshot);
+}
+
+fn record_generated_compaction_summary(
+    candidate: snapshots::RequestSnapshotCandidate,
+    session_id: &str,
+    request_id: &str,
+    response_text: &str,
+) {
+    let Some(snapshot) = snapshots::SNAPSHOT_STORE.record_generated_summary(
+        candidate,
+        session_id.to_string(),
+        request_id.to_string(),
+        now_iso8601(),
+        response_text,
     ) else {
         return;
     };
@@ -8234,8 +8319,11 @@ struct ParsedRequestBody {
     first_message_hash: String,
     user_prompt_excerpt: String,
     is_internal_request: bool,
+    is_compaction_summary_request: bool,
+    is_compacted_continuation: bool,
     cache_ttl_evidence: Option<CacheTtlEvidence>,
     snapshot_capture: Option<snapshots::RequestSnapshotCandidate>,
+    compaction_summary_capture: Option<snapshots::RequestSnapshotCandidate>,
 }
 
 fn cache_control_ttl_secs(cache_control: &Value) -> Option<u64> {
@@ -8306,6 +8394,22 @@ fn is_internal_request_shape(
         || user_prompt_excerpt
             .to_ascii_lowercase()
             .contains("cc-blackbox's compaction drift analyst")
+}
+
+fn looks_like_compaction_summary_request(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    lower.contains("your task is to create a detailed summary of the conversation so far")
+        && lower.contains("this summary should be thorough")
+        && lower.contains("all user messages")
+        && lower.contains("optional next step")
+}
+
+fn looks_like_compacted_continuation(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    lower.contains("this session is being continued from a previous conversation")
+        && (lower.contains("summary:")
+            || lower.contains("the summary below covers")
+            || lower.contains("ran out of context"))
 }
 
 /// Returns (model, message_count, has_tools, system_prompt_length, estimated_input_tokens, sys_prompt_hash, working_dir).
@@ -8395,28 +8499,41 @@ fn parse_request_body(body: &[u8]) -> Option<ParsedRequestBody> {
     let user_prompt_excerpt = clean_user_prompt(&first_user_message);
     let first_message_hash = hash_text_hex(&first_user_message);
     let cache_ttl_evidence = request_cache_ttl_evidence(&v);
+    let is_compaction_summary_request = looks_like_compaction_summary_request(&first_user_message)
+        || looks_like_compaction_summary_request(&user_prompt_excerpt);
+    let is_compacted_continuation = !is_compaction_summary_request
+        && (looks_like_compacted_continuation(&first_user_message)
+            || looks_like_compacted_continuation(&user_prompt_excerpt));
     let is_internal_request =
-        is_internal_request_shape(&working_dir, sl, mc, ht, &user_prompt_excerpt);
+        is_internal_request_shape(&working_dir, sl, mc, ht, &user_prompt_excerpt)
+            || is_compaction_summary_request;
+    let capture_mode = snapshots::PromptCaptureMode::from_env();
+    let capture_candidate = capture_mode.map(|capture_mode| {
+        snapshots::build_candidate(
+            &v,
+            capture_mode,
+            snapshots::RequestSnapshotInput {
+                model: model.clone(),
+                working_dir: normalize_working_dir(&working_dir),
+                message_count: mc,
+                system_prompt_length: sl,
+                estimated_input_tokens: body.len() / 4,
+                first_message_hash: first_message_hash.clone(),
+                first_user_message: first_user_message.clone(),
+                user_prompt_excerpt: user_prompt_excerpt.clone(),
+                compacted_state_hash: snapshots::hash_bytes_hex(body),
+            },
+        )
+    });
     let snapshot_capture = if is_internal_request {
         None
     } else {
-        snapshots::PromptCaptureMode::from_env().map(|capture_mode| {
-            snapshots::build_candidate(
-                &v,
-                capture_mode,
-                snapshots::RequestSnapshotInput {
-                    model: model.clone(),
-                    working_dir: normalize_working_dir(&working_dir),
-                    message_count: mc,
-                    system_prompt_length: sl,
-                    estimated_input_tokens: body.len() / 4,
-                    first_message_hash: first_message_hash.clone(),
-                    first_user_message: first_user_message.clone(),
-                    user_prompt_excerpt: user_prompt_excerpt.clone(),
-                    compacted_state_hash: snapshots::hash_bytes_hex(body),
-                },
-            )
-        })
+        capture_candidate.clone()
+    };
+    let compaction_summary_capture = if is_compaction_summary_request {
+        capture_candidate
+    } else {
+        None
     };
 
     Some(ParsedRequestBody {
@@ -8430,8 +8547,11 @@ fn parse_request_body(body: &[u8]) -> Option<ParsedRequestBody> {
         first_message_hash,
         user_prompt_excerpt,
         is_internal_request,
+        is_compaction_summary_request,
+        is_compacted_continuation,
         cache_ttl_evidence,
         snapshot_capture,
+        compaction_summary_capture,
     })
 }
 
@@ -9324,6 +9444,10 @@ impl ExternalProcessor for CcBlackboxProcessor {
             let mut request_anthropic_beta_values: Vec<String> = Vec::new();
             let mut pending_snapshot_capture: Option<snapshots::RequestSnapshotCandidate> = None;
             let mut pending_snapshot_session_id: Option<String> = None;
+            let mut pending_compaction_summary_capture: Option<(
+                snapshots::RequestSnapshotCandidate,
+                String,
+            )> = None;
             let mut context_window_tokens = STANDARD_CONTEXT_WINDOW_TOKENS;
             let mut finalized = false;
 
@@ -9379,6 +9503,7 @@ impl ExternalProcessor for CcBlackboxProcessor {
                         started_at = Instant::now();
                         pending_snapshot_capture = None;
                         pending_snapshot_session_id = None;
+                        pending_compaction_summary_capture = None;
                         request_id = extract_header(h, "x-request-id")
                             .filter(|value| !value.trim().is_empty())
                             .unwrap_or_else(fallback_request_id);
@@ -9410,12 +9535,8 @@ impl ExternalProcessor for CcBlackboxProcessor {
                             Some(parsed) => {
                                 info!(phase="request_body", request_id=%request_id, model=%parsed.model, message_count=parsed.message_count, has_tools=parsed.has_tools, system_prompt_length=parsed.system_prompt_length, estimated_input_tokens=parsed.estimated_input_tokens, sys_prompt_hash=parsed.sys_prompt_hash, "ext_proc");
                                 let snapshot_capture = parsed.snapshot_capture.clone();
-                                let session_id = ensure_session_state(
-                                    parsed.sys_prompt_hash,
-                                    &parsed.working_dir,
-                                    &parsed.model,
-                                    &parsed.user_prompt_excerpt,
-                                );
+                                let (resolved_sys_prompt_hash, session_id) =
+                                    resolve_request_session_identity(&parsed);
                                 let policy = request_guard_policy();
                                 if let Some(decision) = evaluate_request_guard_for_session(
                                     Some(&session_id),
@@ -9426,7 +9547,7 @@ impl ExternalProcessor for CcBlackboxProcessor {
                                         warn!(request_id = %request_id, error_type = %block.error_type, rule_id = %block.rule_id, "request blocked");
                                         metrics::record_guard_block(&block.rule_id.to_string());
                                         ensure_session_inserted(
-                                            parsed.sys_prompt_hash,
+                                            resolved_sys_prompt_hash,
                                             &session_id,
                                             &parsed.model,
                                             &parsed.working_dir,
@@ -9443,10 +9564,11 @@ impl ExternalProcessor for CcBlackboxProcessor {
                                         let _ = finalize_terminal_budget_block(block);
                                         pending_snapshot_capture = None;
                                         pending_snapshot_session_id = None;
+                                        pending_compaction_summary_capture = None;
                                         blocked = true;
                                     }
                                 }
-                                sys_prompt_hash = parsed.sys_prompt_hash;
+                                sys_prompt_hash = resolved_sys_prompt_hash;
                                 working_dir_str = parsed.working_dir;
                                 first_message_hash_buf = parsed.first_message_hash;
                                 // Only first turn carries a meaningful "initial prompt"; for mc>1
@@ -9459,6 +9581,10 @@ impl ExternalProcessor for CcBlackboxProcessor {
                                 if !blocked {
                                     pending_snapshot_capture = snapshot_capture;
                                     pending_snapshot_session_id = Some(session_id.clone());
+                                    pending_compaction_summary_capture = parsed
+                                        .compaction_summary_capture
+                                        .clone()
+                                        .map(|capture| (capture, session_id.clone()));
                                     context_window_tokens = resolve_context_window_tokens(
                                         request_context_window_hint,
                                         &parsed.model,
@@ -9602,6 +9728,16 @@ impl ExternalProcessor for CcBlackboxProcessor {
                         if b.end_of_stream {
                             if resp_acc.is_json {
                                 resp_acc.process_json_body();
+                            }
+                            if let Some((candidate, snapshot_session_id)) =
+                                pending_compaction_summary_capture.take()
+                            {
+                                record_generated_compaction_summary(
+                                    candidate,
+                                    &snapshot_session_id,
+                                    &request_id,
+                                    &resp_acc.response_text,
+                                );
                             }
                             if !model.is_empty() {
                                 finalize_response(
@@ -11491,6 +11627,83 @@ mod tests {
     }
 
     #[test]
+    fn compaction_summary_prompt_is_captured_from_response_not_request() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _capture = EnvVarGuard::set("CC_BLACKBOX_CAPTURE_PROMPTS", "full");
+        let body = br#"{
+          "model": "claude-sonnet-4-6",
+          "system": "Primary working directory: /tmp/compact-summary",
+          "messages": [
+            {
+              "role": "user",
+              "content": "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\nYour task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.\nThis summary should be thorough in capturing technical details, code patterns, and architectural decisions that would be essential for continuing development work without losing context.\nYour summary should include the following sections:\n6. All user messages: List ALL user messages that are not tool results.\n9. Optional Next Step: List the next step that you will take."
+            }
+          ]
+        }"#;
+
+        let parsed = parse_request_body(body).expect("parse compaction summary prompt");
+        assert!(parsed.is_internal_request);
+        assert!(parsed.is_compaction_summary_request);
+        assert!(!parsed.is_compacted_continuation);
+        assert!(parsed.snapshot_capture.is_none());
+        assert!(parsed.compaction_summary_capture.is_some());
+    }
+
+    #[test]
+    fn compacted_continuation_reuses_prior_logical_session_identity() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _capture = EnvVarGuard::remove("CC_BLACKBOX_CAPTURE_PROMPTS");
+        let working_dir = unique_temp_path("compacted-continuation")
+            .display()
+            .to_string();
+        let initial_body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": format!("Primary working directory: {working_dir}"),
+            "messages": [
+                { "role": "user", "content": "Ship the Playwright OpenTelemetry metrics rollout." }
+            ]
+        });
+        let initial_bytes = serde_json::to_vec(&initial_body).expect("serialize initial request");
+        let parsed_initial = parse_request_body(&initial_bytes).expect("parse initial request");
+        assert!(parsed_initial.snapshot_capture.is_none());
+        let initial_session_id = super::ensure_session_state(
+            parsed_initial.sys_prompt_hash,
+            &parsed_initial.working_dir,
+            &parsed_initial.model,
+            &parsed_initial.user_prompt_excerpt,
+        );
+
+        let continuation_body = serde_json::json!({
+            "model": "claude-sonnet-4-6",
+            "system": format!("Primary working directory: {working_dir}"),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation. Summary: 1. Primary Request and Intent: Continue the Playwright OpenTelemetry metrics rollout."
+                }
+            ]
+        });
+        let continuation_bytes =
+            serde_json::to_vec(&continuation_body).expect("serialize continuation request");
+        let parsed_continuation =
+            parse_request_body(&continuation_bytes).expect("parse continuation request");
+
+        assert!(parsed_continuation.is_compacted_continuation);
+        assert!(!parsed_continuation.is_internal_request);
+        assert_ne!(
+            parsed_continuation.sys_prompt_hash,
+            parsed_initial.sys_prompt_hash
+        );
+
+        let (resolved_hash, resolved_session_id) =
+            super::resolve_request_session_identity(&parsed_continuation);
+        assert_eq!(resolved_hash, parsed_initial.sys_prompt_hash);
+        assert_eq!(resolved_session_id, initial_session_id);
+
+        let _ = super::remove_session_state_by_id(&initial_session_id);
+    }
+
+    #[test]
     fn malformed_request_body_does_not_panic_or_capture() {
         let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
         let _capture = EnvVarGuard::set("CC_BLACKBOX_CAPTURE_PROMPTS", "1");
@@ -12098,6 +12311,7 @@ mod tests {
             diagnosis::SessionState {
                 session_id: "session_existing".to_string(),
                 display_name: "cc-blackbox".to_string(),
+                working_dir: "/tmp/cc-blackbox".to_string(),
                 model: "claude-sonnet".to_string(),
                 initial_prompt: None,
                 created_at: Instant::now(),
@@ -12387,6 +12601,7 @@ mod tests {
             diagnosis::SessionState {
                 session_id: session_id.to_string(),
                 display_name: "finalization-test".to_string(),
+                working_dir: "/tmp/finalization-test".to_string(),
                 model: "claude-sonnet".to_string(),
                 initial_prompt: Some(prompt.to_string()),
                 created_at: Instant::now(),
@@ -13653,6 +13868,7 @@ mod tests {
             diagnosis::SessionState {
                 session_id: "session_metrics_scan_guard".to_string(),
                 display_name: "metrics-scan-guard".to_string(),
+                working_dir: "/tmp/metrics-scan-guard".to_string(),
                 model: "claude-sonnet-4-6".to_string(),
                 initial_prompt: None,
                 created_at: Instant::now(),
@@ -15856,6 +16072,7 @@ mod tests {
             diagnosis::SessionState {
                 session_id: session_id.to_string(),
                 display_name: "no-turn-timeout".to_string(),
+                working_dir: "/tmp/no-turn-timeout".to_string(),
                 model: "claude-sonnet".to_string(),
                 initial_prompt: Some("No turn yet".to_string()),
                 created_at: Instant::now(),
@@ -15888,6 +16105,7 @@ mod tests {
             diagnosis::SessionState {
                 session_id: session_id.to_string(),
                 display_name: "timeout-recheck".to_string(),
+                working_dir: "/tmp/timeout-recheck".to_string(),
                 model: "claude-sonnet".to_string(),
                 initial_prompt: Some("Still active".to_string()),
                 created_at: Instant::now(),
@@ -15935,6 +16153,7 @@ mod tests {
             diagnosis::SessionState {
                 session_id: session_id.to_string(),
                 display_name: "live-marker-final".to_string(),
+                working_dir: "/tmp/live-marker-final".to_string(),
                 model: "claude-sonnet".to_string(),
                 initial_prompt: Some("Finish cleanly".to_string()),
                 created_at: Instant::now(),
@@ -16009,6 +16228,7 @@ mod tests {
             diagnosis::SessionState {
                 session_id: session_id.to_string(),
                 display_name: "explicit-finalization".to_string(),
+                working_dir: "/tmp/explicit-finalization".to_string(),
                 model: "claude-sonnet".to_string(),
                 initial_prompt: Some("Implement the finalization API".to_string()),
                 created_at: Instant::now(),
@@ -16495,6 +16715,7 @@ mod tests {
             diagnosis::SessionState {
                 session_id: session_id.to_string(),
                 display_name: "token-budget-final".to_string(),
+                working_dir: "/tmp/token-budget-final".to_string(),
                 model: "claude-sonnet".to_string(),
                 initial_prompt: Some("Stay within budget".to_string()),
                 created_at: Instant::now(),
@@ -16905,6 +17126,7 @@ action = "warn"
             diagnosis::SessionState {
                 session_id: "session-status-block".to_string(),
                 display_name: "api".to_string(),
+                working_dir: "/tmp/session-status-block".to_string(),
                 model: "claude-sonnet".to_string(),
                 initial_prompt: Some("redacted prompt excerpt".to_string()),
                 created_at: Instant::now(),
@@ -16963,6 +17185,7 @@ action = "warn"
             diagnosis::SessionState {
                 session_id: "session-status-cache".to_string(),
                 display_name: "api".to_string(),
+                working_dir: "/tmp/session-status-cache".to_string(),
                 model: "claude-sonnet".to_string(),
                 initial_prompt: None,
                 created_at: Instant::now(),
@@ -17024,6 +17247,7 @@ action = "warn"
             diagnosis::SessionState {
                 session_id: "session-status-real".to_string(),
                 display_name: "project".to_string(),
+                working_dir: "/tmp/session-status-real".to_string(),
                 model: "claude-haiku".to_string(),
                 initial_prompt: None,
                 created_at: Instant::now(),
@@ -17038,6 +17262,7 @@ action = "warn"
             diagnosis::SessionState {
                 session_id: "session-status-placeholder".to_string(),
                 display_name: "project-dup".to_string(),
+                working_dir: "/tmp/session-status-placeholder".to_string(),
                 model: "claude-haiku".to_string(),
                 initial_prompt: None,
                 created_at: Instant::now(),
@@ -17110,6 +17335,7 @@ action = "warn"
             diagnosis::SessionState {
                 session_id: "session-status-expired".to_string(),
                 display_name: "api".to_string(),
+                working_dir: "/tmp/session-status-expired".to_string(),
                 model: "claude-sonnet".to_string(),
                 initial_prompt: None,
                 created_at: Instant::now(),
@@ -17194,6 +17420,7 @@ action = "diagnose_only"
             diagnosis::SessionState {
                 session_id: "session-status-policy-change".to_string(),
                 display_name: "api".to_string(),
+                working_dir: "/tmp/session-status-policy-change".to_string(),
                 model: "claude-sonnet".to_string(),
                 initial_prompt: None,
                 created_at: Instant::now(),

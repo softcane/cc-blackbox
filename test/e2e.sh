@@ -26,15 +26,82 @@ for cmd in docker curl python3 sqlite3; do
 done
 
 RUN_ID="${CC_BLACKBOX_E2E_RUN_ID:-e2e-$(date +%s)-$$}"
-CORE_URL="http://localhost:9091"
-ENVOY_URL="http://localhost:10000"
-PROM_URL="http://localhost:9092"
-GRAFANA_URL="http://localhost:3000"
 COMPOSE_FILES=(-f docker-compose.yml -f test/docker-compose.e2e.yml)
 E2E_COMPLETED=0
+E2E_AUTO_PORTS=0
+E2E_NORMAL_STACK_RESTORED=0
 
 compose() {
     docker compose "${COMPOSE_FILES[@]}" "$@"
+}
+
+port_available() {
+    local host=$1
+    local port=$2
+    python3 - "$host" "$port" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind((host, port))
+    except OSError:
+        raise SystemExit(1)
+PY
+}
+
+find_open_port() {
+    local host=$1
+    python3 - "$host" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind((host, 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+set_e2e_port() {
+    local env_name=$1
+    local host=$2
+    local default_port=$3
+    local selected
+
+    if [ -n "${!env_name:-}" ]; then
+        return
+    fi
+
+    if port_available "$host" "$default_port"; then
+        export "$env_name=$default_port"
+        return
+    fi
+
+    selected=$(find_open_port "$host")
+    export "$env_name=$selected"
+    E2E_AUTO_PORTS=1
+    info "Default ${env_name#CC_BLACKBOX_} $default_port is busy on $host; using $selected for this E2E run"
+}
+
+configure_e2e_endpoints() {
+    export CC_BLACKBOX_CORE_HOST="${CC_BLACKBOX_CORE_HOST:-127.0.0.1}"
+    export CC_BLACKBOX_ENVOY_HOST="${CC_BLACKBOX_ENVOY_HOST:-127.0.0.1}"
+    export CC_BLACKBOX_PROMETHEUS_HOST="${CC_BLACKBOX_PROMETHEUS_HOST:-127.0.0.1}"
+    export CC_BLACKBOX_GRAFANA_HOST="${CC_BLACKBOX_GRAFANA_HOST:-127.0.0.1}"
+
+    set_e2e_port CC_BLACKBOX_CORE_PORT "$CC_BLACKBOX_CORE_HOST" 9091
+    set_e2e_port CC_BLACKBOX_ENVOY_PORT "$CC_BLACKBOX_ENVOY_HOST" 10000
+    set_e2e_port CC_BLACKBOX_PROMETHEUS_PORT "$CC_BLACKBOX_PROMETHEUS_HOST" 9092
+    set_e2e_port CC_BLACKBOX_GRAFANA_PORT "$CC_BLACKBOX_GRAFANA_HOST" 3000
+
+    CORE_URL="http://${CC_BLACKBOX_CORE_HOST}:${CC_BLACKBOX_CORE_PORT}"
+    ENVOY_URL="http://${CC_BLACKBOX_ENVOY_HOST}:${CC_BLACKBOX_ENVOY_PORT}"
+    PROM_URL="http://${CC_BLACKBOX_PROMETHEUS_HOST}:${CC_BLACKBOX_PROMETHEUS_PORT}"
+    GRAFANA_URL="http://${CC_BLACKBOX_GRAFANA_HOST}:${CC_BLACKBOX_GRAFANA_PORT}"
 }
 
 cleanup_e2e_stack_on_failure() {
@@ -53,9 +120,16 @@ restore_normal_stack() {
     info "Stopping fake Anthropic E2E stack..."
     compose down --remove-orphans -t 5 >/dev/null
 
+    if [ "$E2E_AUTO_PORTS" = "1" ] && [ -z "${CC_BLACKBOX_E2E_RESTORE_NORMAL_STACK+x}" ]; then
+        pass "Fake Anthropic E2E stack stopped"
+        info "Skipping normal stack restore because E2E used auto-selected non-default ports"
+        return
+    fi
+
     if [ "${CC_BLACKBOX_E2E_RESTORE_NORMAL_STACK:-1}" = "1" ]; then
         info "Restoring normal cc-blackbox stack..."
         docker compose up -d >/dev/null
+        E2E_NORMAL_STACK_RESTORED=1
         pass "Normal cc-blackbox stack restored"
     else
         pass "Fake Anthropic E2E stack stopped"
@@ -90,7 +164,7 @@ wait_for_envoy() {
         sleep 2
     done
     compose ps
-    fail "envoy did not open localhost:10000"
+    fail "envoy did not open $ENVOY_URL"
 }
 
 post_hook() {
@@ -363,8 +437,11 @@ assert_json_python() {
 
 echo "=== cc-blackbox deterministic E2E Test ==="
 info "run_id=$RUN_ID"
-info "Starting docker compose with fake Anthropic upstream..."
+info "Stopping any existing cc-blackbox E2E stack..."
 compose down --remove-orphans -t 5 2>/dev/null || true
+configure_e2e_endpoints
+info "Using endpoints: core=$CORE_URL envoy=$ENVOY_URL prometheus=$PROM_URL grafana=$GRAFANA_URL"
+info "Starting docker compose with fake Anthropic upstream..."
 compose up -d --build
 
 info "Waiting for cc-blackbox-core and envoy..."
@@ -494,4 +571,6 @@ echo ""
 echo "=== All deterministic E2E checks passed ==="
 E2E_COMPLETED=1
 restore_normal_stack
-echo "(normal stack left running - use 'docker compose down' to stop)"
+if [ "$E2E_NORMAL_STACK_RESTORED" = "1" ]; then
+    echo "(normal stack left running - use 'docker compose down' to stop)"
+fi

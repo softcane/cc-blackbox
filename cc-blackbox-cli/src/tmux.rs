@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use colored::Colorize;
 use futures_util::StreamExt;
 
-use crate::{event_session_id, WatchEvent};
+use crate::{event_session_id, CompactionSnapshotEvent, WatchEvent};
 
 // ---------------------------------------------------------------------------
 // Tmux environment checks
@@ -160,7 +160,20 @@ struct ManagedPane {
     turns_to_compact: Option<u32>,
     /// If Anthropic routed to a different model than requested.
     model_fallback: Option<(String, String)>,
+    /// Latest compaction snapshot/drift summary for the session.
+    snapshot_summary: Option<SnapshotPaneSummary>,
     applied_activity: Option<Activity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SnapshotPaneSummary {
+    sequence: u64,
+    status: String,
+    capture_mode: String,
+    preservation_score: Option<u8>,
+    scope_label: Option<String>,
+    risk_label: Option<String>,
+    missing_count: usize,
 }
 
 /// Activity level derived from `last_activity` elapsed time.
@@ -188,6 +201,41 @@ fn format_observed_tool_calls(n: u32) -> String {
         0 => "no tool calls seen".to_string(),
         1 => "1 tool call seen".to_string(),
         _ => format!("{n} tool calls seen"),
+    }
+}
+
+fn snapshot_pane_summary(snapshot: &CompactionSnapshotEvent) -> SnapshotPaneSummary {
+    SnapshotPaneSummary {
+        sequence: snapshot.sequence,
+        status: if snapshot.detection.status.is_empty() {
+            "suspected".to_string()
+        } else {
+            snapshot.detection.status.clone()
+        },
+        capture_mode: if snapshot.capture_mode.is_empty() {
+            "unknown".to_string()
+        } else {
+            snapshot.capture_mode.clone()
+        },
+        preservation_score: snapshot
+            .drift
+            .as_ref()
+            .map(|drift| drift.state_preservation.score),
+        scope_label: snapshot
+            .drift
+            .as_ref()
+            .map(|drift| drift.scope_drift.label.clone())
+            .filter(|label| !label.is_empty()),
+        risk_label: snapshot
+            .drift
+            .as_ref()
+            .map(|drift| drift.risk.label.clone())
+            .filter(|label| !label.is_empty()),
+        missing_count: snapshot
+            .drift
+            .as_ref()
+            .map(|drift| drift.missing_facts.len())
+            .unwrap_or(0),
     }
 }
 
@@ -685,6 +733,7 @@ impl TmuxOrchestrator {
                 fill_percent: None,
                 turns_to_compact: None,
                 model_fallback: None,
+                snapshot_summary: None,
                 applied_activity: None,
             },
         );
@@ -961,6 +1010,35 @@ impl TmuxOrchestrator {
                         println!("{}", colored);
                     }
                 }
+                if let Some(snapshot) = &pane.snapshot_summary {
+                    if !pane.ended {
+                        let mut parts = vec![format!(
+                            "{}snapshot #{} {} [{}]",
+                            name_indent, snapshot.sequence, snapshot.status, snapshot.capture_mode
+                        )];
+                        if let Some(score) = snapshot.preservation_score {
+                            parts.push(format!("preservation {score}/100"));
+                        }
+                        if let Some(scope) = &snapshot.scope_label {
+                            parts.push(format!("scope {scope}"));
+                        }
+                        if let Some(risk) = &snapshot.risk_label {
+                            parts.push(format!("risk {risk}"));
+                        }
+                        if snapshot.missing_count > 0 {
+                            parts.push(format!("missing {}", snapshot.missing_count));
+                        }
+                        let msg = parts.join(" · ");
+                        let high_risk = snapshot.risk_label.as_deref() == Some("high")
+                            || snapshot.preservation_score.is_some_and(|score| score < 50);
+                        let colored = if high_risk {
+                            msg.red().bold().to_string()
+                        } else {
+                            msg.yellow().to_string()
+                        };
+                        println!("{}", colored);
+                    }
+                }
                 if let Some((req, actual)) = &pane.model_fallback {
                     if !pane.ended {
                         println!(
@@ -1138,6 +1216,17 @@ impl TmuxOrchestrator {
                 self.ensure_pane_exists(session_id, cleanup_pane_ids);
                 if let Some(pane) = self.panes.get_mut(session_id.as_str()) {
                     pane.model_fallback = Some((requested.clone(), actual.clone()));
+                }
+                self.render_status();
+            }
+
+            WatchEvent::CompactionSnapshot {
+                session_id,
+                snapshot,
+            } => {
+                self.ensure_pane_exists(session_id, cleanup_pane_ids);
+                if let Some(pane) = self.panes.get_mut(session_id.as_str()) {
+                    pane.snapshot_summary = Some(snapshot_pane_summary(snapshot));
                 }
                 self.render_status();
             }
@@ -1347,6 +1436,7 @@ mod tests {
             fill_percent: None,
             turns_to_compact: None,
             model_fallback: None,
+            snapshot_summary: None,
             applied_activity: None,
         }
     }
@@ -1743,6 +1833,40 @@ exit 0
                 .expect("pane")
                 .model_fallback,
             Some(("opus".to_string(), "sonnet".to_string()))
+        );
+
+        let snapshot_event: WatchEvent = serde_json::from_str(
+            r#"{
+              "type":"compaction_snapshot",
+              "session_id":"session_a",
+              "snapshot":{
+                "sequence":2,
+                "capture_mode":"safe_redacted",
+                "local_only":true,
+                "detection":{"status":"detected","reason":"message count dropped","confidence":0.8},
+                "request":{"message_count":2,"system_prompt_length":100,"estimated_input_tokens":1000,"first_message_hash":"firstmsg","system_prompt_hash":"hash","compacted_state_hash":"hash2"},
+                "excerpts":{},
+                "drift":{"source":"deterministic","objective_alignment":{"score":70,"label":"medium","evidence":[]},"state_preservation":{"score":61,"label":"medium","evidence":[]},"scope_drift":{"score":20,"label":"low","evidence":[]},"actionability":{"score":80,"label":"high","evidence":[]},"risk":{"score":25,"label":"low","evidence":[]},"missing_facts":["test"],"changed_framing":null,"caveats":[]}
+              }
+            }"#,
+        )
+        .expect("snapshot event");
+        orchestrator.handle_event(&snapshot_event, &cleanup);
+        assert_eq!(
+            orchestrator
+                .panes
+                .get("session_a")
+                .expect("pane")
+                .snapshot_summary,
+            Some(super::SnapshotPaneSummary {
+                sequence: 2,
+                status: "detected".to_string(),
+                capture_mode: "safe_redacted".to_string(),
+                preservation_score: Some(61),
+                scope_label: Some("low".to_string()),
+                risk_label: Some("low".to_string()),
+                missing_count: 1,
+            })
         );
 
         orchestrator

@@ -59,6 +59,7 @@ pub mod guard;
 pub mod jsonl;
 pub mod metrics;
 pub mod pricing;
+pub mod snapshots;
 pub mod watch;
 
 use envoy::config::core::v3::{
@@ -6311,6 +6312,67 @@ fn flush_deferred_watch_events(session_id: &str, events: Vec<watch::WatchEvent>)
     }
 }
 
+fn previous_context_fill_percent_for_session(session_id: &str) -> Option<f64> {
+    diagnosis::SESSION_TURNS
+        .get(session_id)
+        .and_then(|turns| turns.last().map(|turn| turn.context_utilization * 100.0))
+}
+
+fn maybe_spawn_claude_drift_analysis(snapshot: snapshots::CompactionSnapshot) {
+    let mode = snapshots::ClaudeDriftAnalyzerMode::from_env();
+    if matches!(mode, snapshots::ClaudeDriftAnalyzerMode::Disabled) {
+        return;
+    }
+
+    tokio::spawn(async move {
+        match snapshots::run_configured_claude_drift_analysis(mode, &snapshot).await {
+            Ok(drift) => {
+                if let Some(updated) = snapshots::SNAPSHOT_STORE.update_drift(
+                    &snapshot.session_id,
+                    snapshot.sequence,
+                    drift,
+                ) {
+                    watch::BROADCASTER.broadcast(watch::WatchEvent::CompactionSnapshot {
+                        session_id: updated.session_id.clone(),
+                        snapshot: Box::new(updated),
+                    });
+                }
+            }
+            Err(err) => {
+                warn!(
+                    session_id = %snapshot.session_id,
+                    sequence = snapshot.sequence,
+                    error = %err,
+                    "Claude-assisted drift analysis failed; keeping deterministic score"
+                );
+            }
+        }
+    });
+}
+
+fn record_prompt_snapshot_after_continue(
+    candidate: snapshots::RequestSnapshotCandidate,
+    session_id: &str,
+    request_id: &str,
+) {
+    let previous_context_fill_percent = previous_context_fill_percent_for_session(session_id);
+    let Some(snapshot) = snapshots::SNAPSHOT_STORE.record_request(
+        candidate,
+        session_id.to_string(),
+        request_id.to_string(),
+        now_iso8601(),
+        previous_context_fill_percent,
+    ) else {
+        return;
+    };
+
+    watch::BROADCASTER.broadcast(watch::WatchEvent::CompactionSnapshot {
+        session_id: snapshot.session_id.clone(),
+        snapshot: Box::new(snapshot.clone()),
+    });
+    maybe_spawn_claude_drift_analysis(snapshot);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_response(
     acc: &mut ResponseAccumulator,
@@ -8173,6 +8235,7 @@ struct ParsedRequestBody {
     user_prompt_excerpt: String,
     is_internal_request: bool,
     cache_ttl_evidence: Option<CacheTtlEvidence>,
+    snapshot_capture: Option<snapshots::RequestSnapshotCandidate>,
 }
 
 fn cache_control_ttl_secs(cache_control: &Value) -> Option<u64> {
@@ -8240,6 +8303,9 @@ fn is_internal_request_shape(
         || (system_prompt_length == 0
             && looks_like_title_request(user_prompt_excerpt, message_count, has_tools))
         || looks_like_title_request(user_prompt_excerpt, message_count, has_tools)
+        || user_prompt_excerpt
+            .to_ascii_lowercase()
+            .contains("cc-blackbox's compaction drift analyst")
 }
 
 /// Returns (model, message_count, has_tools, system_prompt_length, estimated_input_tokens, sys_prompt_hash, working_dir).
@@ -8331,6 +8397,27 @@ fn parse_request_body(body: &[u8]) -> Option<ParsedRequestBody> {
     let cache_ttl_evidence = request_cache_ttl_evidence(&v);
     let is_internal_request =
         is_internal_request_shape(&working_dir, sl, mc, ht, &user_prompt_excerpt);
+    let snapshot_capture = if is_internal_request {
+        None
+    } else {
+        snapshots::PromptCaptureMode::from_env().map(|capture_mode| {
+            snapshots::build_candidate(
+                &v,
+                capture_mode,
+                snapshots::RequestSnapshotInput {
+                    model: model.clone(),
+                    working_dir: normalize_working_dir(&working_dir),
+                    message_count: mc,
+                    system_prompt_length: sl,
+                    estimated_input_tokens: body.len() / 4,
+                    first_message_hash: first_message_hash.clone(),
+                    first_user_message: first_user_message.clone(),
+                    user_prompt_excerpt: user_prompt_excerpt.clone(),
+                    compacted_state_hash: snapshots::hash_bytes_hex(body),
+                },
+            )
+        })
+    };
 
     Some(ParsedRequestBody {
         model,
@@ -8344,6 +8431,7 @@ fn parse_request_body(body: &[u8]) -> Option<ParsedRequestBody> {
         user_prompt_excerpt,
         is_internal_request,
         cache_ttl_evidence,
+        snapshot_capture,
     })
 }
 
@@ -9234,6 +9322,8 @@ impl ExternalProcessor for CcBlackboxProcessor {
             let mut request_cache_ttl: Option<CacheTtlEvidence> = None;
             let mut request_context_window_hint: Option<u64> = None;
             let mut request_anthropic_beta_values: Vec<String> = Vec::new();
+            let mut pending_snapshot_capture: Option<snapshots::RequestSnapshotCandidate> = None;
+            let mut pending_snapshot_session_id: Option<String> = None;
             let mut context_window_tokens = STANDARD_CONTEXT_WINDOW_TOKENS;
             let mut finalized = false;
 
@@ -9287,6 +9377,8 @@ impl ExternalProcessor for CcBlackboxProcessor {
                 match msg.request {
                     Some(ExtProcRequest::RequestHeaders(ref h)) => {
                         started_at = Instant::now();
+                        pending_snapshot_capture = None;
+                        pending_snapshot_session_id = None;
                         request_id = extract_header(h, "x-request-id")
                             .filter(|value| !value.trim().is_empty())
                             .unwrap_or_else(fallback_request_id);
@@ -9317,6 +9409,7 @@ impl ExternalProcessor for CcBlackboxProcessor {
                         match parse_request_body(&b.body) {
                             Some(parsed) => {
                                 info!(phase="request_body", request_id=%request_id, model=%parsed.model, message_count=parsed.message_count, has_tools=parsed.has_tools, system_prompt_length=parsed.system_prompt_length, estimated_input_tokens=parsed.estimated_input_tokens, sys_prompt_hash=parsed.sys_prompt_hash, "ext_proc");
+                                let snapshot_capture = parsed.snapshot_capture.clone();
                                 let session_id = ensure_session_state(
                                     parsed.sys_prompt_hash,
                                     &parsed.working_dir,
@@ -9348,6 +9441,8 @@ impl ExternalProcessor for CcBlackboxProcessor {
                                             broadcast_guard_finding(finding);
                                         }
                                         let _ = finalize_terminal_budget_block(block);
+                                        pending_snapshot_capture = None;
+                                        pending_snapshot_session_id = None;
                                         blocked = true;
                                     }
                                 }
@@ -9362,6 +9457,8 @@ impl ExternalProcessor for CcBlackboxProcessor {
                                 is_internal_request = parsed.is_internal_request;
                                 request_cache_ttl = parsed.cache_ttl_evidence.clone();
                                 if !blocked {
+                                    pending_snapshot_capture = snapshot_capture;
+                                    pending_snapshot_session_id = Some(session_id.clone());
                                     context_window_tokens = resolve_context_window_tokens(
                                         request_context_window_hint,
                                         &parsed.model,
@@ -9404,6 +9501,17 @@ impl ExternalProcessor for CcBlackboxProcessor {
                         };
                         if tx.send(Ok(response)).await.is_err() {
                             break;
+                        }
+
+                        if let (Some(candidate), Some(snapshot_session_id)) = (
+                            pending_snapshot_capture.take(),
+                            pending_snapshot_session_id.take(),
+                        ) {
+                            record_prompt_snapshot_after_continue(
+                                candidate,
+                                &snapshot_session_id,
+                                &request_id,
+                            );
                         }
 
                         let parse_ms = parse_start.elapsed().as_millis();
@@ -9780,9 +9888,34 @@ fn event_matches_session(ev: &watch::WatchEvent, filter: Option<&str>) -> bool {
         | watch::WatchEvent::RequestError { session_id, .. }
         | watch::WatchEvent::GuardFinding { session_id, .. }
         | watch::WatchEvent::ModelFallback { session_id, .. }
-        | watch::WatchEvent::ContextStatus { session_id, .. } => session_id == want,
+        | watch::WatchEvent::ContextStatus { session_id, .. }
+        | watch::WatchEvent::CompactionSnapshot { session_id, .. } => session_id == want,
         watch::WatchEvent::RateLimitStatus { .. } => true,
     }
+}
+
+fn build_session_snapshots_response_json(session_id: &str) -> Value {
+    let snapshots = snapshots::SNAPSHOT_STORE.list_session_snapshots(session_id);
+    serde_json::json!({
+        "session_id": session_id,
+        "retention": {
+            "storage": "bounded_in_memory",
+            "raw_prompts_persisted_to_sqlite": false,
+        },
+        "snapshots": snapshots,
+    })
+}
+
+async fn handle_session_snapshots(
+    axum::extract::Path(session_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let data = build_session_snapshots_response_json(&session_id);
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        serde_json::to_string_pretty(&data).unwrap_or_default(),
+    )
+        .into_response()
 }
 
 async fn handle_diagnosis(
@@ -10668,6 +10801,10 @@ async fn http_server() {
         .route("/api/cache-rebuilds", get(handle_cache_rebuilds))
         .route("/api/sessions", get(handle_sessions))
         .route(
+            "/api/sessions/:session_id/snapshots",
+            get(handle_session_snapshots),
+        )
+        .route(
             "/api/sessions/resolve-jsonl",
             get(handle_resolve_jsonl_session),
         )
@@ -10699,6 +10836,13 @@ async fn cleanup_stale_requests() {
         let removed = before - REQUEST_STATE.len();
         if removed > 0 {
             info!(removed, "cleaned up stale request metadata");
+        }
+        let removed_snapshot_sessions = snapshots::SNAPSHOT_STORE.cleanup_expired();
+        if removed_snapshot_sessions > 0 {
+            info!(
+                removed_snapshot_sessions,
+                "cleaned up stale prompt snapshot sessions"
+            );
         }
     }
 }
@@ -11011,6 +11155,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize the event broadcaster.
     let _ = &*watch::BROADCASTER;
+    match snapshots::PromptCaptureMode::from_env() {
+        Some(snapshots::PromptCaptureMode::Safe) => {
+            info!("prompt snapshot capture enabled in safe redacted mode");
+        }
+        Some(snapshots::PromptCaptureMode::Full) => {
+            warn!(
+                "FULL LOCAL-ONLY PROMPT CAPTURE ENABLED; snapshot excerpts may contain sensitive text"
+            );
+        }
+        None => {}
+    }
     metrics::init();
     metrics::set_active_sessions(active_session_count());
 
@@ -11050,22 +11205,23 @@ mod tests {
         build_cache_rebuilds_response_from_db, build_diagnosis_response_json,
         build_guard_policy_report_json, build_guard_status_report_json,
         build_postmortem_response_from_db, build_recent_sessions_response_from_db,
-        build_session_summary_json, build_sessions_response_json, build_summary_response_json,
-        canonical_telemetry_name, classify_cache_event, clean_user_prompt,
-        compact_response_summary, content_metadata_for_storage, context_fill_percent,
-        context_fill_ratio, correlation, db_writer_loop, derive_display_name, diagnosis,
-        end_session_with_db_tx, ensure_session_columns, epoch_to_iso8601,
-        estimated_rebuild_cost_for_cache_event, evaluate_request_guard_for_session,
-        extract_explicit_skill_refs, extract_header, extract_headers, extract_working_dir,
-        fallback_request_id, guard, guard_finding_watch_event, in_memory_postmortem_totals,
-        infer_context_window_tokens, is_internal_request_shape, load_degradation_view_from_db,
-        lock_or_recover, looks_like_machine_recall_line, looks_like_title_request,
-        make_guard_block_response, metrics, model_requests_1m_context, normalize_search_text,
-        now_epoch_secs, now_iso8601, parse_latest_tool_results, parse_request_body,
-        persist_billing_reconciliation, persist_final_session_artifacts, pricing,
-        query_historical_metrics, query_redact_enabled, query_summary,
-        record_api_response_for_guard, redact_operational_text, repair_persisted_session_artifacts,
-        repair_turn_snapshot_context_windows, request_cache_ttl_evidence, request_cache_ttl_secs,
+        build_session_snapshots_response_json, build_session_summary_json,
+        build_sessions_response_json, build_summary_response_json, canonical_telemetry_name,
+        classify_cache_event, clean_user_prompt, compact_response_summary,
+        content_metadata_for_storage, context_fill_percent, context_fill_ratio, correlation,
+        db_writer_loop, derive_display_name, diagnosis, end_session_with_db_tx,
+        ensure_session_columns, epoch_to_iso8601, estimated_rebuild_cost_for_cache_event,
+        evaluate_request_guard_for_session, event_matches_session, extract_explicit_skill_refs,
+        extract_header, extract_headers, extract_working_dir, fallback_request_id, guard,
+        guard_finding_watch_event, in_memory_postmortem_totals, infer_context_window_tokens,
+        is_internal_request_shape, load_degradation_view_from_db, lock_or_recover,
+        looks_like_machine_recall_line, looks_like_title_request, make_guard_block_response,
+        metrics, model_requests_1m_context, normalize_search_text, now_epoch_secs, now_iso8601,
+        parse_latest_tool_results, parse_request_body, persist_billing_reconciliation,
+        persist_final_session_artifacts, pricing, query_historical_metrics, query_redact_enabled,
+        query_summary, record_api_response_for_guard, redact_operational_text,
+        repair_persisted_session_artifacts, repair_turn_snapshot_context_windows,
+        request_cache_ttl_evidence, request_cache_ttl_secs,
         request_context_window_hint_from_headers, request_guard_policy, request_uses_1m_context,
         resolve_context_window_tokens, resolve_context_window_tokens_with_config,
         response_cache_ttl_secs, score_recall_doc, seed_live_metric_labels_from_db,
@@ -11253,6 +11409,8 @@ mod tests {
 
     #[test]
     fn request_body_parser_extracts_session_identity_inputs() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _capture = EnvVarGuard::remove("CC_BLACKBOX_CAPTURE_PROMPTS");
         let body = br#"{
           "model": "claude-sonnet-4-5[1m]",
           "system": [
@@ -11290,7 +11448,60 @@ mod tests {
     }
 
     #[test]
+    fn request_body_parser_gates_prompt_snapshot_capture_by_env() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let body = br#"{
+          "model": "claude-sonnet-4-6",
+          "system": "Primary working directory: /tmp/snapshot-gate",
+          "messages": [
+            { "role": "user", "content": "Fix auth timeout with token=sk-ant-secretvalue" }
+          ]
+        }"#;
+
+        let _capture = EnvVarGuard::remove("CC_BLACKBOX_CAPTURE_PROMPTS");
+        let parsed = parse_request_body(body).expect("parse disabled");
+        assert!(parsed.snapshot_capture.is_none());
+        drop(_capture);
+
+        let _capture = EnvVarGuard::set("CC_BLACKBOX_CAPTURE_PROMPTS", "false");
+        let parsed = parse_request_body(body).expect("parse false");
+        assert!(parsed.snapshot_capture.is_none());
+        drop(_capture);
+
+        let _capture = EnvVarGuard::set("CC_BLACKBOX_CAPTURE_PROMPTS", "1");
+        let parsed = parse_request_body(body).expect("parse safe");
+        assert!(matches!(
+            parsed
+                .snapshot_capture
+                .as_ref()
+                .map(|capture| capture.capture_mode),
+            Some(crate::snapshots::PromptCaptureMode::Safe)
+        ));
+        drop(_capture);
+
+        let _capture = EnvVarGuard::set("CC_BLACKBOX_CAPTURE_PROMPTS", "full");
+        let parsed = parse_request_body(body).expect("parse full");
+        assert!(matches!(
+            parsed
+                .snapshot_capture
+                .as_ref()
+                .map(|capture| capture.capture_mode),
+            Some(crate::snapshots::PromptCaptureMode::Full)
+        ));
+    }
+
+    #[test]
+    fn malformed_request_body_does_not_panic_or_capture() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _capture = EnvVarGuard::set("CC_BLACKBOX_CAPTURE_PROMPTS", "1");
+        assert!(parse_request_body(br#"{"model":"claude-sonnet","messages":["#).is_none());
+        assert!(parse_request_body(br#"{"messages":[]}"#).is_none());
+    }
+
+    #[test]
     fn request_body_parser_keeps_haiku_coding_sessions_but_excludes_title_requests() {
+        let _env_lock = ENV_TEST_LOCK.lock().expect("env test lock");
+        let _capture = EnvVarGuard::remove("CC_BLACKBOX_CAPTURE_PROMPTS");
         let coding = br#"{
           "model": "claude-haiku-4-5-20251001",
           "system": "Primary working directory: /tmp/cc-blackbox-haiku",
@@ -12354,6 +12565,79 @@ mod tests {
             response_summary: Some(response_summary.to_string()),
             response_error_type: None,
             response_error_message: None,
+        }
+    }
+
+    fn sample_compaction_snapshot(session_id: &str) -> crate::snapshots::CompactionSnapshot {
+        crate::snapshots::CompactionSnapshot {
+            sequence: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            session_id: session_id.to_string(),
+            request_id: "req_snapshot".to_string(),
+            model: "claude-sonnet".to_string(),
+            capture_mode: crate::snapshots::PromptCaptureMode::Safe,
+            local_only: true,
+            full_capture_warning: None,
+            detection: crate::snapshots::CompactionDetection {
+                status: crate::snapshots::CompactionDetectionStatus::Detected,
+                reason: "message count dropped".to_string(),
+                confidence: 0.8,
+                signals: vec!["message count dropped".to_string()],
+            },
+            request: crate::snapshots::SnapshotRequestShape {
+                message_count: 2,
+                previous_message_count: Some(10),
+                system_prompt_length: 500,
+                previous_system_prompt_length: Some(1000),
+                estimated_input_tokens: 2000,
+                previous_estimated_input_tokens: Some(20_000),
+                first_message_hash: "firstmsg_latest".to_string(),
+                previous_first_message_hash: Some("firstmsg_previous".to_string()),
+                system_prompt_hash: "hash_system".to_string(),
+                compacted_state_hash: "hash_compact".to_string(),
+            },
+            excerpts: crate::snapshots::SnapshotExcerpts {
+                initial_objective: crate::snapshots::safe_excerpt("Fix login timeout", 240),
+                compacted_objective: crate::snapshots::safe_excerpt(
+                    "Compaction summary: fix login timeout. Next run tests.",
+                    240,
+                ),
+                compact_summary: None,
+                raw_initial_objective: None,
+                raw_compacted_objective: None,
+                raw_compact_summary: None,
+            },
+            drift: Some(crate::snapshots::DriftScore {
+                source: crate::snapshots::DriftScoreSource::Deterministic,
+                objective_alignment: crate::snapshots::DriftDimensionScore {
+                    score: 80,
+                    label: "high".to_string(),
+                    evidence: Vec::new(),
+                },
+                state_preservation: crate::snapshots::DriftDimensionScore {
+                    score: 72,
+                    label: "medium".to_string(),
+                    evidence: Vec::new(),
+                },
+                scope_drift: crate::snapshots::DriftDimensionScore {
+                    score: 20,
+                    label: "low".to_string(),
+                    evidence: Vec::new(),
+                },
+                actionability: crate::snapshots::DriftDimensionScore {
+                    score: 90,
+                    label: "high".to_string(),
+                    evidence: Vec::new(),
+                },
+                risk: crate::snapshots::DriftDimensionScore {
+                    score: 20,
+                    label: "low".to_string(),
+                    evidence: Vec::new(),
+                },
+                missing_facts: Vec::new(),
+                changed_framing: None,
+                caveats: vec!["heuristic".to_string()],
+            }),
         }
     }
 
@@ -17850,6 +18134,113 @@ action = "page_the_user"
             Some(0.24)
         );
         assert!(json.get("rebuild_cost_dollars").is_none());
+    }
+
+    #[test]
+    fn compaction_snapshot_watch_event_serializes_and_filters_by_session() {
+        let event = crate::watch::WatchEvent::CompactionSnapshot {
+            session_id: "session_snapshot".to_string(),
+            snapshot: Box::new(sample_compaction_snapshot("session_snapshot")),
+        };
+        let json = serde_json::to_value(&event).expect("serialize snapshot event");
+        assert_eq!(
+            json.get("type").and_then(|v| v.as_str()),
+            Some("compaction_snapshot")
+        );
+        assert_eq!(
+            json.pointer("/snapshot/capture_mode")
+                .and_then(|v| v.as_str()),
+            Some("safe_redacted")
+        );
+        assert!(json
+            .pointer("/snapshot/excerpts/raw_compacted_objective")
+            .is_none());
+        assert!(event_matches_session(&event, Some("session_snapshot")));
+        assert!(!event_matches_session(&event, Some("session_other")));
+    }
+
+    #[test]
+    fn session_snapshots_api_response_is_in_memory_and_session_scoped() {
+        let session_id = format!(
+            "session_api_snapshot_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        );
+        let first = crate::snapshots::build_candidate(
+            &serde_json::json!({
+                "system": "Primary working directory: /tmp/api-snapshot",
+                "messages": [{"role":"user","content":"Fix login timeout"}]
+            }),
+            crate::snapshots::PromptCaptureMode::Safe,
+            crate::snapshots::RequestSnapshotInput {
+                model: "claude-sonnet".to_string(),
+                working_dir: "/tmp/api-snapshot".to_string(),
+                message_count: 8,
+                system_prompt_length: 1000,
+                estimated_input_tokens: 20_000,
+                first_message_hash: "firstmsg_api_old".to_string(),
+                first_user_message: "Fix login timeout".to_string(),
+                user_prompt_excerpt: "Fix login timeout".to_string(),
+                compacted_state_hash: "hash_old".to_string(),
+            },
+        );
+        crate::snapshots::SNAPSHOT_STORE.record_request(
+            first,
+            session_id.clone(),
+            "req_api_1".to_string(),
+            "2026-01-01T00:00:00Z".to_string(),
+            None,
+        );
+        let compact = crate::snapshots::build_candidate(
+            &serde_json::json!({
+                "system": "Primary working directory: /tmp/api-snapshot",
+                "messages": [{"role":"user","content":"Compaction summary: fix login timeout. Next run tests."}]
+            }),
+            crate::snapshots::PromptCaptureMode::Safe,
+            crate::snapshots::RequestSnapshotInput {
+                model: "claude-sonnet".to_string(),
+                working_dir: "/tmp/api-snapshot".to_string(),
+                message_count: 2,
+                system_prompt_length: 500,
+                estimated_input_tokens: 2_000,
+                first_message_hash: "firstmsg_api_new".to_string(),
+                first_user_message: "Compaction summary: fix login timeout. Next run tests."
+                    .to_string(),
+                user_prompt_excerpt: "Compaction summary: fix login timeout. Next run tests."
+                    .to_string(),
+                compacted_state_hash: "hash_new".to_string(),
+            },
+        );
+        crate::snapshots::SNAPSHOT_STORE.record_request(
+            compact,
+            session_id.clone(),
+            "req_api_2".to_string(),
+            "2026-01-01T00:01:00Z".to_string(),
+            Some(86.0),
+        );
+
+        let json = build_session_snapshots_response_json(&session_id);
+        assert_eq!(
+            json.get("session_id").and_then(|v| v.as_str()),
+            Some(session_id.as_str())
+        );
+        assert_eq!(
+            json.pointer("/retention/storage").and_then(|v| v.as_str()),
+            Some("bounded_in_memory")
+        );
+        assert_eq!(
+            json.pointer("/retention/raw_prompts_persisted_to_sqlite")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            json.get("snapshots")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(1)
+        );
     }
 
     #[test]

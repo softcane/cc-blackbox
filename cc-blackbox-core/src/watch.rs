@@ -8,6 +8,7 @@ use tracing::warn;
 
 use crate::diagnosis::DiagnosisReport;
 use crate::guard::{EvidenceLevel, FindingSeverity, FindingSource, GuardAction, RuleId};
+use crate::snapshots::CompactionSnapshot;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -146,6 +147,13 @@ pub enum WatchEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         context_window_tokens: Option<u64>,
         turns_to_compact: Option<u32>,
+    },
+    /// Request-side prompt snapshot captured after a suspected or detected
+    /// compaction-shaped request. The snapshot payload is already redacted in
+    /// safe mode; full mode is explicitly labeled and remains in memory only.
+    CompactionSnapshot {
+        session_id: String,
+        snapshot: Box<CompactionSnapshot>,
     },
     /// Latest local quota/budget-burn snapshot for the orchestrator top strip. For Claude Code
     /// subscription traffic Anthropic does not return `anthropic-ratelimit-*`
@@ -295,6 +303,73 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{extract_summary, EventBroadcaster, WatchEvent};
+    use crate::snapshots::{
+        CompactionDetection, CompactionDetectionStatus, CompactionSnapshot, DriftDimensionScore,
+        DriftScore, DriftScoreSource, PromptCaptureMode, SnapshotExcerpts, SnapshotRequestShape,
+    };
+
+    fn sample_snapshot(session_id: &str) -> CompactionSnapshot {
+        CompactionSnapshot {
+            sequence: 1,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            session_id: session_id.to_string(),
+            request_id: "req_snapshot".to_string(),
+            model: "claude-sonnet".to_string(),
+            capture_mode: PromptCaptureMode::Safe,
+            local_only: true,
+            full_capture_warning: None,
+            detection: CompactionDetection {
+                status: CompactionDetectionStatus::Detected,
+                reason: "message count dropped".to_string(),
+                confidence: 0.8,
+                signals: vec!["message count dropped".to_string()],
+            },
+            request: SnapshotRequestShape {
+                message_count: 2,
+                previous_message_count: Some(8),
+                system_prompt_length: 500,
+                previous_system_prompt_length: Some(1000),
+                estimated_input_tokens: 2000,
+                previous_estimated_input_tokens: Some(20_000),
+                first_message_hash: "firstmsg_new".to_string(),
+                previous_first_message_hash: Some("firstmsg_old".to_string()),
+                system_prompt_hash: "hash_system".to_string(),
+                compacted_state_hash: "hash_compact".to_string(),
+            },
+            excerpts: SnapshotExcerpts::default(),
+            drift: Some(DriftScore {
+                source: DriftScoreSource::Deterministic,
+                objective_alignment: DriftDimensionScore {
+                    score: 80,
+                    label: "high".to_string(),
+                    evidence: Vec::new(),
+                },
+                state_preservation: DriftDimensionScore {
+                    score: 72,
+                    label: "medium".to_string(),
+                    evidence: Vec::new(),
+                },
+                scope_drift: DriftDimensionScore {
+                    score: 20,
+                    label: "low".to_string(),
+                    evidence: Vec::new(),
+                },
+                actionability: DriftDimensionScore {
+                    score: 90,
+                    label: "high".to_string(),
+                    evidence: Vec::new(),
+                },
+                risk: DriftDimensionScore {
+                    score: 20,
+                    label: "low".to_string(),
+                    evidence: Vec::new(),
+                },
+                missing_facts: Vec::new(),
+                changed_framing: None,
+                caveats: Vec::new(),
+            }),
+        }
+    }
 
     #[test]
     fn extract_summary_renders_known_tool_inputs() {
@@ -351,6 +426,23 @@ mod tests {
             event,
             WatchEvent::ToolResult { outcome, duration_ms, .. }
                 if outcome == "success" && duration_ms == 12
+        ));
+    }
+
+    #[test]
+    fn broadcaster_replays_snapshot_events() {
+        let broadcaster = EventBroadcaster::new();
+        broadcaster.broadcast(WatchEvent::CompactionSnapshot {
+            session_id: "session_a".to_string(),
+            snapshot: Box::new(sample_snapshot("session_a")),
+        });
+
+        let (history, _) = broadcaster.subscribe_with_history();
+        assert_eq!(history.len(), 1);
+        assert!(matches!(
+            &history[0],
+            WatchEvent::CompactionSnapshot { session_id, snapshot }
+                if session_id == "session_a" && snapshot.sequence == 1
         ));
     }
 

@@ -398,6 +398,10 @@ pub(crate) enum WatchEvent {
         #[serde(default)]
         turns_to_compact: Option<u32>,
     },
+    CompactionSnapshot {
+        session_id: String,
+        snapshot: Box<CompactionSnapshotEvent>,
+    },
     #[serde(rename = "quota_burn_status", alias = "rate_limit_status")]
     RateLimitStatus {
         #[serde(default)]
@@ -424,6 +428,145 @@ pub(crate) enum WatchEvent {
     // For the "lagged" pseudo-event from the server.
     #[serde(rename = "lagged")]
     Lagged { missed: u64 },
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct CompactionSnapshotEvent {
+    #[serde(default)]
+    sequence: u64,
+    #[allow(dead_code)]
+    #[serde(default)]
+    timestamp: String,
+    #[serde(default)]
+    request_id: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    capture_mode: String,
+    #[serde(default)]
+    local_only: bool,
+    #[serde(default)]
+    full_capture_warning: Option<String>,
+    #[serde(default)]
+    detection: SnapshotDetection,
+    #[serde(default)]
+    request: SnapshotRequestShape,
+    #[serde(default)]
+    excerpts: SnapshotExcerpts,
+    #[serde(default)]
+    drift: Option<SnapshotDriftScore>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct SnapshotDetection {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    confidence: f64,
+    #[allow(dead_code)]
+    #[serde(default)]
+    signals: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct SnapshotRequestShape {
+    #[serde(default)]
+    message_count: usize,
+    #[serde(default)]
+    previous_message_count: Option<usize>,
+    #[serde(default)]
+    system_prompt_length: usize,
+    #[serde(default)]
+    previous_system_prompt_length: Option<usize>,
+    #[serde(default)]
+    estimated_input_tokens: usize,
+    #[serde(default)]
+    previous_estimated_input_tokens: Option<usize>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    first_message_hash: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    previous_first_message_hash: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    system_prompt_hash: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    compacted_state_hash: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct SnapshotExcerpts {
+    #[allow(dead_code)]
+    #[serde(default)]
+    initial_objective: Option<SnapshotExcerpt>,
+    #[serde(default)]
+    compacted_objective: Option<SnapshotExcerpt>,
+    #[serde(default)]
+    compact_summary: Option<SnapshotExcerpt>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    raw_initial_objective: Option<SnapshotExcerpt>,
+    #[serde(default)]
+    raw_compacted_objective: Option<SnapshotExcerpt>,
+    #[serde(default)]
+    raw_compact_summary: Option<SnapshotExcerpt>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct SnapshotExcerpt {
+    #[serde(default)]
+    text: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    source_chars: usize,
+    #[allow(dead_code)]
+    #[serde(default)]
+    rendered_chars: usize,
+    #[serde(default)]
+    truncated: bool,
+    #[allow(dead_code)]
+    #[serde(default)]
+    redacted: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct SnapshotDriftScore {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    objective_alignment: SnapshotDimensionScore,
+    #[serde(default)]
+    state_preservation: SnapshotDimensionScore,
+    #[serde(default)]
+    scope_drift: SnapshotDimensionScore,
+    #[allow(dead_code)]
+    #[serde(default)]
+    actionability: SnapshotDimensionScore,
+    #[serde(default)]
+    risk: SnapshotDimensionScore,
+    #[serde(default)]
+    missing_facts: Vec<String>,
+    #[serde(default)]
+    changed_framing: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    caveats: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct SnapshotDimensionScore {
+    #[serde(default)]
+    score: u8,
+    #[serde(default)]
+    label: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    evidence: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -858,7 +1001,7 @@ fn bundled_compose_yaml(stack_dir: &Path) -> String {
     volumes:
       - {envoy_config}
     ports:
-      - "127.0.0.1:10000:10000"
+      - "${{CC_BLACKBOX_ENVOY_HOST:-127.0.0.1}}:${{CC_BLACKBOX_ENVOY_PORT:-10000}}:10000"
     depends_on:
       cc-blackbox-core:
         condition: service_healthy
@@ -873,13 +1016,18 @@ fn bundled_compose_yaml(stack_dir: &Path) -> String {
     expose:
       - "50051"
     ports:
-      - "127.0.0.1:9091:9090"
+      - "${{CC_BLACKBOX_CORE_HOST:-127.0.0.1}}:${{CC_BLACKBOX_CORE_PORT:-9091}}:9090"
     environment:
       - RUST_LOG=info
       - CC_BLACKBOX_SESSION_BUDGET_DOLLARS=${{CC_BLACKBOX_SESSION_BUDGET_DOLLARS:-0}}
       - CC_BLACKBOX_SESSION_BUDGET_TOKENS=${{CC_BLACKBOX_SESSION_BUDGET_TOKENS:-0}}
       - CC_BLACKBOX_CIRCUIT_BREAKER_THRESHOLD=${{CC_BLACKBOX_CIRCUIT_BREAKER_THRESHOLD:-0}}
       - CC_BLACKBOX_CIRCUIT_BREAKER_COOLDOWN_SECS=${{CC_BLACKBOX_CIRCUIT_BREAKER_COOLDOWN_SECS:-0}}
+      - CC_BLACKBOX_CAPTURE_PROMPTS=${{CC_BLACKBOX_CAPTURE_PROMPTS:-0}}
+      - CC_BLACKBOX_DRIFT_ANALYZER=${{CC_BLACKBOX_DRIFT_ANALYZER:-0}}
+      - CC_BLACKBOX_DRIFT_ANALYZER_CONTEXT=${{CC_BLACKBOX_DRIFT_ANALYZER_CONTEXT:-redacted}}
+      - CC_BLACKBOX_DRIFT_ANALYZER_COMMAND=${{CC_BLACKBOX_DRIFT_ANALYZER_COMMAND:-claude}}
+      - CC_BLACKBOX_DRIFT_ANALYZER_MOCK_RESPONSE=${{CC_BLACKBOX_DRIFT_ANALYZER_MOCK_RESPONSE:-}}
       - CC_BLACKBOX_GUARD_POLICY_PATH=/config/guard-policy.toml
       - CC_BLACKBOX_JSONL_DIR=/root/.claude/projects
     volumes:
@@ -895,7 +1043,7 @@ fn bundled_compose_yaml(stack_dir: &Path) -> String {
   prometheus:
     image: prom/prometheus:v2.52.0
     ports:
-      - "127.0.0.1:9092:9090"
+      - "${{CC_BLACKBOX_PROMETHEUS_HOST:-127.0.0.1}}:${{CC_BLACKBOX_PROMETHEUS_PORT:-9092}}:9090"
     volumes:
       - {prometheus_config}
       - prometheus_data:/prometheus
@@ -911,7 +1059,7 @@ fn bundled_compose_yaml(stack_dir: &Path) -> String {
   grafana:
     image: grafana/grafana:11.1.0
     ports:
-      - "127.0.0.1:3000:3000"
+      - "${{CC_BLACKBOX_GRAFANA_HOST:-127.0.0.1}}:${{CC_BLACKBOX_GRAFANA_PORT:-3000}}:3000"
     volumes:
       - {grafana_provisioning}
       - {grafana_dashboards}
@@ -2825,7 +2973,8 @@ pub(crate) fn event_session_id(event: &WatchEvent) -> Option<&str> {
         | WatchEvent::RequestError { session_id, .. }
         | WatchEvent::GuardFinding { session_id, .. }
         | WatchEvent::ModelFallback { session_id, .. }
-        | WatchEvent::ContextStatus { session_id, .. } => Some(session_id.as_str()),
+        | WatchEvent::ContextStatus { session_id, .. }
+        | WatchEvent::CompactionSnapshot { session_id, .. } => Some(session_id.as_str()),
         WatchEvent::Lagged { .. } | WatchEvent::RateLimitStatus { .. } => None,
     }
 }
@@ -2922,6 +3071,127 @@ fn parse_mcp_tool_name(tool_name: &str) -> Option<(&str, &str)> {
     } else {
         Some((server, tool))
     }
+}
+
+fn snapshot_shape_change(current: usize, previous: Option<usize>) -> String {
+    previous
+        .map(|previous| format!("{previous} -> {current}"))
+        .unwrap_or_else(|| current.to_string())
+}
+
+fn snapshot_excerpt_for_display(snapshot: &CompactionSnapshotEvent) -> Option<&SnapshotExcerpt> {
+    if snapshot.capture_mode == "full_local" {
+        snapshot
+            .excerpts
+            .raw_compacted_objective
+            .as_ref()
+            .or(snapshot.excerpts.raw_compact_summary.as_ref())
+            .or(snapshot.excerpts.compacted_objective.as_ref())
+    } else {
+        snapshot
+            .excerpts
+            .compacted_objective
+            .as_ref()
+            .or(snapshot.excerpts.compact_summary.as_ref())
+    }
+}
+
+fn snapshot_watch_lines(snapshot: &CompactionSnapshotEvent) -> Vec<String> {
+    let status = if snapshot.detection.status.is_empty() {
+        "suspected"
+    } else {
+        snapshot.detection.status.as_str()
+    };
+    let mode = if snapshot.capture_mode.is_empty() {
+        "unknown"
+    } else {
+        snapshot.capture_mode.as_str()
+    };
+    let mut lines = Vec::new();
+    let mut head = format!(
+        "COMPACTION SNAPSHOT #{} {} [{}] messages {} system {} chars tokens {}",
+        snapshot.sequence,
+        status,
+        mode,
+        snapshot_shape_change(
+            snapshot.request.message_count,
+            snapshot.request.previous_message_count
+        ),
+        snapshot_shape_change(
+            snapshot.request.system_prompt_length,
+            snapshot.request.previous_system_prompt_length
+        ),
+        snapshot_shape_change(
+            snapshot.request.estimated_input_tokens,
+            snapshot.request.previous_estimated_input_tokens
+        )
+    );
+    if snapshot.local_only {
+        head.push_str(" local-only");
+    }
+    if !snapshot.request_id.is_empty() {
+        head.push_str(&format!(" req {}", snapshot.request_id));
+    }
+    lines.push(head);
+
+    if let Some(warning) = snapshot.full_capture_warning.as_deref() {
+        lines.push(format!(
+            "FULL LOCAL PROMPT CAPTURE: {}",
+            truncate_for_box(warning, 120)
+        ));
+    }
+
+    if let Some(drift) = snapshot.drift.as_ref() {
+        let source = if drift.source.is_empty() {
+            "deterministic"
+        } else {
+            drift.source.as_str()
+        };
+        lines.push(format!(
+            "drift {source}: objective {} ({}/100) preservation {} ({}/100) scope {} risk {}",
+            drift.objective_alignment.label,
+            drift.objective_alignment.score,
+            drift.state_preservation.label,
+            drift.state_preservation.score,
+            drift.scope_drift.label,
+            drift.risk.label
+        ));
+        if !drift.missing_facts.is_empty() {
+            lines.push(format!(
+                "missing from latest compact: {}",
+                drift
+                    .missing_facts
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(changed) = drift.changed_framing.as_deref() {
+            lines.push(format!(
+                "changed framing: {}",
+                truncate_for_box(changed, 140)
+            ));
+        }
+    }
+
+    if let Some(excerpt) = snapshot_excerpt_for_display(snapshot) {
+        let mut text = truncate_for_box(&excerpt.text, 110);
+        if excerpt.truncated {
+            text.push_str(" [capped]");
+        }
+        lines.push(format!("compact objective: {text}"));
+    }
+    if !snapshot.detection.reason.is_empty() {
+        lines.push(format!(
+            "evidence: {} ({:.0}% confidence)",
+            truncate_for_box(&snapshot.detection.reason, 140),
+            snapshot.detection.confidence * 100.0
+        ));
+    }
+
+    lines
 }
 
 fn render_event(
@@ -3374,6 +3644,23 @@ fn render_event(
                 line.yellow().to_string()
             };
             print_tagged(&tag, &colored);
+        }
+
+        WatchEvent::CompactionSnapshot {
+            session_id: _,
+            snapshot,
+        } => {
+            let lines = snapshot_watch_lines(snapshot);
+            for (idx, line) in lines.iter().enumerate() {
+                let rendered = if snapshot.capture_mode == "full_local" && idx == 1 {
+                    line.red().bold().to_string()
+                } else if snapshot.detection.status == "detected" {
+                    line.yellow().bold().to_string()
+                } else {
+                    line.yellow().to_string()
+                };
+                print_tagged(&tag, &rendered);
+            }
         }
 
         WatchEvent::RateLimitStatus {
@@ -7406,9 +7693,9 @@ mod tests {
         render_run_guard_panel, render_tmux_unavailable_fallback, run_child_command_with_deps,
         run_child_command_with_lifecycle_deps, run_claude_postmortem_analysis_with_command,
         run_claude_postmortem_analysis_with_lookup, run_guard_start_with_deps, run_owned_watch_url,
-        select_run_live_mode, shell_join, shell_quote, truncate_for_box, watcher_args, yaml_quote,
-        ActiveSessions, Cli, Commands, DecisionState, FooterColorMode, GuardCommands,
-        GuardStackReadiness, RunGuardEventOrigin, RunGuardPanel, RunLiveMode,
+        select_run_live_mode, shell_join, shell_quote, snapshot_watch_lines, truncate_for_box,
+        watcher_args, yaml_quote, ActiveSessions, Cli, Commands, DecisionState, FooterColorMode,
+        GuardCommands, GuardStackReadiness, RunGuardEventOrigin, RunGuardPanel, RunLiveMode,
         RunOwnedSessionMonitor, RunOwnedSessions, RunTerminalState, WatchEvent,
         WatchPostmortemState,
     };
@@ -11471,6 +11758,67 @@ What to do     Continue from the compacted segment.\n\
     }
 
     #[test]
+    fn cli_watch_renders_compaction_snapshot_without_safe_raw_fields() {
+        let event: WatchEvent = serde_json::from_str(
+            r#"{
+              "type":"compaction_snapshot",
+              "session_id":"session_snapshot",
+              "snapshot":{
+                "sequence":3,
+                "timestamp":"2026-01-01T00:00:00Z",
+                "request_id":"req_3",
+                "model":"claude-sonnet",
+                "capture_mode":"safe_redacted",
+                "local_only":true,
+                "detection":{"status":"detected","reason":"message count dropped 42 -> 9","confidence":0.82,"signals":["message count dropped"]},
+                "request":{"message_count":9,"previous_message_count":42,"system_prompt_length":28000,"previous_system_prompt_length":30000,"estimated_input_tokens":9000,"previous_estimated_input_tokens":42000,"first_message_hash":"firstmsg_new","system_prompt_hash":"hash_system","compacted_state_hash":"hash_compact"},
+                "excerpts":{"compacted_objective":{"text":"Compaction summary: fix login timeout. Next run auth_timeout_test.","source_chars":65,"rendered_chars":65,"truncated":false,"redacted":true}},
+                "drift":{"source":"deterministic","objective_alignment":{"score":71,"label":"medium","evidence":[]},"state_preservation":{"score":68,"label":"medium","evidence":[]},"scope_drift":{"score":20,"label":"low","evidence":[]},"actionability":{"score":80,"label":"high","evidence":[]},"risk":{"score":30,"label":"low","evidence":[]},"missing_facts":["migration constraint"],"changed_framing":null,"caveats":["heuristic"]}
+              }
+            }"#,
+        )
+        .expect("parse snapshot event");
+        let WatchEvent::CompactionSnapshot { snapshot, .. } = event else {
+            panic!("snapshot event");
+        };
+        let lines = snapshot_watch_lines(&snapshot);
+        let rendered = lines.join("\n");
+        assert!(rendered.contains("COMPACTION SNAPSHOT #3 detected [safe_redacted]"));
+        assert!(rendered.contains("messages 42 -> 9"));
+        assert!(rendered.contains("preservation medium (68/100)"));
+        assert!(rendered.contains("missing from latest compact: migration constraint"));
+        assert!(rendered.contains("compact objective: Compaction summary"));
+        assert!(!rendered.contains("raw_compacted_objective"));
+    }
+
+    #[test]
+    fn cli_watch_renders_full_snapshot_warning() {
+        let event: WatchEvent = serde_json::from_str(
+            r#"{
+              "type":"compaction_snapshot",
+              "session_id":"session_snapshot",
+              "snapshot":{
+                "sequence":1,
+                "capture_mode":"full_local",
+                "local_only":true,
+                "full_capture_warning":"FULL LOCAL-ONLY PROMPT CAPTURE ENABLED: excerpts may contain sensitive prompt text.",
+                "detection":{"status":"suspected","reason":"previous context fill was near compaction threshold","confidence":0.45},
+                "request":{"message_count":2,"system_prompt_length":100,"estimated_input_tokens":1000,"first_message_hash":"firstmsg","system_prompt_hash":"hash","compacted_state_hash":"hash2"},
+                "excerpts":{"raw_compacted_objective":{"text":"Raw local compact state","source_chars":23,"rendered_chars":23,"truncated":false,"redacted":false}}
+              }
+            }"#,
+        )
+        .expect("parse full snapshot event");
+        let WatchEvent::CompactionSnapshot { snapshot, .. } = event else {
+            panic!("snapshot event");
+        };
+        let rendered = snapshot_watch_lines(&snapshot).join("\n");
+        assert!(rendered.contains("FULL LOCAL PROMPT CAPTURE"));
+        assert!(rendered.contains("full_local"));
+        assert!(rendered.contains("Raw local compact state"));
+    }
+
+    #[test]
     fn watch_event_schema_accepts_all_core_event_variants() {
         let fixtures = [
             r#"{"type":"tool_use","session_id":"s","timestamp":"2026-01-01T00:00:00Z","tool_name":"Read","summary":"src/main.rs"}"#,
@@ -11488,6 +11836,7 @@ What to do     Continue from the compacted segment.\n\
             r#"{"type":"guard_finding","session_id":"s","rule_id":"per_session_token_budget_exceeded","severity":"critical","action":"block","evidence_level":"direct_proxy","source":"proxy","confidence":1.0,"timestamp":"2026-05-10T00:00:00Z","detail":"Session token budget exceeded.","suggested_action":"Start a fresh session."}"#,
             r#"{"type":"model_fallback","session_id":"s","requested":"claude-opus-4-7","actual":"claude-sonnet-4-6"}"#,
             r#"{"type":"context_status","session_id":"s","fill_percent":72.5,"context_window_tokens":1000000,"turns_to_compact":2}"#,
+            r#"{"type":"compaction_snapshot","session_id":"s","snapshot":{"sequence":1,"capture_mode":"safe_redacted","local_only":true,"detection":{"status":"detected","reason":"compact marker","confidence":0.9},"request":{"message_count":2,"system_prompt_length":100,"estimated_input_tokens":1000,"first_message_hash":"firstmsg","system_prompt_hash":"hash","compacted_state_hash":"hash2"},"excerpts":{"compacted_objective":{"text":"Compaction summary: continue.","source_chars":28,"rendered_chars":28,"truncated":false,"redacted":true}}}}"#,
             r#"{"type":"quota_burn_status","seconds_to_reset":3600,"tokens_used_this_week":10,"tokens_limit":100,"tokens_remaining":90,"budget_source":"env","projected_exhaustion_secs":1800}"#,
             r#"{"type":"lagged","missed":2}"#,
         ];
@@ -11534,6 +11883,14 @@ What to do     Continue from the compacted segment.\n\
         ));
         assert!(yaml.contains(
             "- CC_BLACKBOX_SESSION_BUDGET_TOKENS=${CC_BLACKBOX_SESSION_BUDGET_TOKENS:-0}"
+        ));
+        assert!(yaml.contains("- CC_BLACKBOX_CAPTURE_PROMPTS=${CC_BLACKBOX_CAPTURE_PROMPTS:-0}"));
+        assert!(yaml.contains("- CC_BLACKBOX_DRIFT_ANALYZER=${CC_BLACKBOX_DRIFT_ANALYZER:-0}"));
+        assert!(yaml.contains(
+            "- CC_BLACKBOX_DRIFT_ANALYZER_COMMAND=${CC_BLACKBOX_DRIFT_ANALYZER_COMMAND:-claude}"
+        ));
+        assert!(yaml.contains(
+            "- CC_BLACKBOX_DRIFT_ANALYZER_MOCK_RESPONSE=${CC_BLACKBOX_DRIFT_ANALYZER_MOCK_RESPONSE:-}"
         ));
         assert!(yaml.contains("- CC_BLACKBOX_GUARD_POLICY_PATH=/config/guard-policy.toml"));
         assert!(yaml.contains("- CC_BLACKBOX_JSONL_DIR=/root/.claude/projects"));

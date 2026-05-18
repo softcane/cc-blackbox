@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "cc-blackbox-cli"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "chrono",
  "clap",
@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "cc-blackbox-core"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "async-stream",
  "axum 0.7.9",

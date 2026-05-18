@@ -4,7 +4,7 @@ services:
     volumes:
       - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
     ports:
-      - "127.0.0.1:10000:10000"
+      - "${CC_BLACKBOX_ENVOY_HOST:-127.0.0.1}:${CC_BLACKBOX_ENVOY_PORT:-10000}:10000"
     depends_on:
       cc-blackbox-core:
         condition: service_healthy
@@ -21,7 +21,7 @@ services:
     expose:
       - "50051"
     ports:
-      - "127.0.0.1:9091:9090"
+      - "${CC_BLACKBOX_CORE_HOST:-127.0.0.1}:${CC_BLACKBOX_CORE_PORT:-9091}:9090"
     environment:
       - RUST_LOG=info
       - CC_BLACKBOX_SESSION_BUDGET_DOLLARS=${CC_BLACKBOX_SESSION_BUDGET_DOLLARS:-0}
@@ -29,6 +29,11 @@ services:
       - CC_BLACKBOX_CIRCUIT_BREAKER_THRESHOLD=${CC_BLACKBOX_CIRCUIT_BREAKER_THRESHOLD:-0}
       - CC_BLACKBOX_CIRCUIT_BREAKER_COOLDOWN_SECS=${CC_BLACKBOX_CIRCUIT_BREAKER_COOLDOWN_SECS:-0}
       - CC_BLACKBOX_POSTMORTEM_IDLE_SECS=${CC_BLACKBOX_POSTMORTEM_IDLE_SECS:-600}
+      - CC_BLACKBOX_CAPTURE_PROMPTS=${CC_BLACKBOX_CAPTURE_PROMPTS:-0}
+      - CC_BLACKBOX_DRIFT_ANALYZER=${CC_BLACKBOX_DRIFT_ANALYZER:-0}
+      - CC_BLACKBOX_DRIFT_ANALYZER_CONTEXT=${CC_BLACKBOX_DRIFT_ANALYZER_CONTEXT:-redacted}
+      - CC_BLACKBOX_DRIFT_ANALYZER_COMMAND=${CC_BLACKBOX_DRIFT_ANALYZER_COMMAND:-claude}
+      - CC_BLACKBOX_DRIFT_ANALYZER_MOCK_RESPONSE=${CC_BLACKBOX_DRIFT_ANALYZER_MOCK_RESPONSE:-}
       - CC_BLACKBOX_GUARD_POLICY_PATH=/config/guard-policy.toml
       - CC_BLACKBOX_JSONL_DIR=/root/.claude/projects
     volumes:
@@ -44,7 +49,7 @@ services:
   prometheus:
     image: prom/prometheus:v2.52.0
     ports:
-      - "127.0.0.1:9092:9090"
+      - "${CC_BLACKBOX_PROMETHEUS_HOST:-127.0.0.1}:${CC_BLACKBOX_PROMETHEUS_PORT:-9092}:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
@@ -60,7 +65,7 @@ services:
   grafana:
     image: grafana/grafana:11.1.0
     ports:
-      - "127.0.0.1:3000:3000"
+      - "${CC_BLACKBOX_GRAFANA_HOST:-127.0.0.1}:${CC_BLACKBOX_GRAFANA_PORT:-3000}:3000"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro

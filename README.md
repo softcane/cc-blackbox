@@ -293,6 +293,8 @@ The footer is the normal live view. Live Guard, watch mode, APIs, and Grafana ar
 - **Opt into automatic watch postmortems:** `cc-blackbox watch --postmortem`
 - **Watch all sessions in tmux:** `cc-blackbox watch --tmux`
 - **Watch one session:** `cc-blackbox watch --session session_1776... --url http://127.0.0.1:9091`
+- **Opt into compaction snapshots:** `CC_BLACKBOX_CAPTURE_PROMPTS=1 cc-blackbox guard start` captures redacted/capped in-memory snapshots. `CC_BLACKBOX_CAPTURE_PROMPTS=full` is local-only and explicitly labeled because it can show raw prompt excerpts.
+- **Inspect recent snapshots for a session:** `curl -s http://127.0.0.1:9091/api/sessions/<session_id>/snapshots`
 - **Review recent sessions:** `cc-blackbox sessions --limit 20 --days 7`
 - **Open the local session API:** `curl -s 'http://127.0.0.1:9091/api/sessions?limit=5'`
 - **Read the current local summary:** `curl -s http://127.0.0.1:9091/api/summary`

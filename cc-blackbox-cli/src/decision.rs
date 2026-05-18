@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::{format_duration_coarse, format_tokens, json_bool, json_f64, json_str, json_u64};
-use crate::{RunGuardEventOrigin, WatchEvent};
+use crate::{CompactionSnapshotEvent, RunGuardEventOrigin, WatchEvent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -380,6 +380,10 @@ impl SessionDecisionTracker {
                 ..
             } => {
                 self.add_reason(compaction_loop_reason(*consecutive, *wasted_tokens));
+                true
+            }
+            WatchEvent::CompactionSnapshot { snapshot, .. } => {
+                self.add_reason(compaction_snapshot_reason(snapshot));
                 true
             }
             WatchEvent::ToolUse { .. }
@@ -1278,6 +1282,53 @@ fn compaction_loop_reason(consecutive: u32, wasted_tokens: u64) -> DecisionReaso
         suggested_action: None,
         state: DecisionState::StopRecommended,
         priority: 740,
+    }
+}
+
+fn compaction_snapshot_reason(snapshot: &CompactionSnapshotEvent) -> DecisionReason {
+    let drift = snapshot.drift.as_ref();
+    let preservation = drift
+        .map(|drift| drift.state_preservation.score)
+        .unwrap_or(0);
+    let risk = drift
+        .map(|drift| drift.risk.label.as_str())
+        .unwrap_or("unknown");
+    let missing = drift
+        .map(|drift| drift.missing_facts.len())
+        .unwrap_or_default();
+    let status = if snapshot.detection.status.is_empty() {
+        "suspected"
+    } else {
+        snapshot.detection.status.as_str()
+    };
+    let (state, priority) = if risk == "high" || preservation < 45 {
+        (DecisionState::StopRecommended, 735)
+    } else if status == "detected" || missing > 0 {
+        (DecisionState::Risky, 610)
+    } else {
+        (DecisionState::Watching, 120)
+    };
+    let mode = if snapshot.capture_mode.is_empty() {
+        "unknown"
+    } else {
+        snapshot.capture_mode.as_str()
+    };
+    DecisionReason {
+        code: "compaction_snapshot".to_string(),
+        label: "compaction snapshot".to_string(),
+        short: format!("snapshot #{}, {status}", snapshot.sequence),
+        detail: format!(
+            "Snapshot #{} {status} in {mode} mode; preservation {} / 100, risk {risk}, missing facts {missing}.",
+            snapshot.sequence, preservation
+        ),
+        evidence_level: "heuristic".to_string(),
+        source: "proxy".to_string(),
+        evidence: "derived proxy estimate".to_string(),
+        caveat: Some("Compaction detection and deterministic drift scoring are heuristic.".to_string()),
+        suggested_action: (state == DecisionState::StopRecommended)
+            .then(|| "Restate missing constraints or restart from a fresh handoff.".to_string()),
+        state,
+        priority,
     }
 }
 
